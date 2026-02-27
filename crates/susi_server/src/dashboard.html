@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FusionHub License Server</title>
+<style>
+:root {
+    --bg: #0f1117;
+    --bg2: #1a1d27;
+    --bg3: #242836;
+    --border: #2e3348;
+    --text: #e0e0e8;
+    --text2: #8b8fa8;
+    --accent: #6c8cff;
+    --accent-hover: #8ba4ff;
+    --green: #4ade80;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --radius: 8px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-hover); }
+
+.header {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.header h1 { font-size: 18px; font-weight: 600; }
+.header .status { font-size: 13px; color: var(--text2); }
+.header .status.ok { color: var(--green); }
+.header .status.err { color: var(--red); }
+
+.container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+.toolbar {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+.toolbar .spacer { flex: 1; }
+
+button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 8px 16px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: background 0.15s;
+}
+button:hover { background: var(--accent-hover); }
+button.secondary {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text);
+}
+button.secondary:hover { background: var(--border); }
+button.danger { background: var(--red); }
+button.danger:hover { background: #ef4444; }
+button.small { padding: 4px 10px; font-size: 12px; }
+
+input, select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    font-size: 13px;
+    outline: none;
+}
+input:focus, select:focus { border-color: var(--accent); }
+input::placeholder { color: var(--text2); }
+
+label {
+    display: block;
+    font-size: 12px;
+    color: var(--text2);
+    margin-bottom: 4px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+}
+
+.stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+}
+.stat-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+}
+.stat-card .value { font-size: 28px; font-weight: 700; }
+.stat-card .label { font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; }
+
+table { width: 100%; border-collapse: collapse; }
+th {
+    text-align: left;
+    padding: 10px 14px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text2);
+    background: var(--bg3);
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+}
+td {
+    padding: 10px 14px;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+}
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: rgba(108, 140, 255, 0.04); }
+
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.badge.active { background: rgba(74, 222, 128, 0.15); color: var(--green); }
+.badge.expired { background: rgba(251, 191, 36, 0.15); color: var(--yellow); }
+.badge.revoked { background: rgba(248, 113, 113, 0.15); color: var(--red); }
+
+.feature-tag {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    margin: 1px 2px;
+}
+
+.key-display {
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 12px;
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    user-select: all;
+}
+
+/* Modal */
+.modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 100;
+    justify-content: center;
+    align-items: flex-start;
+    padding-top: 80px;
+}
+.modal-overlay.visible { display: flex; }
+.modal {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    width: 100%;
+    max-width: 520px;
+    padding: 24px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+}
+.modal h2 { font-size: 16px; margin-bottom: 16px; }
+.modal .form-row {
+    margin-bottom: 12px;
+}
+.modal .form-row input,
+.modal .form-row select {
+    width: 100%;
+}
+.modal .form-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 20px;
+}
+
+.toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    padding: 12px 20px;
+    border-radius: var(--radius);
+    font-size: 13px;
+    z-index: 200;
+    animation: slideIn 0.2s ease-out;
+    max-width: 400px;
+}
+.toast.success { background: rgba(74, 222, 128, 0.15); border: 1px solid var(--green); color: var(--green); }
+.toast.error { background: rgba(248, 113, 113, 0.15); border: 1px solid var(--red); color: var(--red); }
+@keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+.empty-state {
+    text-align: center;
+    padding: 48px 24px;
+    color: var(--text2);
+}
+.empty-state p { font-size: 14px; margin-bottom: 16px; }
+
+/* Detail panel */
+.detail-panel {
+    display: none;
+    margin-bottom: 20px;
+}
+.detail-panel.visible { display: block; }
+.detail-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px;
+    background: var(--bg3);
+    border-bottom: 1px solid var(--border);
+}
+.detail-header h3 { font-size: 14px; }
+.detail-body { padding: 14px; }
+.detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+.detail-field .field-label { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; }
+.detail-field .field-value { font-size: 14px; margin-top: 2px; }
+.detail-section-title {
+    font-size: 12px;
+    color: var(--text2);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 16px 0 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+}
+
+.machines-list { margin-top: 4px; }
+.machine-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: var(--bg);
+    border-radius: var(--radius);
+    margin-bottom: 4px;
+    font-size: 13px;
+}
+.machine-item .machine-code {
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 11px;
+    color: var(--text2);
+}
+
+/* Search */
+#searchInput { min-width: 200px; }
+
+@media (max-width: 768px) {
+    .container { padding: 12px; }
+    .detail-grid { grid-template-columns: 1fr; }
+    table { font-size: 12px; }
+    th, td { padding: 8px 10px; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>FusionHub License Server</h1>
+    <span id="connectionStatus" class="status">Connecting...</span>
+</div>
+
+<div class="container">
+    <div class="stats">
+        <div class="stat-card">
+            <div class="value" id="statTotal">-</div>
+            <div class="label">Total Licenses</div>
+        </div>
+        <div class="stat-card">
+            <div class="value" id="statActive" style="color: var(--green);">-</div>
+            <div class="label">Active</div>
+        </div>
+        <div class="stat-card">
+            <div class="value" id="statExpired" style="color: var(--yellow);">-</div>
+            <div class="label">Expired</div>
+        </div>
+        <div class="stat-card">
+            <div class="value" id="statRevoked" style="color: var(--red);">-</div>
+            <div class="label">Revoked</div>
+        </div>
+    </div>
+
+    <div class="toolbar">
+        <input type="text" id="searchInput" placeholder="Search licenses...">
+        <div class="spacer"></div>
+        <button class="secondary" onclick="loadLicenses()">Refresh</button>
+        <button onclick="showCreateModal()">+ New License</button>
+    </div>
+
+    <!-- Detail panel -->
+    <div id="detailPanel" class="detail-panel card">
+        <div class="detail-header">
+            <h3 id="detailTitle">License Details</h3>
+            <div>
+                <button class="small secondary" onclick="exportLicense()">Export</button>
+                <button class="small danger" id="btnRevoke" onclick="revokeLicense()">Revoke</button>
+                <button class="small secondary" onclick="closeDetail()">&times; Close</button>
+            </div>
+        </div>
+        <div class="detail-body">
+            <div class="detail-grid">
+                <div class="detail-field">
+                    <div class="field-label">License Key</div>
+                    <div class="field-value" id="detailKey"></div>
+                </div>
+                <div class="detail-field">
+                    <div class="field-label">Status</div>
+                    <div class="field-value" id="detailStatus"></div>
+                </div>
+                <div class="detail-field">
+                    <div class="field-label">Product</div>
+                    <div class="field-value" id="detailProduct"></div>
+                </div>
+                <div class="detail-field">
+                    <div class="field-label">Customer</div>
+                    <div class="field-value" id="detailCustomer"></div>
+                </div>
+                <div class="detail-field">
+                    <div class="field-label">Created</div>
+                    <div class="field-value" id="detailCreated"></div>
+                </div>
+                <div class="detail-field">
+                    <div class="field-label">Expires</div>
+                    <div class="field-value" id="detailExpires"></div>
+                </div>
+                <div class="detail-field">
+                    <div class="field-label">Features</div>
+                    <div class="field-value" id="detailFeatures"></div>
+                </div>
+                <div class="detail-field">
+                    <div class="field-label">Machines</div>
+                    <div class="field-value" id="detailMachineCount"></div>
+                </div>
+            </div>
+            <div class="detail-section-title">Activated Machines</div>
+            <div id="detailMachines" class="machines-list"></div>
+        </div>
+    </div>
+
+    <!-- License table -->
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Key</th>
+                    <th>Customer</th>
+                    <th>Product</th>
+                    <th>Status</th>
+                    <th>Expires</th>
+                    <th>Machines</th>
+                    <th>Features</th>
+                </tr>
+            </thead>
+            <tbody id="licenseTableBody">
+                <tr><td colspan="7" class="empty-state"><p>Loading...</p></td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Create License Modal -->
+<div id="createModal" class="modal-overlay" onclick="if(event.target===this)closeCreateModal()">
+    <div class="modal">
+        <h2>Create New License</h2>
+        <div class="form-row">
+            <label>Customer</label>
+            <input type="text" id="createCustomer" placeholder="Company name">
+        </div>
+        <div class="form-row">
+            <label>Product</label>
+            <input type="text" id="createProduct" value="FusionHub">
+        </div>
+        <div class="form-row">
+            <label>Expiry</label>
+            <select id="createExpiryType" onchange="updateExpiryFields()">
+                <option value="days">Days from now</option>
+                <option value="date">Specific date</option>
+                <option value="perpetual">Perpetual</option>
+            </select>
+        </div>
+        <div class="form-row" id="createExpiryValueRow">
+            <label id="createExpiryValueLabel">Days</label>
+            <input type="text" id="createExpiryValue" value="365">
+        </div>
+        <div class="form-row">
+            <label>Features (comma-separated)</label>
+            <input type="text" id="createFeatures" placeholder="full_fusion, vehicular, recorder">
+        </div>
+        <div class="form-row">
+            <label>Max Machines (0 = unlimited)</label>
+            <input type="number" id="createMaxMachines" value="1" min="0">
+        </div>
+        <div class="form-actions">
+            <button class="secondary" onclick="closeCreateModal()">Cancel</button>
+            <button onclick="createLicense()">Create License</button>
+        </div>
+    </div>
+</div>
+
+<!-- Export Modal -->
+<div id="exportModal" class="modal-overlay" onclick="if(event.target===this)closeExportModal()">
+    <div class="modal">
+        <h2>Export Signed License File</h2>
+        <div class="form-row">
+            <label>License Key</label>
+            <input type="text" id="exportKey" readonly>
+        </div>
+        <div class="form-row">
+            <label>Machine Code (SHA256 fingerprint)</label>
+            <input type="text" id="exportMachineCode" placeholder="Paste machine fingerprint here">
+        </div>
+        <div class="form-row">
+            <label>Friendly Name</label>
+            <input type="text" id="exportFriendlyName" placeholder="e.g. Vehicle-ECU-1">
+        </div>
+        <div class="form-actions">
+            <button class="secondary" onclick="closeExportModal()">Cancel</button>
+            <button onclick="doExport()">Export &amp; Download</button>
+        </div>
+    </div>
+</div>
+
+<script>
+const API = '/api/v1';
+let adminKey = '';
+let licenses = [];
+let selectedKey = null;
+
+// On load, prompt for admin key
+(function init() {
+    adminKey = localStorage.getItem('license_admin_key') || '';
+    if (!adminKey) {
+        adminKey = prompt('Enter admin API key:') || '';
+        if (adminKey) localStorage.setItem('license_admin_key', adminKey);
+    }
+    loadLicenses();
+})();
+
+function authHeaders() {
+    return { 'Authorization': 'Bearer ' + adminKey, 'Content-Type': 'application/json' };
+}
+
+function toast(msg, type) {
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 4000);
+}
+
+function formatDate(iso) {
+    if (!iso || iso === 'perpetual') return 'Perpetual';
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-CA'); // YYYY-MM-DD
+}
+
+function getStatus(lic) {
+    if (lic.revoked) return 'revoked';
+    if (lic.expires !== 'perpetual' && new Date(lic.expires) < new Date()) return 'expired';
+    return 'active';
+}
+
+async function loadLicenses() {
+    const status = document.getElementById('connectionStatus');
+    try {
+        const resp = await fetch(API + '/licenses', { headers: authHeaders() });
+        if (resp.status === 401) {
+            status.textContent = 'Unauthorized';
+            status.className = 'status err';
+            adminKey = prompt('Invalid admin key. Enter correct key:') || '';
+            if (adminKey) {
+                localStorage.setItem('license_admin_key', adminKey);
+                return loadLicenses();
+            }
+            return;
+        }
+        licenses = await resp.json();
+        status.textContent = 'Connected';
+        status.className = 'status ok';
+        renderStats();
+        renderTable();
+    } catch (e) {
+        status.textContent = 'Disconnected';
+        status.className = 'status err';
+        toast('Failed to connect: ' + e.message, 'error');
+    }
+}
+
+function renderStats() {
+    const total = licenses.length;
+    const active = licenses.filter(l => getStatus(l) === 'active').length;
+    const expired = licenses.filter(l => getStatus(l) === 'expired').length;
+    const revoked = licenses.filter(l => getStatus(l) === 'revoked').length;
+    document.getElementById('statTotal').textContent = total;
+    document.getElementById('statActive').textContent = active;
+    document.getElementById('statExpired').textContent = expired;
+    document.getElementById('statRevoked').textContent = revoked;
+}
+
+function renderTable() {
+    const tbody = document.getElementById('licenseTableBody');
+    const search = document.getElementById('searchInput').value.toLowerCase();
+
+    const filtered = licenses.filter(l => {
+        if (!search) return true;
+        return l.license_key.toLowerCase().includes(search) ||
+               l.customer.toLowerCase().includes(search) ||
+               l.product.toLowerCase().includes(search) ||
+               l.features.some(f => f.toLowerCase().includes(search));
+    });
+
+    if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><p>No licenses found</p><button onclick="showCreateModal()">Create your first license</button></td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = filtered.map(l => {
+        const status = getStatus(l);
+        const features = l.features.map(f => '<span class="feature-tag">' + esc(f) + '</span>').join(' ');
+        return '<tr style="cursor:pointer" onclick="selectLicense(\'' + esc(l.license_key) + '\')">' +
+            '<td><span class="key-display">' + esc(l.license_key) + '</span></td>' +
+            '<td>' + esc(l.customer) + '</td>' +
+            '<td>' + esc(l.product) + '</td>' +
+            '<td><span class="badge ' + status + '">' + status + '</span></td>' +
+            '<td>' + formatDate(l.expires) + '</td>' +
+            '<td>' + l.machine_count + '/' + (l.max_machines === 0 ? '\u221e' : l.max_machines) + '</td>' +
+            '<td>' + (features || '<span style="color:var(--text2)">none</span>') + '</td>' +
+            '</tr>';
+    }).join('');
+}
+
+document.getElementById('searchInput').addEventListener('input', renderTable);
+
+function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+// Detail panel
+function selectLicense(key) {
+    selectedKey = key;
+    const lic = licenses.find(l => l.license_key === key);
+    if (!lic) return;
+
+    const status = getStatus(lic);
+    document.getElementById('detailTitle').textContent = 'License: ' + lic.customer;
+    document.getElementById('detailKey').innerHTML = '<span class="key-display">' + esc(lic.license_key) + '</span>';
+    document.getElementById('detailStatus').innerHTML = '<span class="badge ' + status + '">' + status + '</span>';
+    document.getElementById('detailProduct').textContent = lic.product;
+    document.getElementById('detailCustomer').textContent = lic.customer;
+    document.getElementById('detailCreated').textContent = formatDate(lic.created);
+    document.getElementById('detailExpires').textContent = formatDate(lic.expires);
+    document.getElementById('detailFeatures').innerHTML = lic.features.map(f => '<span class="feature-tag">' + esc(f) + '</span>').join(' ') || 'none';
+    document.getElementById('detailMachineCount').textContent = lic.machine_count + ' / ' + (lic.max_machines === 0 ? '\u221e' : lic.max_machines);
+
+    const btnRevoke = document.getElementById('btnRevoke');
+    btnRevoke.style.display = status === 'revoked' ? 'none' : '';
+
+    const machinesEl = document.getElementById('detailMachines');
+    if (lic.machines && lic.machines.length > 0) {
+        machinesEl.innerHTML = lic.machines.map(m =>
+            '<div class="machine-item">' +
+            '<div><strong>' + esc(m.friendly_name || 'Unknown') + '</strong><br><span class="machine-code">' + esc(m.machine_code) + '</span></div>' +
+            '<button class="small danger" onclick="deactivateMachine(\'' + esc(lic.license_key) + '\', \'' + esc(m.machine_code) + '\')">Remove</button>' +
+            '</div>'
+        ).join('');
+    } else {
+        machinesEl.innerHTML = '<div style="color:var(--text2);font-size:13px;padding:8px 0;">No machines activated</div>';
+    }
+
+    document.getElementById('detailPanel').classList.add('visible');
+}
+
+function closeDetail() {
+    selectedKey = null;
+    document.getElementById('detailPanel').classList.remove('visible');
+}
+
+// Create modal
+function showCreateModal() {
+    document.getElementById('createModal').classList.add('visible');
+    document.getElementById('createCustomer').focus();
+}
+
+function closeCreateModal() {
+    document.getElementById('createModal').classList.remove('visible');
+}
+
+function updateExpiryFields() {
+    const type = document.getElementById('createExpiryType').value;
+    const row = document.getElementById('createExpiryValueRow');
+    const label = document.getElementById('createExpiryValueLabel');
+    const input = document.getElementById('createExpiryValue');
+    if (type === 'perpetual') {
+        row.style.display = 'none';
+    } else if (type === 'days') {
+        row.style.display = '';
+        label.textContent = 'Days';
+        input.type = 'number';
+        input.value = '365';
+    } else {
+        row.style.display = '';
+        label.textContent = 'Date (YYYY-MM-DD)';
+        input.type = 'date';
+        const d = new Date();
+        d.setFullYear(d.getFullYear() + 1);
+        input.value = d.toISOString().split('T')[0];
+    }
+}
+
+async function createLicense() {
+    const customer = document.getElementById('createCustomer').value.trim();
+    if (!customer) { toast('Customer name is required', 'error'); return; }
+
+    const body = {
+        product: document.getElementById('createProduct').value.trim() || 'FusionHub',
+        customer: customer,
+        features: document.getElementById('createFeatures').value.split(',').map(s => s.trim()).filter(Boolean),
+        max_machines: parseInt(document.getElementById('createMaxMachines').value) || 0,
+    };
+
+    const expiryType = document.getElementById('createExpiryType').value;
+    if (expiryType === 'perpetual') {
+        body.perpetual = true;
+    } else if (expiryType === 'days') {
+        body.days = parseInt(document.getElementById('createExpiryValue').value) || 365;
+    } else {
+        body.expires = document.getElementById('createExpiryValue').value;
+    }
+
+    try {
+        const resp = await fetch(API + '/licenses', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+            const err = await resp.json();
+            toast('Error: ' + err.error, 'error');
+            return;
+        }
+        const lic = await resp.json();
+        toast('License created: ' + lic.license_key, 'success');
+        closeCreateModal();
+        await loadLicenses();
+        selectLicense(lic.license_key);
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function revokeLicense() {
+    if (!selectedKey) return;
+    if (!confirm('Revoke license ' + selectedKey + '? This cannot be undone.')) return;
+
+    try {
+        const resp = await fetch(API + '/licenses/' + encodeURIComponent(selectedKey) + '/revoke', {
+            method: 'POST',
+            headers: authHeaders(),
+        });
+        if (!resp.ok) {
+            const err = await resp.json();
+            toast('Error: ' + err.error, 'error');
+            return;
+        }
+        toast('License revoked', 'success');
+        closeDetail();
+        await loadLicenses();
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function deactivateMachine(key, machineCode) {
+    if (!confirm('Remove machine ' + machineCode.substring(0, 12) + '...?')) return;
+
+    try {
+        const resp = await fetch(API + '/licenses/' + encodeURIComponent(key) + '/machines/' + encodeURIComponent(machineCode), {
+            method: 'DELETE',
+            headers: authHeaders(),
+        });
+        if (!resp.ok) {
+            const err = await resp.json();
+            toast('Error: ' + err.error, 'error');
+            return;
+        }
+        toast('Machine deactivated', 'success');
+        await loadLicenses();
+        selectLicense(key);
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+// Export modal
+function exportLicense() {
+    if (!selectedKey) return;
+    document.getElementById('exportKey').value = selectedKey;
+    document.getElementById('exportMachineCode').value = '';
+    document.getElementById('exportFriendlyName').value = '';
+    document.getElementById('exportModal').classList.add('visible');
+    document.getElementById('exportMachineCode').focus();
+}
+
+function closeExportModal() {
+    document.getElementById('exportModal').classList.remove('visible');
+}
+
+async function doExport() {
+    const key = document.getElementById('exportKey').value;
+    const machineCode = document.getElementById('exportMachineCode').value.trim();
+    const friendlyName = document.getElementById('exportFriendlyName').value.trim();
+
+    if (!machineCode) { toast('Machine code is required', 'error'); return; }
+
+    try {
+        const resp = await fetch(API + '/licenses/' + encodeURIComponent(key) + '/export', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({ machine_code: machineCode, friendly_name: friendlyName }),
+        });
+        if (!resp.ok) {
+            const err = await resp.json();
+            toast('Error: ' + err.error, 'error');
+            return;
+        }
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'license.json';
+        a.click();
+        URL.revokeObjectURL(url);
+
+        toast('License file exported', 'success');
+        closeExportModal();
+        await loadLicenses();
+        selectLicense(key);
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+        closeCreateModal();
+        closeExportModal();
+    }
+});
+</script>
+</body>
+</html>

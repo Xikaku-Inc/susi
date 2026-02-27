@@ -1,0 +1,32 @@
+[package]
+name = "susi_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+rand = "0.8"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[features]
+default = []
+db = ["rusqlite"]
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_SystemInformation",
+] }
+
+[dev-dependencies]
+approx = { workspace = true }

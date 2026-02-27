@@ -1,0 +1,19 @@
+[package]
+name = "susi_client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+susi_core = { path = "../susi_core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+rsa = { version = "0.9", features = ["pem"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+
+[dev-dependencies]
+approx = { workspace = true }
+env_logger = { workspace = true }
