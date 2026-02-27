@@ -92,6 +92,7 @@ mod tests {
             expires: Some(Utc::now() + Duration::days(365)),
             features: vec!["full_fusion".to_string(), "recorder".to_string()],
             machine_codes: vec!["abc123def456".to_string()],
+            lease_expires: None,
         }
     }
 

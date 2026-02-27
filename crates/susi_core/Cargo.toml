@@ -15,10 +15,15 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 pkcs8 = { version = "0.10", features = ["pem"] }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+aes-gcm = "0.10"
+hkdf = "0.12"
 
 [features]
 default = []
 db = ["rusqlite"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -26,6 +31,11 @@ windows = { version = "0.58", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Foundation",
 ] }
 
 [dev-dependencies]

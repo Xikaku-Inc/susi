@@ -13,27 +13,44 @@ pub enum LicenseStatus {
     Valid {
         payload: LicensePayload,
     },
+    /// License still works but the lease has expired and is in the grace period.
+    /// Client should attempt to renew ASAP.
+    ValidGracePeriod {
+        payload: LicensePayload,
+        lease_expired_at: DateTime<Utc>,
+    },
     Expired {
         expired_at: DateTime<Utc>,
+    },
+    /// The lease has expired (including grace period). Must renew.
+    LeaseExpired {
+        lease_expired_at: DateTime<Utc>,
     },
     InvalidMachine {
         expected: Vec<String>,
         actual: String,
     },
     InvalidSignature,
+    TokenNotFound,
     FileNotFound(String),
     Error(String),
 }
 
 impl LicenseStatus {
     pub fn is_valid(&self) -> bool {
-        matches!(self, LicenseStatus::Valid { .. })
+        matches!(self, LicenseStatus::Valid { .. } | LicenseStatus::ValidGracePeriod { .. })
+    }
+
+    pub fn needs_renewal(&self) -> bool {
+        matches!(self, LicenseStatus::ValidGracePeriod { .. } | LicenseStatus::LeaseExpired { .. })
     }
 
     /// Check if a specific feature is available in this license.
     pub fn has_feature(&self, feature: &str) -> bool {
         match self {
-            LicenseStatus::Valid { payload } => payload.has_feature(feature),
+            LicenseStatus::Valid { payload } | LicenseStatus::ValidGracePeriod { payload, .. } => {
+                payload.has_feature(feature)
+            }
             _ => false,
         }
     }
@@ -41,7 +58,9 @@ impl LicenseStatus {
     /// Get the list of features if the license is valid.
     pub fn features(&self) -> Vec<String> {
         match self {
-            LicenseStatus::Valid { payload } => payload.features.clone(),
+            LicenseStatus::Valid { payload } | LicenseStatus::ValidGracePeriod { payload, .. } => {
+                payload.features.clone()
+            }
             _ => vec![],
         }
     }
@@ -49,7 +68,19 @@ impl LicenseStatus {
     /// Get the expiry date if the license is valid. `None` for perpetual.
     pub fn expires(&self) -> Option<DateTime<Utc>> {
         match self {
-            LicenseStatus::Valid { payload } => payload.expires,
+            LicenseStatus::Valid { payload } | LicenseStatus::ValidGracePeriod { payload, .. } => {
+                payload.expires
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the lease expiry if present.
+    pub fn lease_expires(&self) -> Option<DateTime<Utc>> {
+        match self {
+            LicenseStatus::Valid { payload } | LicenseStatus::ValidGracePeriod { payload, .. } => {
+                payload.lease_expires
+            }
             _ => None,
         }
     }
@@ -59,6 +90,8 @@ impl LicenseStatus {
 pub struct LicenseClient {
     public_key: RsaPublicKey,
     server_url: Option<String>,
+    /// Grace period in hours after lease expiry. Default: 24.
+    grace_hours: i64,
 }
 
 impl LicenseClient {
@@ -68,6 +101,7 @@ impl LicenseClient {
         Ok(Self {
             public_key,
             server_url: None,
+            grace_hours: susi_core::DEFAULT_LEASE_GRACE_HOURS as i64,
         })
     }
 
@@ -76,6 +110,11 @@ impl LicenseClient {
         let mut client = Self::new(public_key_pem)?;
         client.server_url = Some(server_url);
         Ok(client)
+    }
+
+    /// Set the grace period (hours) for lease expiry.
+    pub fn set_grace_hours(&mut self, hours: i64) {
+        self.grace_hours = hours;
     }
 
     /// Verify a signed license file on disk.
@@ -103,7 +142,7 @@ impl LicenseClient {
 
         if payload.is_expired() {
             return LicenseStatus::Expired {
-                expired_at: payload.expires.unwrap(), // is_expired() only returns true for Some(dt)
+                expired_at: payload.expires.unwrap(),
             };
         }
 
@@ -127,16 +166,28 @@ impl LicenseClient {
             }
         }
 
+        // Check lease expiry
+        if payload.is_lease_expired() {
+            if payload.is_in_grace_period(self.grace_hours) {
+                return LicenseStatus::ValidGracePeriod {
+                    lease_expired_at: payload.lease_expires.unwrap(),
+                    payload,
+                };
+            }
+            return LicenseStatus::LeaseExpired {
+                lease_expired_at: payload.lease_expires.unwrap(),
+            };
+        }
+
         LicenseStatus::Valid { payload }
     }
 
     /// Try to refresh the license from the server, falling back to the local file.
+    /// This both renews the lease and verifies the license.
     pub fn verify_and_refresh(&self, path: &Path, license_key: &str) -> LicenseStatus {
         if let Some(ref server_url) = self.server_url {
-            // Try online verification first
-            match self.try_online_verify(server_url, license_key) {
+            match self.try_online_activate(server_url, license_key) {
                 Ok(signed) => {
-                    // Save refreshed license to disk
                     if let Ok(json) = serde_json::to_string_pretty(&signed) {
                         let _ = std::fs::write(path, json);
                     }
@@ -152,7 +203,7 @@ impl LicenseClient {
         self.verify_file(path)
     }
 
-    fn try_online_verify(
+    fn try_online_activate(
         &self,
         server_url: &str,
         license_key: &str,
@@ -160,7 +211,7 @@ impl LicenseClient {
         let machine_code = fingerprint::get_machine_code()
             .map_err(|e| format!("Fingerprint error: {}", e))?;
 
-        let url = format!("{}/verify", server_url.trim_end_matches('/'));
+        let url = format!("{}/activate", server_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "license_key": license_key,
             "machine_code": machine_code,
@@ -182,6 +233,51 @@ impl LicenseClient {
         response
             .json::<SignedLicense>()
             .map_err(|e| format!("Invalid server response: {}", e))
+    }
+
+    /// Verify a license from a connected USB hardware token.
+    /// Scans all connected USB mass storage devices for a valid token.
+    pub fn verify_token(&self) -> LicenseStatus {
+        let devices = match susi_core::usb::enumerate_usb_devices() {
+            Ok(d) => d,
+            Err(e) => return LicenseStatus::Error(format!("USB enumeration failed: {}", e)),
+        };
+
+        if devices.is_empty() {
+            return LicenseStatus::TokenNotFound;
+        }
+
+        let mut last_error = String::new();
+
+        for device in &devices {
+            let token_path = susi_core::token::token_file_path(&device.mount_path);
+            if !token_path.exists() {
+                continue;
+            }
+
+            match susi_core::token::read_token(&device.mount_path, &device.serial) {
+                Ok(signed) => {
+                    let status = self.verify_signed(&signed);
+                    if status.is_valid() {
+                        return status;
+                    }
+                    last_error = format!("Token on {} invalid: {:?}", device.mount_path.display(), status);
+                }
+                Err(e) => {
+                    last_error = format!(
+                        "Token on {} decryption failed: {}",
+                        device.mount_path.display(), e
+                    );
+                    continue;
+                }
+            }
+        }
+
+        if last_error.is_empty() {
+            LicenseStatus::TokenNotFound
+        } else {
+            LicenseStatus::Error(format!("No valid USB token found. Last error: {}", last_error))
+        }
     }
 
     /// Get the machine code for the current machine.
@@ -213,6 +309,7 @@ mod tests {
             expires: Some(Utc::now() + Duration::days(365)),
             features: vec!["full_fusion".to_string(), "recorder".to_string()],
             machine_codes: machine_code.into_iter().collect(),
+            lease_expires: None,
         }
     }
 
@@ -250,6 +347,7 @@ mod tests {
             expires: Some(Utc::now() - Duration::days(1)),
             features: vec![],
             machine_codes: vec![],
+            lease_expires: None,
         };
         let signed = sign_license(&private, &payload).unwrap();
 
@@ -328,6 +426,7 @@ mod tests {
             expires: None,
             features: vec!["full_fusion".to_string()],
             machine_codes: vec![],
+            lease_expires: None,
         };
         let signed = sign_license(&private, &payload).unwrap();
 
@@ -335,6 +434,64 @@ mod tests {
         assert!(status.is_valid());
         assert!(status.expires().is_none());
         assert!(status.has_feature("full_fusion"));
+    }
+
+    #[test]
+    fn test_verify_valid_lease() {
+        let (_, pub_pem, private) = make_keypair_pems();
+        let client = LicenseClient::new(&pub_pem).unwrap();
+        let mut payload = make_valid_payload(None);
+        payload.lease_expires = Some(Utc::now() + Duration::days(7));
+        let signed = sign_license(&private, &payload).unwrap();
+
+        let status = client.verify_signed(&signed);
+        assert!(status.is_valid());
+        assert!(!status.needs_renewal());
+        assert!(status.lease_expires().is_some());
+    }
+
+    #[test]
+    fn test_verify_expired_lease_in_grace() {
+        let (_, pub_pem, private) = make_keypair_pems();
+        let mut client = LicenseClient::new(&pub_pem).unwrap();
+        client.set_grace_hours(24);
+
+        let mut payload = make_valid_payload(None);
+        payload.lease_expires = Some(Utc::now() - Duration::hours(2)); // expired 2h ago
+        let signed = sign_license(&private, &payload).unwrap();
+
+        let status = client.verify_signed(&signed);
+        assert!(status.is_valid()); // still valid in grace
+        assert!(status.needs_renewal());
+        assert!(matches!(status, LicenseStatus::ValidGracePeriod { .. }));
+    }
+
+    #[test]
+    fn test_verify_expired_lease_past_grace() {
+        let (_, pub_pem, private) = make_keypair_pems();
+        let mut client = LicenseClient::new(&pub_pem).unwrap();
+        client.set_grace_hours(24);
+
+        let mut payload = make_valid_payload(None);
+        payload.lease_expires = Some(Utc::now() - Duration::hours(48)); // expired 48h ago
+        let signed = sign_license(&private, &payload).unwrap();
+
+        let status = client.verify_signed(&signed);
+        assert!(!status.is_valid());
+        assert!(matches!(status, LicenseStatus::LeaseExpired { .. }));
+    }
+
+    #[test]
+    fn test_verify_no_lease_enforcement() {
+        let (_, pub_pem, private) = make_keypair_pems();
+        let client = LicenseClient::new(&pub_pem).unwrap();
+        let mut payload = make_valid_payload(None);
+        payload.lease_expires = None;
+        let signed = sign_license(&private, &payload).unwrap();
+
+        let status = client.verify_signed(&signed);
+        assert!(status.is_valid());
+        assert!(!status.needs_renewal());
     }
 
     #[test]

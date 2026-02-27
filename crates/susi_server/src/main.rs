@@ -8,11 +8,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::Parser;
 use susi_core::crypto::{private_key_from_pem, sign_license};
 use susi_core::db::LicenseDb;
-use susi_core::License;
+use susi_core::{License, DEFAULT_LEASE_DURATION_HOURS, DEFAULT_LEASE_GRACE_HOURS};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +84,12 @@ struct CreateLicenseRequest {
     features: Vec<String>,
     #[serde(default = "default_max_machines")]
     max_machines: u32,
+    /// Lease duration in hours. 0 = no lease enforcement. Default: 168 (7 days).
+    #[serde(default = "default_lease_duration")]
+    lease_duration_hours: u32,
+    /// Grace period in hours after lease expires. Default: 24.
+    #[serde(default = "default_lease_grace")]
+    lease_grace_hours: u32,
 }
 
 fn default_product() -> String {
@@ -91,6 +97,12 @@ fn default_product() -> String {
 }
 fn default_max_machines() -> u32 {
     1
+}
+fn default_lease_duration() -> u32 {
+    DEFAULT_LEASE_DURATION_HOURS
+}
+fn default_lease_grace() -> u32 {
+    DEFAULT_LEASE_GRACE_HOURS
 }
 
 #[derive(Deserialize)]
@@ -115,7 +127,10 @@ struct LicenseSummary {
     expires: String,
     features: Vec<String>,
     max_machines: u32,
-    machine_count: usize,
+    lease_duration_hours: u32,
+    lease_grace_hours: u32,
+    active_machine_count: usize,
+    total_machine_count: usize,
     machines: Vec<MachineSummary>,
     revoked: bool,
 }
@@ -125,9 +140,12 @@ struct MachineSummary {
     machine_code: String,
     friendly_name: String,
     activated_at: String,
+    lease_expires_at: Option<String>,
+    lease_active: bool,
 }
 
 fn license_to_summary(lic: &License) -> LicenseSummary {
+    let now = Utc::now();
     LicenseSummary {
         id: lic.id.clone(),
         license_key: lic.license_key.clone(),
@@ -140,7 +158,10 @@ fn license_to_summary(lic: &License) -> LicenseSummary {
             .unwrap_or_else(|| "perpetual".to_string()),
         features: lic.features.clone(),
         max_machines: lic.max_machines,
-        machine_count: lic.machines.len(),
+        lease_duration_hours: lic.lease_duration_hours,
+        lease_grace_hours: lic.lease_grace_hours,
+        active_machine_count: lic.active_machine_count(),
+        total_machine_count: lic.machines.len(),
         machines: lic
             .machines
             .iter()
@@ -148,6 +169,8 @@ fn license_to_summary(lic: &License) -> LicenseSummary {
                 machine_code: m.machine_code.clone(),
                 friendly_name: m.friendly_name.clone(),
                 activated_at: m.activated_at.to_rfc3339(),
+                lease_expires_at: m.lease_expires_at.map(|dt| dt.to_rfc3339()),
+                lease_active: m.is_lease_active(now),
             })
             .collect(),
         revoked: lic.revoked,
@@ -184,6 +207,14 @@ fn check_admin(headers: &HeaderMap, admin_key: &str) -> Result<(), (StatusCode, 
 // Public endpoints (client-facing)
 // ---------------------------------------------------------------------------
 
+fn compute_lease_expires(license: &License) -> Option<DateTime<Utc>> {
+    if license.lease_duration_hours == 0 {
+        None
+    } else {
+        Some(Utc::now() + Duration::hours(license.lease_duration_hours as i64))
+    }
+}
+
 async fn handle_activate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ActivateRequest>,
@@ -216,7 +247,8 @@ async fn handle_activate(
         req.friendly_name.clone()
     };
 
-    db.add_machine_activation(&license.id, &req.machine_code, &name)
+    let lease_expires = compute_lease_expires(&license);
+    db.add_machine_activation(&license.id, &req.machine_code, &name, lease_expires)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let license = db
@@ -224,7 +256,7 @@ async fn handle_activate(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .unwrap();
 
-    let payload = license.to_payload();
+    let payload = license.to_payload_for(Some(&req.machine_code));
     let signed = sign_license(&state.private_key, &payload)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
@@ -257,7 +289,22 @@ async fn handle_verify(
         ));
     }
 
-    let payload = license.to_payload();
+    // Renew the lease on verify (acts as heartbeat)
+    if license.uses_leases() {
+        let lease_expires = compute_lease_expires(&license);
+        let activation = license.machines.iter().find(|m| m.machine_code == req.machine_code);
+        let name = activation.map(|a| a.friendly_name.as_str()).unwrap_or("Unknown");
+        db.add_machine_activation(&license.id, &req.machine_code, name, lease_expires)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    }
+
+    // Re-fetch to get updated lease
+    let license = db
+        .get_license_by_key(&req.license_key)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .unwrap();
+
+    let payload = license.to_payload_for(Some(&req.machine_code));
     let signed = sign_license(&state.private_key, &payload)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
@@ -339,13 +386,15 @@ async fn handle_create_license(
         })
     };
 
-    let license = License::new(
+    let mut license = License::new(
         req.product,
         req.customer,
         expires_dt,
         req.features,
         req.max_machines,
     );
+    license.lease_duration_hours = req.lease_duration_hours;
+    license.lease_grace_hours = req.lease_grace_hours;
 
     let db = state.db.lock().unwrap();
     db.insert_license(&license)
@@ -408,7 +457,8 @@ async fn handle_export_license(
         req.friendly_name.clone()
     };
 
-    db.add_machine_activation(&license.id, &req.machine_code, &name)
+    let lease_expires = compute_lease_expires(&license);
+    db.add_machine_activation(&license.id, &req.machine_code, &name, lease_expires)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     // Re-fetch with the activation
@@ -417,7 +467,7 @@ async fn handle_export_license(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .unwrap();
 
-    let payload = license.to_payload();
+    let payload = license.to_payload_for(Some(&req.machine_code));
     let signed = sign_license(&state.private_key, &payload)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 

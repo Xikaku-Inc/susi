@@ -29,7 +29,9 @@ impl LicenseDb {
                 expires TEXT NOT NULL,
                 features TEXT NOT NULL,
                 max_machines INTEGER NOT NULL DEFAULT 0,
-                revoked INTEGER NOT NULL DEFAULT 0
+                revoked INTEGER NOT NULL DEFAULT 0,
+                lease_duration_hours INTEGER NOT NULL DEFAULT 168,
+                lease_grace_hours INTEGER NOT NULL DEFAULT 24
             );
 
             CREATE TABLE IF NOT EXISTS machine_activations (
@@ -38,6 +40,7 @@ impl LicenseDb {
                 machine_code TEXT NOT NULL,
                 friendly_name TEXT NOT NULL DEFAULT '',
                 activated_at TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (license_id) REFERENCES licenses(id),
                 UNIQUE(license_id, machine_code)
             );
@@ -46,6 +49,30 @@ impl LicenseDb {
             CREATE INDEX IF NOT EXISTS idx_activations_license ON machine_activations(license_id);",
             )
             .map_err(|e| LicenseError::Other(format!("DB init: {}", e)))?;
+        self.migrate()?;
+        Ok(())
+    }
+
+    fn migrate(&self) -> Result<(), LicenseError> {
+        // Add lease columns to existing databases
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE licenses ADD COLUMN lease_duration_hours INTEGER NOT NULL DEFAULT 168;
+             ALTER TABLE licenses ADD COLUMN lease_grace_hours INTEGER NOT NULL DEFAULT 24;
+             ALTER TABLE machine_activations ADD COLUMN lease_expires_at TEXT NOT NULL DEFAULT '';"
+        );
+        Ok(())
+    }
+
+    /// Delete machine activations whose lease has expired (cleanup on access).
+    pub fn cleanup_expired_leases(&self, license_id: &str) -> Result<(), LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "DELETE FROM machine_activations
+                 WHERE license_id = ?1 AND lease_expires_at != '' AND lease_expires_at < ?2",
+                params![license_id, now],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB cleanup: {}", e)))?;
         Ok(())
     }
 
@@ -57,8 +84,8 @@ impl LicenseDb {
             .unwrap_or_default();
         self.conn
             .execute(
-                "INSERT INTO licenses (id, product, customer, license_key, created, expires, features, max_machines, revoked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO licenses (id, product, customer, license_key, created, expires, features, max_machines, revoked, lease_duration_hours, lease_grace_hours)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     license.id,
                     license.product,
@@ -69,6 +96,8 @@ impl LicenseDb {
                     features_json,
                     license.max_machines,
                     license.revoked as i32,
+                    license.lease_duration_hours,
+                    license.lease_grace_hours,
                 ],
             )
             .map_err(|e| LicenseError::Other(format!("DB insert: {}", e)))?;
@@ -79,7 +108,7 @@ impl LicenseDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, product, customer, license_key, created, expires, features, max_machines, revoked
+                "SELECT id, product, customer, license_key, created, expires, features, max_machines, revoked, lease_duration_hours, lease_grace_hours
              FROM licenses WHERE license_key = ?1",
             )
             .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
@@ -124,6 +153,13 @@ impl LicenseDb {
             )
         };
 
+        let lease_duration_hours: u32 = row
+            .get(9)
+            .map_err(|e| LicenseError::Other(format!("DB get: {}", e)))?;
+
+        // Cleanup expired leases immediately
+        self.cleanup_expired_leases(&id)?;
+
         let mut license = License {
             id: id.clone(),
             product: row
@@ -140,6 +176,10 @@ impl LicenseDb {
             features,
             max_machines: row
                 .get::<_, u32>(7)
+                .map_err(|e| LicenseError::Other(format!("DB get: {}", e)))?,
+            lease_duration_hours,
+            lease_grace_hours: row
+                .get(10)
                 .map_err(|e| LicenseError::Other(format!("DB get: {}", e)))?,
             machines: Vec::new(),
             revoked: row
@@ -159,30 +199,40 @@ impl LicenseDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT machine_code, friendly_name, activated_at
+                "SELECT machine_code, friendly_name, activated_at, lease_expires_at
              FROM machine_activations WHERE license_id = ?1",
             )
             .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
 
         let activations = stmt
             .query_map(params![license_id], |row| {
-                let activated_str: String = row.get(2)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    activated_str,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
             .filter_map(|r| r.ok())
-            .filter_map(|(machine_code, friendly_name, activated_str)| {
+            .filter_map(|(machine_code, friendly_name, activated_str, lease_str)| {
                 let activated_at = DateTime::parse_from_rfc3339(&activated_str)
                     .ok()?
                     .with_timezone(&Utc);
+                let lease_expires_at = if lease_str.is_empty() {
+                    None
+                } else {
+                    Some(
+                        DateTime::parse_from_rfc3339(&lease_str)
+                            .ok()?
+                            .with_timezone(&Utc),
+                    )
+                };
                 Some(MachineActivation {
                     machine_code,
                     friendly_name,
                     activated_at,
+                    lease_expires_at,
                 })
             })
             .collect();
@@ -195,16 +245,24 @@ impl LicenseDb {
         license_id: &str,
         machine_code: &str,
         friendly_name: &str,
+        lease_expires_at: Option<DateTime<Utc>>,
     ) -> Result<(), LicenseError> {
+        let lease_str = lease_expires_at
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default();
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO machine_activations (license_id, machine_code, friendly_name, activated_at)
-             VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO machine_activations (license_id, machine_code, friendly_name, activated_at, lease_expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(license_id, machine_code) DO UPDATE SET
+                activated_at = excluded.activated_at,
+                lease_expires_at = excluded.lease_expires_at",
                 params![
                     license_id,
                     machine_code,
                     friendly_name,
                     Utc::now().to_rfc3339(),
+                    lease_str,
                 ],
             )
             .map_err(|e| LicenseError::Other(format!("DB insert: {}", e)))?;
@@ -240,27 +298,25 @@ impl LicenseDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, product, customer, license_key, created, expires, features, max_machines, revoked
+                "SELECT id, product, customer, license_key, created, expires, features, max_machines, revoked, lease_duration_hours, lease_grace_hours
              FROM licenses ORDER BY created DESC",
             )
             .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
 
         let rows = stmt
             .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let features_json: String = row.get(6)?;
-                let created_str: String = row.get(4)?;
-                let expires_str: String = row.get(5)?;
                 Ok((
-                    id,
+                    row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    created_str,
-                    expires_str,
-                    features_json,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                     row.get::<_, u32>(7)?,
                     row.get::<_, i32>(8)?,
+                    row.get::<_, u32>(9)?,
+                    row.get::<_, u32>(10)?,
                 ))
             })
             .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
@@ -277,6 +333,8 @@ impl LicenseDb {
                 features_json,
                 max_machines,
                 revoked,
+                lease_duration_hours,
+                lease_grace_hours,
             ) = row.map_err(|e| LicenseError::Other(format!("DB row: {}", e)))?;
 
             let features: Vec<String> = serde_json::from_str(&features_json).unwrap_or_default();
@@ -293,6 +351,9 @@ impl LicenseDb {
                 )
             };
 
+            // Cleanup expired leases
+            let _ = self.cleanup_expired_leases(&id);
+
             let machines = self.get_machine_activations(&id).unwrap_or_default();
 
             licenses.push(License {
@@ -304,6 +365,8 @@ impl LicenseDb {
                 expires,
                 features,
                 max_machines,
+                lease_duration_hours,
+                lease_grace_hours,
                 machines,
                 revoked: revoked != 0,
             });
@@ -317,9 +380,14 @@ impl LicenseDb {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use crate::license::DEFAULT_LEASE_DURATION_HOURS;
 
     fn test_db() -> LicenseDb {
         LicenseDb::open(":memory:").unwrap()
+    }
+
+    fn lease_expires(hours: i64) -> Option<DateTime<Utc>> {
+        Some(Utc::now() + Duration::hours(hours))
     }
 
     #[test]
@@ -344,6 +412,7 @@ mod tests {
         assert_eq!(retrieved.customer, "Test Corp");
         assert_eq!(retrieved.features, vec!["full_fusion"]);
         assert_eq!(retrieved.max_machines, 3);
+        assert_eq!(retrieved.lease_duration_hours, DEFAULT_LEASE_DURATION_HOURS);
         assert!(!retrieved.revoked);
     }
 
@@ -359,9 +428,10 @@ mod tests {
         );
         db.insert_license(&license).unwrap();
 
-        db.add_machine_activation(&license.id, "machine1", "ECU-1")
+        let lease = lease_expires(168);
+        db.add_machine_activation(&license.id, "machine1", "ECU-1", lease)
             .unwrap();
-        db.add_machine_activation(&license.id, "machine2", "ECU-2")
+        db.add_machine_activation(&license.id, "machine2", "ECU-2", lease)
             .unwrap();
 
         let retrieved = db
@@ -369,6 +439,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retrieved.machines.len(), 2);
+        assert!(retrieved.machines[0].lease_expires_at.is_some());
 
         db.remove_machine_activation(&license.id, "machine1")
             .unwrap();
@@ -378,6 +449,87 @@ mod tests {
             .unwrap();
         assert_eq!(retrieved.machines.len(), 1);
         assert_eq!(retrieved.machines[0].machine_code, "machine2");
+    }
+
+    #[test]
+    fn test_expired_lease_cleaned_on_access() {
+        let db = test_db();
+        let license = License::new(
+            "FusionHub".to_string(),
+            "Test".to_string(),
+            Some(Utc::now() + Duration::days(30)),
+            vec![],
+            1,
+        );
+        db.insert_license(&license).unwrap();
+
+        // Add a machine with an already-expired lease
+        let expired_lease = Some(Utc::now() - Duration::hours(1));
+        db.add_machine_activation(&license.id, "old_machine", "Old", expired_lease)
+            .unwrap();
+
+        // Access triggers cleanup
+        let retrieved = db
+            .get_license_by_key(&license.license_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.machines.len(), 0);
+    }
+
+    #[test]
+    fn test_lease_renewal_updates_expiry() {
+        let db = test_db();
+        let license = License::new(
+            "FusionHub".to_string(),
+            "Test".to_string(),
+            Some(Utc::now() + Duration::days(30)),
+            vec![],
+            1,
+        );
+        db.insert_license(&license).unwrap();
+
+        let lease1 = Some(Utc::now() + Duration::hours(1));
+        db.add_machine_activation(&license.id, "machine1", "M1", lease1)
+            .unwrap();
+
+        // Renew with longer lease
+        let lease2 = Some(Utc::now() + Duration::hours(168));
+        db.add_machine_activation(&license.id, "machine1", "M1", lease2)
+            .unwrap();
+
+        let retrieved = db
+            .get_license_by_key(&license.license_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.machines.len(), 1);
+        // The lease should have been updated (closer to 168h than 1h from now)
+        let lease_dt = retrieved.machines[0].lease_expires_at.unwrap();
+        let hours_remaining = (lease_dt - Utc::now()).num_hours();
+        assert!(hours_remaining > 100);
+    }
+
+    #[test]
+    fn test_no_lease_activation() {
+        let db = test_db();
+        let mut license = License::new(
+            "FusionHub".to_string(),
+            "Test".to_string(),
+            Some(Utc::now() + Duration::days(30)),
+            vec![],
+            1,
+        );
+        license.lease_duration_hours = 0;
+        db.insert_license(&license).unwrap();
+
+        db.add_machine_activation(&license.id, "machine1", "M1", None)
+            .unwrap();
+
+        let retrieved = db
+            .get_license_by_key(&license.license_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.machines.len(), 1);
+        assert!(retrieved.machines[0].lease_expires_at.is_none());
     }
 
     #[test]
@@ -448,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_machine_ignored() {
+    fn test_duplicate_machine_renews() {
         let db = test_db();
         let license = License::new(
             "FusionHub".to_string(),
@@ -459,9 +611,10 @@ mod tests {
         );
         db.insert_license(&license).unwrap();
 
-        db.add_machine_activation(&license.id, "machine1", "M1")
+        let lease = lease_expires(168);
+        db.add_machine_activation(&license.id, "machine1", "M1", lease)
             .unwrap();
-        db.add_machine_activation(&license.id, "machine1", "M1 again")
+        db.add_machine_activation(&license.id, "machine1", "M1 again", lease)
             .unwrap();
 
         let retrieved = db

@@ -6,7 +6,7 @@ use susi_core::crypto::{
 };
 use susi_core::db::LicenseDb;
 use susi_core::fingerprint;
-use susi_core::License;
+use susi_core::{License, DEFAULT_LEASE_DURATION_HOURS, DEFAULT_LEASE_GRACE_HOURS};
 
 #[derive(Parser)]
 #[command(name = "susi-admin", about = "Susi License Administration Tool")]
@@ -50,6 +50,12 @@ enum Commands {
         /// Maximum number of machines (0 = unlimited)
         #[arg(long, default_value = "1")]
         max_machines: u32,
+        /// Lease duration in hours (0 = no lease enforcement)
+        #[arg(long, default_value_t = DEFAULT_LEASE_DURATION_HOURS)]
+        lease_duration: u32,
+        /// Grace period in hours after lease expiry
+        #[arg(long, default_value_t = DEFAULT_LEASE_GRACE_HOURS)]
+        lease_grace: u32,
         /// Path to SQLite database
         #[arg(long, default_value = "licenses.db")]
         db: String,
@@ -110,6 +116,25 @@ enum Commands {
         db: String,
     },
 
+    /// Export a signed license to a USB hardware token
+    ExportToken {
+        /// License key (XXXXX-XXXXX-XXXXX-XXXXX)
+        #[arg(long)]
+        key: String,
+        /// Path to private key PEM file
+        #[arg(long, default_value = "private.pem")]
+        private_key: String,
+        /// Path to SQLite database
+        #[arg(long, default_value = "licenses.db")]
+        db: String,
+        /// Friendly name for this token activation
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Override USB serial (skip auto-detection)
+        #[arg(long)]
+        usb_serial: Option<String>,
+    },
+
     /// Print the hardware fingerprint of this machine
     Fingerprint,
 }
@@ -128,8 +153,10 @@ fn main() -> Result<()> {
             perpetual,
             features,
             max_machines,
+            lease_duration,
+            lease_grace,
             db,
-        } => cmd_create(&product, &customer, expires, days, perpetual, &features, max_machines, &db),
+        } => cmd_create(&product, &customer, expires, days, perpetual, &features, max_machines, lease_duration, lease_grace, &db),
         Commands::Export {
             key,
             machine_code,
@@ -146,6 +173,13 @@ fn main() -> Result<()> {
             machine_code,
             db,
         } => cmd_deactivate(&key, &machine_code, &db),
+        Commands::ExportToken {
+            key,
+            private_key,
+            db,
+            name,
+            usb_serial,
+        } => cmd_export_token(&key, &private_key, &db, &name, usb_serial),
         Commands::Fingerprint => cmd_fingerprint(),
     }
 }
@@ -181,6 +215,8 @@ fn cmd_create(
     perpetual: bool,
     features: &str,
     max_machines: u32,
+    lease_duration: u32,
+    lease_grace: u32,
     db_path: &str,
 ) -> Result<()> {
     let expires_dt = if perpetual {
@@ -205,13 +241,15 @@ fn cmd_create(
         .filter(|s| !s.is_empty())
         .collect();
 
-    let license = License::new(
+    let mut license = License::new(
         product.to_string(),
         customer.to_string(),
         expires_dt,
         feature_list,
         max_machines,
     );
+    license.lease_duration_hours = lease_duration;
+    license.lease_grace_hours = lease_grace;
 
     let db = LicenseDb::open(db_path)?;
     db.insert_license(&license)?;
@@ -235,6 +273,14 @@ fn cmd_create(
             "unlimited".to_string()
         } else {
             license.max_machines.to_string()
+        }
+    );
+    println!(
+        "  Lease:        {}",
+        if license.lease_duration_hours == 0 {
+            "disabled (perpetual activations)".to_string()
+        } else {
+            format!("{}h (grace: {}h)", license.lease_duration_hours, license.lease_grace_hours)
         }
     );
     println!("  ID:           {}", license.id);
@@ -292,11 +338,16 @@ fn cmd_export(
     } else {
         friendly_name.to_string()
     };
-    db.add_machine_activation(&license.id, &machine_code, &name)?;
+    let lease_expires = if license.lease_duration_hours == 0 {
+        None
+    } else {
+        Some(Utc::now() + Duration::hours(license.lease_duration_hours as i64))
+    };
+    db.add_machine_activation(&license.id, &machine_code, &name, lease_expires)?;
 
     // Re-fetch license with the new activation
     let license = db.get_license_by_key(key)?.unwrap();
-    let payload = license.to_payload();
+    let payload = license.to_payload_for(Some(&machine_code));
     let signed = sign_license(&private_key, &payload)?;
 
     let json = serde_json::to_string_pretty(&signed)?;
@@ -325,10 +376,10 @@ fn cmd_list(db_path: &str) -> Result<()> {
     }
 
     println!(
-        "{:<25} {:<20} {:<12} {:<8} {:<10} {}",
-        "KEY", "CUSTOMER", "EXPIRES", "STATUS", "MACHINES", "FEATURES"
+        "{:<25} {:<20} {:<12} {:<8} {:<10} {:<10} {}",
+        "KEY", "CUSTOMER", "EXPIRES", "STATUS", "MACHINES", "LEASE", "FEATURES"
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(100));
 
     for lic in &licenses {
         let status = if lic.revoked {
@@ -338,19 +389,25 @@ fn cmd_list(db_path: &str) -> Result<()> {
         } else {
             "ACTIVE"
         };
-        let machines = format!("{}/{}", lic.machines.len(), lic.max_machines);
+        let machines = format!("{}/{}", lic.active_machine_count(), lic.max_machines);
+        let lease_str = if lic.lease_duration_hours == 0 {
+            "off".to_string()
+        } else {
+            format!("{}h", lic.lease_duration_hours)
+        };
 
         let expires_str = match &lic.expires {
             Some(dt) => dt.format("%Y-%m-%d").to_string(),
             None => "PERPETUAL".to_string(),
         };
         println!(
-            "{:<25} {:<20} {:<12} {:<8} {:<10} {}",
+            "{:<25} {:<20} {:<12} {:<8} {:<10} {:<10} {}",
             lic.license_key,
             truncate(&lic.customer, 18),
             expires_str,
             status,
             machines,
+            lease_str,
             lic.features.join(", "),
         );
     }
@@ -379,6 +436,115 @@ fn cmd_deactivate(key: &str, machine_code: &str, db_path: &str) -> Result<()> {
 
     db.remove_machine_activation(&license.id, machine_code)?;
     println!("Machine {} deactivated from license {}.", machine_code, key);
+    Ok(())
+}
+
+fn cmd_export_token(
+    key: &str,
+    private_key_path: &str,
+    db_path: &str,
+    friendly_name: &str,
+    usb_serial_override: Option<String>,
+) -> Result<()> {
+    let devices = susi_core::usb::enumerate_usb_devices()
+        .context("Failed to enumerate USB devices")?;
+
+    if devices.is_empty() {
+        bail!("No USB mass storage devices found. Please insert a USB stick.");
+    }
+
+    let device = if let Some(ref serial) = usb_serial_override {
+        devices
+            .iter()
+            .find(|d| d.serial == *serial)
+            .with_context(|| {
+                let list: Vec<String> = devices
+                    .iter()
+                    .map(|d| format!("  {} - {} ({})", d.serial, d.name, d.mount_path.display()))
+                    .collect();
+                format!(
+                    "No USB device with serial '{}' found. Connected devices:\n{}",
+                    serial,
+                    list.join("\n")
+                )
+            })?
+            .clone()
+    } else if devices.len() == 1 {
+        devices[0].clone()
+    } else {
+        println!("Multiple USB devices found:");
+        for (i, dev) in devices.iter().enumerate() {
+            println!(
+                "  [{}] {} - {} ({})",
+                i + 1,
+                dev.serial,
+                dev.name,
+                dev.mount_path.display()
+            );
+        }
+        bail!(
+            "Multiple USB devices found. Use --usb-serial to specify which one.\n\
+             Example: --usb-serial {}",
+            devices[0].serial
+        );
+    };
+
+    println!("Using USB device: {} ({})", device.name, device.serial);
+
+    let priv_pem = std::fs::read_to_string(private_key_path)
+        .with_context(|| format!("Failed to read private key from {}", private_key_path))?;
+    let private_key = private_key_from_pem(&priv_pem)?;
+
+    let db = LicenseDb::open(db_path)?;
+    let license = db
+        .get_license_by_key(key)?
+        .with_context(|| format!("License key not found: {}", key))?;
+
+    if license.revoked {
+        bail!("License has been revoked");
+    }
+    if license.is_expired() {
+        bail!("License has expired");
+    }
+
+    let payload = susi_core::LicensePayload {
+        id: license.id.clone(),
+        product: license.product.clone(),
+        customer: license.customer.clone(),
+        license_key: license.license_key.clone(),
+        created: license.created,
+        expires: license.expires,
+        features: license.features.clone(),
+        machine_codes: vec![],
+        lease_expires: None,
+    };
+
+    let signed = sign_license(&private_key, &payload)?;
+    susi_core::token::write_token(&device.mount_path, &signed, &device.serial)?;
+
+    let activation_code = format!("usb:{}", device.serial);
+    let name = if friendly_name.is_empty() {
+        format!("USB Token: {}", device.name)
+    } else {
+        friendly_name.to_string()
+    };
+    db.add_machine_activation(&license.id, &activation_code, &name, None)?;
+
+    println!("License exported to USB token successfully!");
+    println!("  Token:    {} at {}", device.name, device.mount_path.display());
+    println!("  Serial:   {}", device.serial);
+    println!(
+        "  File:     {}",
+        susi_core::token::token_file_path(&device.mount_path).display()
+    );
+    println!(
+        "  Expires:  {}",
+        match &license.expires {
+            Some(dt) => dt.format("%Y-%m-%d").to_string(),
+            None => "PERPETUAL".to_string(),
+        }
+    );
+
     Ok(())
 }
 

@@ -41,6 +41,15 @@ pub enum LicenseError {
     #[error("PEM error: {0}")]
     Pem(String),
 
+    #[error("USB error: {0}")]
+    UsbError(String),
+
+    #[error("No USB token found")]
+    UsbTokenNotFound,
+
+    #[error("Token decryption failed: {0}")]
+    TokenDecryptionFailed(String),
+
     #[error("{0}")]
     Other(String),
 }

@@ -13,15 +13,20 @@
 #include <openssl/pem.h>
 #include <openssl/sha.h>
 
+#include <openssl/hmac.h>
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <iphlpapi.h>
 #include <windows.h>
+#include <winioctl.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #else
+#include <climits>
 #include <dirent.h>
 #include <unistd.h>
+#include <unordered_map>
 #endif
 
 using json = nlohmann::json;
@@ -240,6 +245,28 @@ static std::string getMachineCode()
 // ---------------------------------------------------------------------------
 // ISO 8601 date parsing (enough for RFC 3339 timestamps from our licenses)
 // ---------------------------------------------------------------------------
+static time_t parseIsoTimestamp(const std::string& str)
+{
+    std::tm tm = {};
+#ifdef _WIN32
+    int parsed = sscanf_s(str.c_str(), "%d-%d-%dT%d:%d:%d",
+#else
+    int parsed = sscanf(str.c_str(), "%d-%d-%dT%d:%d:%d",
+#endif
+                        &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+                        &tm.tm_hour, &tm.tm_min, &tm.tm_sec);
+    if (parsed >= 6) {
+        tm.tm_year -= 1900;
+        tm.tm_mon -= 1;
+#ifdef _WIN32
+        return _mkgmtime(&tm);
+#else
+        return timegm(&tm);
+#endif
+    }
+    return -1;
+}
+
 static bool isExpired(const json& payload)
 {
     if (!payload.contains("expires") || payload.at("expires").is_null()) {
@@ -247,30 +274,12 @@ static bool isExpired(const json& payload)
     }
 
     std::string expiresStr = payload.at("expires").get<std::string>();
-
-    std::tm tm = {};
-#ifdef _WIN32
-    int parsed = sscanf_s(expiresStr.c_str(), "%d-%d-%dT%d:%d:%d",
-#else
-    int parsed = sscanf(expiresStr.c_str(), "%d-%d-%dT%d:%d:%d",
-#endif
-                        &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
-                        &tm.tm_hour, &tm.tm_min, &tm.tm_sec);
-    if (parsed >= 6) {
-        tm.tm_year -= 1900;
-        tm.tm_mon -= 1;
-
-#ifdef _WIN32
-        time_t expires = _mkgmtime(&tm);
-#else
-        time_t expires = timegm(&tm);
-#endif
-        time_t now = time(nullptr);
-        return now > expires;
+    time_t expires = parseIsoTimestamp(expiresStr);
+    if (expires == -1) {
+        SUSI_LOG("Could not parse expires date: %s", expiresStr.c_str());
+        return true; // fail safe
     }
-
-    SUSI_LOG("Could not parse expires date: %s", expiresStr.c_str());
-    return true; // fail safe: treat unparseable as expired
+    return time(nullptr) > expires;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +310,7 @@ static std::string getPublicKeyPem()
 bool SusiClient::checkLicense(std::string jsonLicenseInfo)
 {
     m_features.clear();
+    m_leaseExpiresEpoch = 0;
 
     if (std::string(DEFAULT_PUBLIC_KEY).empty()) {
         SUSI_LOG("No public key compiled in, skipping license check");
@@ -391,6 +401,26 @@ bool SusiClient::checkLicense(std::string jsonLicenseInfo)
         }
     }
 
+    // Check lease expiry
+    if (payload.contains("lease_expires") && !payload.at("lease_expires").is_null()) {
+        std::string leaseStr = payload.at("lease_expires").get<std::string>();
+        time_t leaseExpires = parseIsoTimestamp(leaseStr);
+        if (leaseExpires == -1) {
+            SUSI_LOG("Could not parse lease_expires: %s", leaseStr.c_str());
+            return false;
+        }
+        m_leaseExpiresEpoch = static_cast<int64_t>(leaseExpires);
+        time_t now = time(nullptr);
+        time_t graceEnd = leaseExpires + static_cast<time_t>(m_graceHours * 3600);
+        if (now > graceEnd) {
+            SUSI_LOG("Lease expired (at %s, grace period exhausted)", leaseStr.c_str());
+            return false;
+        }
+        if (now > leaseExpires) {
+            SUSI_LOG("Lease expired at %s, in grace period — renew soon!", leaseStr.c_str());
+        }
+    }
+
     // Extract features
     if (payload.contains("features") && payload.at("features").is_array()) {
         for (const auto& f : payload.at("features")) {
@@ -425,7 +455,356 @@ bool SusiClient::checkLicense(std::string jsonLicenseInfo)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// USB hardware token support
+// ---------------------------------------------------------------------------
+
+struct UsbDeviceInfo {
+    std::string serial;
+    std::string mountPath;
+    std::string name;
+};
+
+#ifdef _WIN32
+static std::vector<UsbDeviceInfo> enumerateUsbDevices()
+{
+    std::vector<UsbDeviceInfo> devices;
+
+    wchar_t driveStrings[512];
+    DWORD len = GetLogicalDriveStringsW(sizeof(driveStrings) / sizeof(wchar_t), driveStrings);
+    if (len == 0) return devices;
+
+    for (wchar_t* drive = driveStrings; *drive != L'\0'; drive += wcslen(drive) + 1) {
+        if (GetDriveTypeW(drive) != DRIVE_REMOVABLE) continue;
+
+        wchar_t devicePath[16];
+        swprintf_s(devicePath, L"\\\\.\\%c:", drive[0]);
+
+        HANDLE hDevice = CreateFileW(
+            devicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hDevice == INVALID_HANDLE_VALUE) continue;
+
+        STORAGE_PROPERTY_QUERY query = {};
+        query.PropertyId = StorageDeviceProperty;
+        query.QueryType = PropertyStandardQuery;
+
+        BYTE buffer[1024] = {};
+        DWORD returned = 0;
+        BOOL ok = DeviceIoControl(hDevice, IOCTL_STORAGE_QUERY_PROPERTY,
+            &query, sizeof(query), buffer, sizeof(buffer), &returned, nullptr);
+        CloseHandle(hDevice);
+        if (!ok) continue;
+
+        auto* desc = reinterpret_cast<STORAGE_DEVICE_DESCRIPTOR*>(buffer);
+        if (desc->SerialNumberOffset == 0 || desc->SerialNumberOffset >= sizeof(buffer)) continue;
+
+        std::string serial(reinterpret_cast<char*>(buffer + desc->SerialNumberOffset));
+        while (!serial.empty() && (serial.back() == ' ' || serial.back() == '\0'))
+            serial.pop_back();
+        if (serial.empty()) continue;
+
+        wchar_t volumeName[MAX_PATH + 1] = {};
+        GetVolumeInformationW(drive, volumeName, MAX_PATH + 1,
+            nullptr, nullptr, nullptr, nullptr, 0);
+
+        int needed = WideCharToMultiByte(CP_UTF8, 0, volumeName, -1, nullptr, 0, nullptr, nullptr);
+        std::string label(needed > 0 ? needed - 1 : 0, '\0');
+        if (needed > 0)
+            WideCharToMultiByte(CP_UTF8, 0, volumeName, -1, label.data(), needed, nullptr, nullptr);
+
+        needed = WideCharToMultiByte(CP_UTF8, 0, drive, -1, nullptr, 0, nullptr, nullptr);
+        std::string mountPath(needed > 0 ? needed - 1 : 0, '\0');
+        if (needed > 0)
+            WideCharToMultiByte(CP_UTF8, 0, drive, -1, mountPath.data(), needed, nullptr, nullptr);
+
+        devices.push_back({serial, mountPath, label.empty() ? "USB Drive" : label});
+    }
+    return devices;
+}
+#else
+static std::vector<UsbDeviceInfo> enumerateUsbDevices()
+{
+    std::vector<UsbDeviceInfo> devices;
+
+    // Parse /proc/mounts
+    std::unordered_map<std::string, std::string> mounts;
+    std::ifstream mountsFile("/proc/mounts");
+    std::string line;
+    while (std::getline(mountsFile, line)) {
+        std::istringstream iss(line);
+        std::string dev, mount;
+        iss >> dev >> mount;
+        mounts[dev] = mount;
+    }
+
+    DIR* blockDir = opendir("/sys/block");
+    if (!blockDir) return devices;
+
+    struct dirent* entry;
+    while ((entry = readdir(blockDir)) != nullptr) {
+        std::string blockName = entry->d_name;
+        if (blockName.substr(0, 2) != "sd") continue;
+
+        // Check removable
+        std::string remPath = "/sys/block/" + blockName + "/removable";
+        std::ifstream remFile(remPath);
+        std::string remVal;
+        if (!remFile.is_open() || !std::getline(remFile, remVal) || remVal != "1") continue;
+
+        // Walk sysfs for USB serial
+        std::string devLink = "/sys/block/" + blockName + "/device";
+        char realPath[PATH_MAX];
+        if (!realpath(devLink.c_str(), realPath)) continue;
+
+        std::string serial;
+        std::string cur(realPath);
+        for (int i = 0; i < 6; ++i) {
+            std::string serialFile = cur + "/serial";
+            std::ifstream sf(serialFile);
+            if (sf.is_open()) {
+                std::getline(sf, serial);
+                while (!serial.empty() && isspace(serial.back())) serial.pop_back();
+                if (!serial.empty()) break;
+            }
+            auto pos = cur.rfind('/');
+            if (pos == std::string::npos) break;
+            cur = cur.substr(0, pos);
+        }
+        if (serial.empty()) continue;
+
+        // Find mount point
+        std::string devPath = "/dev/" + blockName;
+        std::string mountPoint;
+        for (int p = 1; p <= 9; ++p) {
+            auto it = mounts.find(devPath + std::to_string(p));
+            if (it != mounts.end()) { mountPoint = it->second; break; }
+        }
+        if (mountPoint.empty()) {
+            auto it = mounts.find(devPath);
+            if (it != mounts.end()) mountPoint = it->second;
+        }
+        if (mountPoint.empty()) continue;
+
+        std::string modelPath = "/sys/block/" + blockName + "/device/model";
+        std::string model = "USB Drive";
+        std::ifstream mf(modelPath);
+        if (mf.is_open()) {
+            std::getline(mf, model);
+            while (!model.empty() && isspace(model.back())) model.pop_back();
+        }
+
+        devices.push_back({serial, mountPoint, model});
+    }
+    closedir(blockDir);
+    return devices;
+}
+#endif
+
+// HKDF-SHA256 (extract-then-expand, compatible with OpenSSL 1.1.1+)
+static bool hkdfSha256(
+    const unsigned char* salt, size_t saltLen,
+    const unsigned char* ikm, size_t ikmLen,
+    const unsigned char* info, size_t infoLen,
+    unsigned char* okm, size_t okmLen)
+{
+    // Extract: PRK = HMAC-SHA256(salt, IKM)
+    unsigned char prk[32];
+    unsigned int prkLen = 0;
+    if (!HMAC(EVP_sha256(), salt, static_cast<int>(saltLen),
+              ikm, ikmLen, prk, &prkLen))
+        return false;
+
+    // Expand
+    unsigned char t[32] = {};
+    size_t tLen = 0;
+    size_t offset = 0;
+    unsigned char counter = 1;
+
+    while (offset < okmLen) {
+        HMAC_CTX* ctx = HMAC_CTX_new();
+        HMAC_Init_ex(ctx, prk, static_cast<int>(prkLen), EVP_sha256(), nullptr);
+        if (tLen > 0) HMAC_Update(ctx, t, tLen);
+        HMAC_Update(ctx, info, infoLen);
+        HMAC_Update(ctx, &counter, 1);
+        unsigned int len = 0;
+        HMAC_Final(ctx, t, &len);
+        HMAC_CTX_free(ctx);
+        tLen = len;
+
+        size_t copyLen = std::min(tLen, okmLen - offset);
+        memcpy(okm + offset, t, copyLen);
+        offset += copyLen;
+        counter++;
+    }
+    return true;
+}
+
+static bool deriveTokenKey(const std::string& serial, unsigned char keyOut[32])
+{
+    const char* salt = "susi-token-v1";
+    const char* info = "license-encryption";
+    return hkdfSha256(
+        reinterpret_cast<const unsigned char*>(salt), strlen(salt),
+        reinterpret_cast<const unsigned char*>(serial.data()), serial.size(),
+        reinterpret_cast<const unsigned char*>(info), strlen(info),
+        keyOut, 32);
+}
+
+static std::string decryptToken(const std::vector<unsigned char>& blob, const std::string& serial)
+{
+    const size_t NONCE_SIZE = 12;
+    const size_t TAG_SIZE = 16;
+
+    if (blob.size() < NONCE_SIZE + TAG_SIZE) return {};
+
+    unsigned char key[32];
+    if (!deriveTokenKey(serial, key)) return {};
+
+    const unsigned char* nonce = blob.data();
+    size_t ctLen = blob.size() - NONCE_SIZE - TAG_SIZE;
+    const unsigned char* ciphertext = blob.data() + NONCE_SIZE;
+    const unsigned char* tag = blob.data() + NONCE_SIZE + ctLen;
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return {};
+
+    std::vector<unsigned char> out(ctLen + 16);
+    int len = 0;
+    std::string plaintext;
+
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_SIZE, nullptr) == 1 &&
+        EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, nonce) == 1 &&
+        EVP_DecryptUpdate(ctx, out.data(), &len, ciphertext, static_cast<int>(ctLen)) == 1) {
+        int ptLen = len;
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_SIZE,
+                const_cast<unsigned char*>(tag)) == 1 &&
+            EVP_DecryptFinal_ex(ctx, out.data() + ptLen, &len) == 1) {
+            ptLen += len;
+            plaintext.assign(reinterpret_cast<char*>(out.data()), ptLen);
+        }
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    return plaintext;
+}
+
+bool SusiClient::checkLicenseToken()
+{
+    m_features.clear();
+    m_leaseExpiresEpoch = 0;
+
+    if (std::string(DEFAULT_PUBLIC_KEY).empty()) {
+        SUSI_LOG("No public key compiled in, skipping license check");
+        return true;
+    }
+
+    auto devices = enumerateUsbDevices();
+    if (devices.empty()) {
+        SUSI_LOG("No USB mass storage devices found");
+        return false;
+    }
+
+    for (const auto& dev : devices) {
+        std::string tokenPath = dev.mountPath;
+        if (!tokenPath.empty() && tokenPath.back() != '/' && tokenPath.back() != '\\') {
+#ifdef _WIN32
+            tokenPath += "\\";
+#else
+            tokenPath += "/";
+#endif
+        }
+        tokenPath += ".susi";
+#ifdef _WIN32
+        tokenPath += "\\license.bin";
+#else
+        tokenPath += "/license.bin";
+#endif
+
+        std::ifstream f(tokenPath, std::ios::binary);
+        if (!f.is_open()) continue;
+
+        std::vector<unsigned char> blob(
+            (std::istreambuf_iterator<char>(f)),
+            std::istreambuf_iterator<char>());
+        f.close();
+
+        std::string decrypted = decryptToken(blob, dev.serial);
+        if (decrypted.empty()) continue;
+
+        json signedLicense;
+        try {
+            signedLicense = json::parse(decrypted);
+        } catch (...) {
+            continue;
+        }
+
+        if (!signedLicense.contains("license_data") || !signedLicense.contains("signature"))
+            continue;
+
+        std::string licenseData = signedLicense.at("license_data").get<std::string>();
+        std::string signatureB64 = signedLicense.at("signature").get<std::string>();
+
+        auto signatureBytes = base64Decode(signatureB64);
+        if (signatureBytes.empty()) continue;
+
+        if (!verifySignature(getPublicKeyPem(), licenseData, signatureBytes))
+            continue;
+
+        json payload;
+        try {
+            payload = json::parse(licenseData);
+        } catch (...) {
+            continue;
+        }
+
+        if (isExpired(payload)) continue;
+
+        // Token-bound: no machine_codes check (machine_codes is empty)
+
+        // Extract features
+        if (payload.contains("features") && payload.at("features").is_array()) {
+            for (const auto& feat : payload.at("features")) {
+                if (feat.is_string())
+                    m_features.push_back(feat.get<std::string>());
+            }
+        }
+
+        std::string product = payload.value("product", std::string("unknown"));
+        std::string customer = payload.value("customer", std::string("unknown"));
+        SUSI_LOG("License valid via USB token '%s' (serial: %s, product: %s, customer: %s)",
+                 dev.name.c_str(), dev.serial.c_str(), product.c_str(), customer.c_str());
+        return true;
+    }
+
+    SUSI_LOG("No valid USB license token found");
+    return false;
+}
+
 bool SusiClient::hasFeature(const std::string& feature) const
 {
     return std::find(m_features.begin(), m_features.end(), feature) != m_features.end();
+}
+
+bool SusiClient::isLeaseValid() const
+{
+    if (m_leaseExpiresEpoch == 0) return true; // no lease enforcement
+    return time(nullptr) < static_cast<time_t>(m_leaseExpiresEpoch);
+}
+
+bool SusiClient::isInGracePeriod() const
+{
+    if (m_leaseExpiresEpoch == 0) return false;
+    time_t now = time(nullptr);
+    time_t expires = static_cast<time_t>(m_leaseExpiresEpoch);
+    time_t graceEnd = expires + static_cast<time_t>(m_graceHours * 3600);
+    return now >= expires && now < graceEnd;
+}
+
+bool SusiClient::isLeaseExpired() const
+{
+    if (m_leaseExpiresEpoch == 0) return false;
+    time_t now = time(nullptr);
+    time_t graceEnd = static_cast<time_t>(m_leaseExpiresEpoch) + static_cast<time_t>(m_graceHours * 3600);
+    return now >= graceEnd;
 }
