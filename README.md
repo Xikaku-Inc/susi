@@ -176,7 +176,7 @@ if (valid) {
 }
 ```
 
-Before building for production, paste your public key (from `susi-admin keygen`) into the `DEFAULT_PUBLIC_KEY` constant in `susi.cpp`. When the key is empty, license checks are skipped (development mode).
+Before building for production, paste your public key (from `susi-admin keygen`) into the `DEFAULT_PUBLIC_KEY` constant in `susi.cpp`.
 
 To use your own logging framework instead of `fprintf`, define `SUSI_LOG` before including `susi.cpp`:
 
