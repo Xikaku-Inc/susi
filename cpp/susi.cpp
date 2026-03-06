@@ -288,7 +288,6 @@ static bool isExpired(const json& payload)
 
 // Default embedded public key.
 // Replace this with your actual public key generated via: susi-admin keygen
-// When empty, license check is skipped (development mode).
 static const char* DEFAULT_PUBLIC_KEY = "";
 
 static std::string getPublicKeyPem()
