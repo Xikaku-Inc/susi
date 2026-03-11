@@ -149,19 +149,50 @@ match status {
 
 ### 5. Verify in your C++ application
 
-The `cpp/` directory contains a standalone C++ client (`susi.h` + `susi.cpp`) that uses OpenSSL for verification. Add it to your CMake project:
+The `cpp/` directory contains a standalone C++ client that uses OpenSSL for verification. There are two ways to integrate it:
 
+#### Option A: Conan package
+
+Build and publish the library to your local Conan cache, then consume it from your project:
+
+
+1. Install susi into your local cache, by executing this in the `cpp/` directory: `conan create .`
+2. In you project's conanfile, add: `requires = "susi/<version>"/self.requires("susi/<version>")`
+3. Add the following two lines to you ´CMakeLists.txt´:
 ```cmake
-add_subdirectory(susi/cpp)
-target_link_libraries(your_target PRIVATE susi)
+find_package(susi REQUIRED)
+...
+target_link_libraries(your_target PRIVATE susi::susi)
+```
+4. Build using conan and CMake:
+```bash
+conan install . --build=missing
+cmake --preset=<preset>
+cmake --build --preset=<preset>
 ```
 
-Then use it:
+#### Option B: CMake add_subdirectory
+
+1. Copy or clone the `cpp/` directory into your project
+2. Add it as a subdirectory to you `CMakeLists.txt`:
+```cmake
+add_subdirectory(susi/cpp)
+target_link_libraries(your_target PRIVATE susi::susi)
+```
+3. Build using CMake:
+```bash
+cmake -B build -S .
+cmake --build build
+```
+
+With this approach you must provide OpenSSL yourself and make sure CMake can find it.
+
+Then you can use it in your project:
 
 ```cpp
 #include <susi.h>
 
-SusiClient susi;
+SusiClient susi("your-public-key");
 
 // Pass the "LicenseInfo" section of your config as JSON:
 bool valid = susi.checkLicense(R"({"LicenseFile": "license.json"})");
@@ -175,8 +206,6 @@ if (valid) {
     }
 }
 ```
-
-Before building for production, paste your public key (from `susi-admin keygen`) into the `DEFAULT_PUBLIC_KEY` constant in `susi.cpp`. When the key is empty, license checks are skipped (development mode).
 
 To use your own logging framework instead of `fprintf`, define `SUSI_LOG` before including `susi.cpp`:
 
