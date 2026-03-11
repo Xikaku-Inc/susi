@@ -507,6 +507,25 @@ fn cmd_export_token(
         bail!("License has expired");
     }
 
+    // Check machine limit
+    let activation_code = format!("usb:{}", device.serial);
+    
+    if !license.is_machine_activated(&activation_code) && !license.can_add_machine() {
+        bail!(
+            "Machine limit reached ({} of {})",
+            license.machines.len(),
+            license.max_machines
+        );
+    }
+
+    // Add machine activation
+    let name = if friendly_name.is_empty() {
+        format!("USB Token: {}", device.name)
+    } else {
+        friendly_name.to_string()
+    };
+    db.add_machine_activation(&license.id, &activation_code, &name, None)?;
+    
     let payload = susi_core::LicensePayload {
         id: license.id.clone(),
         product: license.product.clone(),
@@ -521,14 +540,6 @@ fn cmd_export_token(
 
     let signed = sign_license(&private_key, &payload)?;
     susi_core::token::write_token(&device.mount_path, &signed, &device.serial)?;
-
-    let activation_code = format!("usb:{}", device.serial);
-    let name = if friendly_name.is_empty() {
-        format!("USB Token: {}", device.name)
-    } else {
-        friendly_name.to_string()
-    };
-    db.add_machine_activation(&license.id, &activation_code, &name, None)?;
 
     println!("License exported to USB token successfully!");
     println!("  Token:    {} at {}", device.name, device.mount_path.display());
