@@ -540,6 +540,8 @@ bool SusiClient::checkLicenseAndRefresh(const std::string& licensePath, const st
         } else {
             SUSI_LOG("Online license refresh failed, falling back to cached file");
         }
+    } else {
+        SUSI_LOG("No server supplied. Online license check will fail. Falling back to cached file.");
     }
 
     // Fall back to local file

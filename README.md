@@ -185,7 +185,7 @@ cmake -B build -S .
 cmake --build build
 ```
 
-With this approach you must provide OpenSSL yourself and make sure CMake can find it.
+With this approach you must provide the dependecies (OpenSSL, nlohmann/json and libcurl) yourself and make sure CMake can find them.
 
 Then you can use it in your project:
 
