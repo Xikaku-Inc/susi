@@ -354,19 +354,19 @@ std::string SusiClient::getPublicKeyPem()
 // ---------------------------------------------------------------------------
 // Shared license verify logic
 // ---------------------------------------------------------------------------
-bool SusiClient::verifySignedLicenseJson(std::string signedLicenseStr, std::string activationCode)
+SusiClient::LicenseStatus SusiClient::verifySignedLicenseJson(std::string signedLicenseStr, std::string activationCode)
 {
     json signedLicense;
     try {
         signedLicense = json::parse(signedLicenseStr);
     } catch (const json::exception& e) {
         SUSI_LOG("Invalid license format: %s", e.what());
-        return false;
+        return LicenseStatus::Error;
     }
 
     if (!signedLicense.contains("license_data") || !signedLicense.contains("signature")) {
         SUSI_LOG("License missing required fields (license_data, signature)");
-        return false;
+        return LicenseStatus::Error;
     }
 
     std::string licenseData = signedLicense.at("license_data").get<std::string>();
@@ -376,13 +376,13 @@ bool SusiClient::verifySignedLicenseJson(std::string signedLicenseStr, std::stri
     auto signatureBytes = base64Decode(signatureB64);
     if (signatureBytes.empty()) {
         SUSI_LOG("Failed to decode license signature");
-        return false;
+        return LicenseStatus::InvalidSignature;
     }
 
     // Verify RSA-SHA256 signature
     if (!verifySignature(getPublicKeyPem(), licenseData, signatureBytes)) {
         SUSI_LOG("License has an invalid signature");
-        return false;
+        return LicenseStatus::InvalidSignature;
     }
 
     // Parse the verified payload
@@ -391,13 +391,13 @@ bool SusiClient::verifySignedLicenseJson(std::string signedLicenseStr, std::stri
         payload = json::parse(licenseData);
     } catch (const json::exception& e) {
         SUSI_LOG("Failed to parse license payload: %s", e.what());
-        return false;
+        return LicenseStatus::Error;
     }
 
     // Check expiry
     if (isExpired(payload)) {
         SUSI_LOG("License expired: %s", payload.value("expires", std::string("unknown")).c_str());
-        return false;
+        return LicenseStatus::Expired;
     }
 
     // Check machine code
@@ -416,28 +416,30 @@ bool SusiClient::verifySignedLicenseJson(std::string signedLicenseStr, std::stri
             }
             if (!found) {
                 SUSI_LOG("License not valid for this machine (code: %s)", activationCode.c_str());
-                return false;
+                return LicenseStatus::InvalidMachine;
             }
         }
     }
 
     // Check lease expiry
+    bool inGracePeriod = false;
     if (payload.contains("lease_expires") && !payload.at("lease_expires").is_null()) {
         std::string leaseStr = payload.at("lease_expires").get<std::string>();
         time_t leaseExpires = parseIsoTimestamp(leaseStr);
         if (leaseExpires == -1) {
             SUSI_LOG("Could not parse lease_expires: %s", leaseStr.c_str());
-            return false;
+            return LicenseStatus::Error;
         }
         m_leaseExpiresEpoch = static_cast<int64_t>(leaseExpires);
         time_t now = time(nullptr);
         time_t graceEnd = leaseExpires + static_cast<time_t>(m_graceHours * 3600);
         if (now > graceEnd) {
             SUSI_LOG("Lease expired (at %s, grace period exhausted)", leaseStr.c_str());
-            return false;
+            return LicenseStatus::LeaseExpired;
         }
         if (now > leaseExpires) {
             SUSI_LOG("Lease expired at %s, in grace period - renew soon!", leaseStr.c_str());
+            inGracePeriod = true;
         }
     }
 
@@ -472,13 +474,13 @@ bool SusiClient::verifySignedLicenseJson(std::string signedLicenseStr, std::stri
         SUSI_LOG("Licensed features: %s", featureList.c_str());
     }
 
-    return true;
+    return inGracePeriod ? LicenseStatus::ValidGracePeriod : LicenseStatus::Valid;
 }
 
 // ---------------------------------------------------------------------------
 // License check from file
 // ---------------------------------------------------------------------------
-bool SusiClient::checkLicense(std::string jsonLicenseInfo)
+SusiClient::LicenseStatus SusiClient::checkLicense(std::string jsonLicenseInfo)
 {
     m_features.clear();
     m_leaseExpiresEpoch = 0;
@@ -488,7 +490,8 @@ bool SusiClient::checkLicense(std::string jsonLicenseInfo)
         info = json::parse(jsonLicenseInfo);
     } catch (const json::exception& e) {
         SUSI_LOG("Could not parse license info JSON: %s", e.what());
-        return false;
+        m_isValid = false;
+        return LicenseStatus::Error;
     }
 
     std::string licenseFilePath = "license.json";
@@ -498,17 +501,20 @@ bool SusiClient::checkLicense(std::string jsonLicenseInfo)
     std::ifstream licenseFile(licenseFilePath);
     if (!licenseFile.is_open()) {
         SUSI_LOG("License file not found: %s", licenseFilePath.c_str());
-        return false;
+        m_isValid = false;
+        return LicenseStatus::FileNotFound;
     }
 
     std::string licenseContents((std::istreambuf_iterator<char>(licenseFile)), std::istreambuf_iterator<char>());
-    return verifySignedLicenseJson(licenseContents);
+    auto status = verifySignedLicenseJson(licenseContents);
+    m_isValid = (status == LicenseStatus::Valid || status == LicenseStatus::ValidGracePeriod);
+    return status;
 }
 
 // ---------------------------------------------------------------------------
 // Online license check
 // ---------------------------------------------------------------------------
-bool SusiClient::checkLicenseAndRefresh(const std::string& licensePath, const std::string& licenseKey)
+SusiClient::LicenseStatus SusiClient::checkLicenseAndRefresh(const std::string& licensePath, const std::string& licenseKey)
 {
     m_features.clear();
     m_leaseExpiresEpoch = 0;
@@ -525,22 +531,41 @@ bool SusiClient::checkLicenseAndRefresh(const std::string& licensePath, const st
 
         std::string response;
         long httpCode = httpPost(url, body.dump(), response);
-        if (httpCode >= 200 && httpCode < 300) { // got license file
-            bool valid = verifySignedLicenseJson(response);
+        if (httpCode >= 200 && httpCode < 300) {
+            auto status = verifySignedLicenseJson(response);
+            m_isValid = (status == LicenseStatus::Valid || status == LicenseStatus::ValidGracePeriod);
 
-            if (valid) {
+            if (m_isValid) {
                 std::ofstream f(licensePath);
                 if (f.is_open()) {
                     f << response;
                 }
             }
 
-            return valid;
-        } else if (httpCode == 403 || httpCode == 404) { // license not valid or not found
-            SUSI_LOG("Server rejected license (HTTP %ld) - removing cached file", httpCode);
+            return status;
+        } else if (httpCode == 403) {
             std::remove(licensePath.c_str());
-            return false;
-        } else { // other error occured
+            m_isValid = false;
+
+            if (response.find("revoked") != std::string::npos){
+                SUSI_LOG("License has been revoked - removing chached file");
+                return LicenseStatus::Revoked;
+            } else if (response.find("expired") != std::string::npos) {
+                SUSI_LOG("License has expired - removing chached file");
+                return LicenseStatus::Expired;
+            } else if (response.find("Machine limit") != std::string::npos){
+                SUSI_LOG("License machine limit exceeded - removing chached file");
+                return LicenseStatus::InvalidMachine;
+            } else {
+                SUSI_LOG("Server rejected license (HTTP 403) - removing cached file");
+                return LicenseStatus::Error;
+            }
+        } else if (httpCode == 404) {
+            SUSI_LOG("License not found on server (HTTP 404) - removing cached file");
+            std::remove(licensePath.c_str());
+            m_isValid = false;
+            return LicenseStatus::InvalidLicenseKey;
+        } else {
             SUSI_LOG("Online license refresh failed, falling back to cached file");
         }
     } else {
@@ -551,11 +576,14 @@ bool SusiClient::checkLicenseAndRefresh(const std::string& licensePath, const st
     std::ifstream licenseFile(licensePath);
     if (!licenseFile.is_open()) {
         SUSI_LOG("Cached license file cannot be found: %s", licensePath.c_str());
-        return false;
+        m_isValid = false;
+        return LicenseStatus::FileNotFound;
     }
 
     std::string licenseContents((std::istreambuf_iterator<char>(licenseFile)), std::istreambuf_iterator<char>());
-    return verifySignedLicenseJson(licenseContents);
+    auto status = verifySignedLicenseJson(licenseContents);
+    m_isValid = (status == LicenseStatus::Valid || status == LicenseStatus::ValidGracePeriod);
+    return status;
 }
 
 // ---------------------------------------------------------------------------
@@ -792,7 +820,7 @@ static std::string decryptToken(const std::vector<unsigned char>& blob, const st
     return plaintext;
 }
 
-bool SusiClient::checkLicenseToken()
+SusiClient::LicenseStatus SusiClient::checkLicenseToken()
 {
     m_features.clear();
     m_leaseExpiresEpoch = 0;
@@ -800,7 +828,8 @@ bool SusiClient::checkLicenseToken()
     auto devices = enumerateUsbDevices();
     if (devices.empty()) {
         SUSI_LOG("No USB mass storage devices found");
-        return false;
+        m_isValid = false;
+        return LicenseStatus::TokenNotFound;
     }
 
     for (const auto& dev : devices) {
@@ -832,16 +861,19 @@ bool SusiClient::checkLicenseToken()
 
         std::string usbActivationCode = "usb:" + dev.serial;
 
-        if (!verifySignedLicenseJson(decrypted, usbActivationCode)) {
+        LicenseStatus status = verifySignedLicenseJson(decrypted, usbActivationCode);
+        if (status != LicenseStatus::Valid && status != LicenseStatus::ValidGracePeriod) {
             continue;
         }
 
         SUSI_LOG("License token: device '%s' (serial: %s)", dev.name.c_str(), dev.serial.c_str());
-        return true;
+        m_isValid = true;
+        return status;
     }
 
     SUSI_LOG("No valid USB license token found");
-    return false;
+    m_isValid = false;
+    return LicenseStatus::TokenNotFound;
 }
 
 bool SusiClient::hasFeature(const std::string& feature) const

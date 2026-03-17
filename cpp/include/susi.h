@@ -6,6 +6,22 @@
 #include <vector>
 
 class SusiClient {
+public:
+    enum class LicenseStatus {
+        Valid,
+        ValidGracePeriod,
+        Expired,
+        LeaseExpired,
+        InvalidMachine,
+        InvalidSignature,
+        InvalidLicenseKey,
+        Revoked,
+        TokenNotFound,
+        FileNotFound,
+        Error,
+    };
+private:
+    bool m_isValid = false;
     std::vector<std::string> m_features;
     int64_t m_leaseExpiresEpoch = 0; // 0 = no lease
     int64_t m_graceHours = 24;
@@ -20,14 +36,15 @@ public:
 
     std::string getPublicKeyPem();
 
-    /// Checks if license is signed correctly and still valid.
-    /// If no activation code is given to check against, the local machine code is used.
-    bool verifySignedLicenseJson(std::string signedLicenseStr, std::string activationCode = "");
-    bool checkLicense(std::string jsonLicenseInfo);
-    bool checkLicenseToken();
+    /// Checks given license info JSON string, which should contain a "LicenseFile" field with the path to the license file to check.
+    LicenseStatus checkLicense(std::string jsonLicenseInfo);
+    /// Checks for a license token on attached USB devices, and verifies it if found.
+    LicenseStatus checkLicenseToken();
     /// Contact the activation server to refresh the lease, then verify the license.
     /// Falls back to the cached local file if the server is unreachable.
-    bool checkLicenseAndRefresh(const std::string& licensePath, const std::string& licenseKey);
+    LicenseStatus checkLicenseAndRefresh(const std::string& licensePath, const std::string& licenseKey);
+
+    bool isValid() const { return m_isValid; }
 
     const std::vector<std::string>& features() const { return m_features; }
 
@@ -43,6 +60,8 @@ public:
     bool isLeaseExpired() const;
 
     void setGraceHours(int64_t hours) { m_graceHours = hours; }
+private:
+    LicenseStatus verifySignedLicenseJson(std::string signedLicenseStr, std::string activationCode = "");
 };
 
 #endif

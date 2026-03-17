@@ -143,11 +143,8 @@ match status {
     LicenseStatus::InvalidSignature => {
         eprintln!("License file has been tampered with");
     }
-    LicenseStatus::InvalidLicenseKey => {
-        eprintln!("License key is not valid");
-    }
-    LicenseStatus::Revoked => {
-        eprintln!("License has been revoked");
+    LicenseStatus::FileNotFound(err) => {
+        eprintln!("License file not found: {}", err);
     }
     other => eprintln!("License error: {:?}", other),
 }
@@ -201,15 +198,40 @@ Then you can use it in your project:
 SusiClient susi("your-public-key");
 
 // Pass the "LicenseInfo" section of your config as JSON:
-bool valid = susi.checkLicense(R"({"LicenseFile": "license.json"})");
+auto status = susi.checkLicense(R"({"LicenseFile": "license.json"})");
 
-if (valid) {
-    if (susi.hasFeature("pro")) {
-        // enable pro features
-    }
-    if (susi.isInGracePeriod()) {
-        // lease expired but still in grace period — trigger renewal
-    }
+switch (status) {
+    case SusiClient::LicenseStatus::Valid:
+        // License is valid
+        break;
+    case SusiClient::LicenseStatus::ValidGracePeriod:
+        // Lease expired but still in grace period — trigger renewal
+        break;
+    case SusiClient::LicenseStatus::Expired:
+        // License has expired
+        break;
+    case SusiClient::LicenseStatus::LeaseExpired:
+        // Lease and grace period both expired — must renew
+        break;
+    case SusiClient::LicenseStatus::InvalidMachine:
+        // License not valid for this machine
+        break;
+    case SusiClient::LicenseStatus::InvalidSignature:
+        // License file has been tampered with
+        break;
+    case SusiClient::LicenseStatus::FileNotFound:
+        // License file not found
+        break;
+    default:
+        // Other error
+        break;
+}
+
+if (susi.isValid()){
+  // license valid
+  if (susi.hasFeature("pro")) {
+    // enable pro features
+  }
 }
 ```
 
@@ -218,6 +240,24 @@ To use your own logging framework instead of `fprintf`, define `SUSI_LOG` before
 ```cpp
 #define SUSI_LOG(fmt, ...) my_logger("susi", fmt, ##__VA_ARGS__)
 ```
+
+### License Status Values
+
+All verification methods return a status indicating the result. The following table lists all possible values:
+
+| Description                                                            | Rust                                                            | C++                                |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------- | ---------------------------------- |
+| License is valid and active                                            | `LicenseStatus::Valid { payload }`                              | `LicenseStatus::Valid`             |
+| Lease expired but within grace period                                  | `LicenseStatus::ValidGracePeriod { payload, lease_expired_at }` | `LicenseStatus::ValidGracePeriod`  |
+| Lease and grace period both expired                                    | `LicenseStatus::LeaseExpired { lease_expired_at }`              | `LicenseStatus::LeaseExpired`      |
+| License expired                                                        | `LicenseStatus::Expired { expired_at }`                         | `LicenseStatus::Expired`           |
+| License not valid for this machine or machine limit of license reached | `LicenseStatus::InvalidMachine { expected, actual }`            | `LicenseStatus::InvalidMachine`    |
+| License file has been tampered with                                    | `LicenseStatus::InvalidSignature`                               | `LicenseStatus::InvalidSignature`  |
+| License key not recognized                                             | `LicenseStatus::InvalidLicenseKey`                              | `LicenseStatus::InvalidLicenseKey` |
+| License has been revoked                                               | `LicenseStatus::Revoked`                                        | `LicenseStatus::Revoked`           |
+| No USB token found                                                     | `LicenseStatus::TokenNotFound`                                  | `LicenseStatus::TokenNotFound`     |
+| License file not found on disk                                         | `LicenseStatus::FileNotFound(String)`                           | `LicenseStatus::FileNotFound`      |
+| Other error (parse error, crypto failure, etc.)                        | `LicenseStatus::Error(String)`                                  | `LicenseStatus::Error`             |
 
 ## License File Format
 
@@ -300,7 +340,7 @@ let client = LicenseClient::new(include_str!("public.pem")).unwrap();
 let status = client.verify_token();
 
 if status.is_valid() {
-    println!("Licensed via USB token");
+    // license valid
     if status.has_feature("pro") {
         // enable pro features
     }
@@ -310,8 +350,11 @@ if status.is_valid() {
 ### Verify from a USB token (C++)
 
 ```cpp
-SusiClient susi;
-if (susi.checkLicenseToken()) {
+SusiClient susi("your-public-key");
+auto status = susi.checkLicenseToken();
+
+if (susi.isValid()) {
+    // license valid
     if (susi.hasFeature("pro")) {
         // enable pro features
     }
@@ -455,15 +498,17 @@ SusiClient susi("your-public-key", "https://license.example.com/api/v1");
 
 // Contacts the server to renew the lease, writes the updated license.json,
 // then verifies it. Falls back to the cached file if the server is unreachable.
-bool valid = susi.checkLicenseAndRefresh("license.json", "XXXXX-XXXXX-XXXXX-XXXXX");
+auto status = susi.checkLicenseAndRefresh("license.json", "XXXXX-XXXXX-XXXXX-XXXXX");
 
-if (valid) {
-    if (susi.isInGracePeriod()) {
-        // Lease expired but still within grace period — try to renew soon
-    }
+if (susi.isValid()) {
+    // license valid
     if (susi.hasFeature("pro")) {
         // enable pro features
     }
+}
+
+if (susi.isInGracePeriod() || susi.isLeaseExpired()){
+  // Lease expired or in grace period — try again soon
 }
 ```
 
