@@ -241,7 +241,7 @@ To use your own logging framework instead of `fprintf`, define `SUSI_LOG` before
 #define SUSI_LOG(fmt, ...) my_logger("susi", fmt, ##__VA_ARGS__)
 ```
 
-### License Status Values
+### 6. License Status Values
 
 All verification methods return a status indicating the result. The following table lists all possible values:
 
