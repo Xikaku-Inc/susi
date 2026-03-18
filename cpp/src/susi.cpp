@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -480,27 +481,14 @@ SusiClient::LicenseStatus SusiClient::verifySignedLicenseJson(std::string signed
 // ---------------------------------------------------------------------------
 // License check from file
 // ---------------------------------------------------------------------------
-SusiClient::LicenseStatus SusiClient::checkLicense(std::string jsonLicenseInfo)
+SusiClient::LicenseStatus SusiClient::checkLicense(const std::filesystem::path& licensePath)
 {
     m_features.clear();
     m_leaseExpiresEpoch = 0;
 
-    json info;
-    try {
-        info = json::parse(jsonLicenseInfo);
-    } catch (const json::exception& e) {
-        SUSI_LOG("Could not parse license info JSON: %s", e.what());
-        m_isValid = false;
-        return LicenseStatus::Error;
-    }
-
-    std::string licenseFilePath = "license.json";
-    if (info.contains("LicenseFile") && info.at("LicenseFile").is_string())
-        licenseFilePath = info.at("LicenseFile").get<std::string>();
-
-    std::ifstream licenseFile(licenseFilePath);
+    std::ifstream licenseFile(licensePath);
     if (!licenseFile.is_open()) {
-        SUSI_LOG("License file not found: %s", licenseFilePath.c_str());
+        SUSI_LOG("License file not found: %s", licensePath.string().c_str());
         m_isValid = false;
         return LicenseStatus::FileNotFound;
     }
@@ -514,7 +502,7 @@ SusiClient::LicenseStatus SusiClient::checkLicense(std::string jsonLicenseInfo)
 // ---------------------------------------------------------------------------
 // Online license check
 // ---------------------------------------------------------------------------
-SusiClient::LicenseStatus SusiClient::checkLicenseAndRefresh(const std::string& licensePath, const std::string& licenseKey)
+SusiClient::LicenseStatus SusiClient::checkLicenseAndRefresh(const std::filesystem::path& licensePath, const std::string& licenseKey)
 {
     m_features.clear();
     m_leaseExpiresEpoch = 0;
@@ -544,7 +532,7 @@ SusiClient::LicenseStatus SusiClient::checkLicenseAndRefresh(const std::string& 
 
             return status;
         } else if (httpCode == 403) {
-            std::remove(licensePath.c_str());
+            std::filesystem::remove(licensePath);
             m_isValid = false;
 
             if (response.find("revoked") != std::string::npos){
@@ -562,7 +550,7 @@ SusiClient::LicenseStatus SusiClient::checkLicenseAndRefresh(const std::string& 
             }
         } else if (httpCode == 404) {
             SUSI_LOG("License not found on server (HTTP 404) - removing cached file");
-            std::remove(licensePath.c_str());
+            std::filesystem::remove(licensePath);
             m_isValid = false;
             return LicenseStatus::InvalidLicenseKey;
         } else {
@@ -575,7 +563,7 @@ SusiClient::LicenseStatus SusiClient::checkLicenseAndRefresh(const std::string& 
     // Fall back to local file
     std::ifstream licenseFile(licensePath);
     if (!licenseFile.is_open()) {
-        SUSI_LOG("Cached license file cannot be found: %s", licensePath.c_str());
+        SUSI_LOG("Cached license file cannot be found: %s", licensePath.string().c_str());
         m_isValid = false;
         return LicenseStatus::FileNotFound;
     }

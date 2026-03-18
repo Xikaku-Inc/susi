@@ -2,6 +2,7 @@
 #define SUSI_H
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -36,13 +37,13 @@ public:
 
     std::string getPublicKeyPem();
 
-    /// Checks given license info JSON string, which should contain a "LicenseFile" field with the path to the license file to check.
-    LicenseStatus checkLicense(std::string jsonLicenseInfo);
+    /// Checks the license file at the given path.
+    LicenseStatus checkLicense(const std::filesystem::path& licensePath);
     /// Checks for a license token on attached USB devices, and verifies it if found.
     LicenseStatus checkLicenseToken();
     /// Contact the activation server to refresh the lease, then verify the license.
     /// Falls back to the cached local file if the server is unreachable.
-    LicenseStatus checkLicenseAndRefresh(const std::string& licensePath, const std::string& licenseKey);
+    LicenseStatus checkLicenseAndRefresh(const std::filesystem::path& licensePath, const std::string& licenseKey);
 
     bool isValid() const { return m_isValid; }
 

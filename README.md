@@ -197,8 +197,8 @@ Then you can use it in your project:
 
 SusiClient susi("your-public-key");
 
-// Pass the "LicenseInfo" section of your config as JSON:
-auto status = susi.checkLicense(R"({"LicenseFile": "license.json"})");
+// Pass path to license file
+auto status = susi.checkLicense("license.json");
 
 switch (status) {
     case SusiClient::LicenseStatus::Valid:
