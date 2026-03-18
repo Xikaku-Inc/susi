@@ -355,7 +355,7 @@ std::string SusiClient::getPublicKeyPem()
 // ---------------------------------------------------------------------------
 // Shared license verify logic
 // ---------------------------------------------------------------------------
-SusiClient::LicenseStatus SusiClient::verifySignedLicenseJson(std::string signedLicenseStr, std::string activationCode)
+SusiClient::LicenseStatus SusiClient::verifySignedLicenseJson(const std::string& signedLicenseStr, const std::string& activationCode)
 {
     json signedLicense;
     try {
@@ -402,21 +402,22 @@ SusiClient::LicenseStatus SusiClient::verifySignedLicenseJson(std::string signed
     }
 
     // Check machine code
+    std::string codeToCheck = activationCode;
     if (payload.contains("machine_codes") && payload.at("machine_codes").is_array()) {
         const auto& codes = payload.at("machine_codes");
         if (!codes.empty()) {
-            if(activationCode.empty()){
-                activationCode = getMachineCode();
+            if(codeToCheck.empty()){
+                codeToCheck = getMachineCode();
             }
             bool found = false;
             for (const auto& code : codes) {
-                if (code.is_string() && code.get<std::string>() == activationCode) {
+                if (code.is_string() && code.get<std::string>() == codeToCheck) {
                     found = true;
                     break;
                 }
             }
             if (!found) {
-                SUSI_LOG("License not valid for this machine (code: %s)", activationCode.c_str());
+                SUSI_LOG("License not valid for this machine (code: %s)", codeToCheck.c_str());
                 return LicenseStatus::InvalidMachine;
             }
         }

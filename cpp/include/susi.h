@@ -62,7 +62,9 @@ public:
 
     void setGraceHours(int64_t hours) { m_graceHours = hours; }
 private:
-    LicenseStatus verifySignedLicenseJson(std::string signedLicenseStr, std::string activationCode = "");
+    /// Verifies the signature of the signed license JSON string and returns the license status.
+    /// If activation code is not provided, the local machine code is used.
+    LicenseStatus verifySignedLicenseJson(const std::string& signedLicenseStr, const std::string& activationCode = "");
 };
 
 #endif
