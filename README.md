@@ -314,6 +314,8 @@ Instead of binding a license to a specific machine, you can bind it to a physica
 
 Token-bound licenses have a machine code based on the serial number of the USB stick: `usb:<serial>`.
 
+On **Linux**, the client reads the USB hardware serial from sysfs (the same string exposed under the block device’s USB parent). On **Windows** the same value is resolved from the **PnP device instance ID** for `USBSTOR` (the `SERIAL` segment before `&0` in the instance path), not the SCSI/storage inquiry serial. That keeps the reported serial aligned across platforms for typical USB mass-storage sticks.
+
 ### Export a license to a USB token
 
 Insert a USB stick, then:

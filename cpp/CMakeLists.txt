@@ -31,7 +31,7 @@ target_link_libraries(susi PRIVATE CURL::libcurl)
 
 # Windows network libraries
 if(WIN32)
-    target_link_libraries(susi PRIVATE iphlpapi ws2_32)
+    target_link_libraries(susi PRIVATE iphlpapi ws2_32 setupapi cfgmgr32)
 endif()
 
 set_target_properties(susi PROPERTIES PUBLIC_HEADER "include/susi.h")

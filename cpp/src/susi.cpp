@@ -7,6 +7,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -23,8 +24,12 @@
 #include <iphlpapi.h>
 #include <windows.h>
 #include <winioctl.h>
+#include <setupapi.h>
+#include <cfgmgr32.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 #else
 #include <climits>
 #include <dirent.h>
@@ -586,6 +591,110 @@ struct UsbDeviceInfo {
 };
 
 #ifdef _WIN32
+// UTF-16 (no trailing null) -> UTF-8; matches Linux sysfs serial trimming in spirit.
+static std::string wideToUtf8Span(const wchar_t* wstr, size_t wcharCount)
+{
+    if (!wstr || wcharCount == 0)
+        return {};
+    int needed = WideCharToMultiByte(CP_UTF8, 0, wstr, static_cast<int>(wcharCount), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0)
+        return {};
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr, static_cast<int>(wcharCount), out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+static bool win32GetVolumeDiskNumber(HANDLE hVolume, DWORD& outDiskNumber)
+{
+    alignas(VOLUME_DISK_EXTENTS) BYTE buf[512] = {};
+    DWORD br = 0;
+    if (!DeviceIoControl(hVolume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, nullptr, 0, buf, sizeof(buf), &br, nullptr))
+        return false;
+    auto* vde = reinterpret_cast<VOLUME_DISK_EXTENTS*>(buf);
+    if (vde->NumberOfDiskExtents < 1)
+        return false;
+    outDiskNumber = vde->Extents[0].DiskNumber;
+    return true;
+}
+
+// USB instance serial from PnP (USBSTOR\...\SERIAL&0), aligned with Linux sysfs .../serial.
+static std::string win32UsbInstanceSerialForDiskNumber(DWORD diskNumber)
+{
+    HDEVINFO devs = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISK, nullptr, nullptr,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (devs == INVALID_HANDLE_VALUE)
+        return {};
+
+    std::string serialUtf8;
+    SP_DEVICE_INTERFACE_DATA ifData = {};
+    ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+
+    for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(devs, nullptr, &GUID_DEVINTERFACE_DISK, idx, &ifData); ++idx) {
+        DWORD required = 0;
+        SetupDiGetDeviceInterfaceDetailW(devs, &ifData, nullptr, 0, &required, nullptr);
+        if (required < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W))
+            continue;
+
+        std::vector<BYTE> detailBuf(required);
+        auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(detailBuf.data());
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+        SP_DEVINFO_DATA devInfo = {};
+        devInfo.cbSize = sizeof(SP_DEVINFO_DATA);
+        if (!SetupDiGetDeviceInterfaceDetailW(devs, &ifData, detail, required, nullptr, &devInfo))
+            continue;
+
+        HANDLE hDisk = CreateFileW(detail->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hDisk == INVALID_HANDLE_VALUE)
+            continue;
+
+        STORAGE_DEVICE_NUMBER sdn = {};
+        DWORD br = 0;
+        const BOOL gotNum = DeviceIoControl(hDisk, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0,
+            &sdn, sizeof(sdn), &br, nullptr);
+        CloseHandle(hDisk);
+        if (!gotNum || sdn.DeviceNumber != diskNumber)
+            continue;
+
+        DEVINST devInst = devInfo.DevInst;
+        for (int depth = 0; depth < 32 && devInst != 0; ++depth) {
+            wchar_t instId[512];
+            if (CM_Get_Device_IDW(devInst, instId, static_cast<ULONG>(sizeof(instId) / sizeof(instId[0])), 0) != CR_SUCCESS)
+                break;
+
+            std::wstring id(instId);
+            static const wchar_t kUsbStor[] = L"USBSTOR\\";
+            constexpr size_t kUsbStorLen = sizeof(kUsbStor) / sizeof(kUsbStor[0]) - 1;
+            if (id.size() >= kUsbStorLen && _wcsnicmp(id.c_str(), kUsbStor, kUsbStorLen) == 0) {
+                const size_t lastSlash = id.rfind(L'\\');
+                if (lastSlash != std::wstring::npos && lastSlash + 1 < id.size()) {
+                    std::wstring tail = id.substr(lastSlash + 1);
+                    std::wstring ser;
+                    const size_t amp = tail.rfind(L'&');
+                    if (amp != std::wstring::npos && amp > 0)
+                        ser = tail.substr(0, amp);
+                    else
+                        ser = tail;
+                    while (!ser.empty() && (ser.back() == L' ' || ser.back() == L'\t'))
+                        ser.pop_back();
+                    serialUtf8 = wideToUtf8Span(ser.data(), ser.size());
+                }
+                break;
+            }
+
+            DEVINST parent = 0;
+            if (CM_Get_Parent(&parent, devInst, 0) != CR_SUCCESS)
+                break;
+            devInst = parent;
+        }
+        break;
+    }
+
+    SetupDiDestroyDeviceInfoList(devs);
+    return serialUtf8;
+}
+
 static std::vector<UsbDeviceInfo> enumerateUsbDevices()
 {
     std::vector<UsbDeviceInfo> devices;
@@ -600,28 +709,19 @@ static std::vector<UsbDeviceInfo> enumerateUsbDevices()
         wchar_t devicePath[16];
         swprintf_s(devicePath, L"\\\\.\\%c:", drive[0]);
 
-        HANDLE hDevice = CreateFileW(
+        HANDLE hVolume = CreateFileW(
             devicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr, OPEN_EXISTING, 0, nullptr);
-        if (hDevice == INVALID_HANDLE_VALUE) continue;
+        if (hVolume == INVALID_HANDLE_VALUE) continue;
 
-        STORAGE_PROPERTY_QUERY query = {};
-        query.PropertyId = StorageDeviceProperty;
-        query.QueryType = PropertyStandardQuery;
+        DWORD diskNumber = 0;
+        if (!win32GetVolumeDiskNumber(hVolume, diskNumber)) {
+            CloseHandle(hVolume);
+            continue;
+        }
+        CloseHandle(hVolume);
 
-        BYTE buffer[1024] = {};
-        DWORD returned = 0;
-        BOOL ok = DeviceIoControl(hDevice, IOCTL_STORAGE_QUERY_PROPERTY,
-            &query, sizeof(query), buffer, sizeof(buffer), &returned, nullptr);
-        CloseHandle(hDevice);
-        if (!ok) continue;
-
-        auto* desc = reinterpret_cast<STORAGE_DEVICE_DESCRIPTOR*>(buffer);
-        if (desc->SerialNumberOffset == 0 || desc->SerialNumberOffset >= sizeof(buffer)) continue;
-
-        std::string serial(reinterpret_cast<char*>(buffer + desc->SerialNumberOffset));
-        while (!serial.empty() && (serial.back() == ' ' || serial.back() == '\0'))
-            serial.pop_back();
+        std::string serial = win32UsbInstanceSerialForDiskNumber(diskNumber);
         if (serial.empty()) continue;
 
         wchar_t volumeName[MAX_PATH + 1] = {};

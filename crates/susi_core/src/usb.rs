@@ -18,40 +18,159 @@ pub fn enumerate_usb_devices() -> Result<Vec<UsbDevice>, LicenseError> {
 #[cfg(target_os = "windows")]
 fn platform_enumerate() -> Result<Vec<UsbDevice>, LicenseError> {
     use std::ffi::c_void;
+    use std::mem::size_of;
+    use windows::core::PCWSTR;
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_Device_IDW, CM_Get_Parent, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
+        SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW, CR_SUCCESS, SP_DEVICE_INTERFACE_DATA,
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+    };
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Ioctl::{
+        GUID_DEVINTERFACE_DISK, IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER,
+        VOLUME_DISK_EXTENTS,
     };
     use windows::Win32::System::IO::DeviceIoControl;
-    use windows::core::PCWSTR;
 
     const DRIVE_REMOVABLE: u32 = 2;
-    const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
 
-    #[repr(C)]
-    struct StoragePropertyQuery {
-        property_id: u32,
-        query_type: u32,
-        additional: [u8; 1],
-    }
+    /// USB instance serial from PnP (USBSTOR\...\SERIAL&0), aligned with Linux sysfs .../serial.
+    unsafe fn usb_instance_serial_for_disk_number(disk_number: u32) -> Option<String> {
+        let devs = SetupDiGetClassDevsW(
+            Some(&GUID_DEVINTERFACE_DISK),
+            PCWSTR::null(),
+            None,
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        )
+        .ok()?;
 
-    #[repr(C)]
-    #[allow(dead_code)]
-    struct StorageDeviceDescriptor {
-        version: u32,
-        size: u32,
-        device_type: u8,
-        device_type_modifier: u8,
-        removable_media: u8,
-        command_queueing: u8,
-        vendor_id_offset: u32,
-        product_id_offset: u32,
-        product_revision_offset: u32,
-        serial_number_offset: u32,
-        bus_type: u32,
-        raw_properties_length: u32,
-        raw_device_properties: [u8; 1],
+        let mut if_data = SP_DEVICE_INTERFACE_DATA {
+            cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+            ..Default::default()
+        };
+
+        let mut idx = 0u32;
+        let mut found_serial: Option<String> = None;
+
+        while SetupDiEnumDeviceInterfaces(devs, None, &GUID_DEVINTERFACE_DISK, idx, &mut if_data).is_ok() {
+            idx += 1;
+
+            let mut required: u32 = 0;
+            let _ = SetupDiGetDeviceInterfaceDetailW(devs, &mut if_data, None, 0, Some(&mut required), None);
+            if required < size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32 {
+                continue;
+            }
+
+            let mut detail_buf = vec![0u8; required as usize];
+            let detail = detail_buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+            (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+
+            let mut dev_info = SP_DEVINFO_DATA {
+                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+
+            if SetupDiGetDeviceInterfaceDetailW(
+                devs,
+                &mut if_data,
+                Some(detail),
+                required,
+                None,
+                Some(&mut dev_info),
+            )
+            .is_err()
+            {
+                continue;
+            }
+
+            let path_ptr = (*detail).DevicePath.as_ptr();
+            let path_len = (0..)
+                .take_while(|&i| *path_ptr.add(i) != 0)
+                .last()
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            if path_len == 0 {
+                continue;
+            }
+
+            let h_disk = match CreateFileW(
+                PCWSTR(path_ptr),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                HANDLE::default(),
+            ) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            let mut sdn = STORAGE_DEVICE_NUMBER::default();
+            let mut br = 0u32;
+            let got = DeviceIoControl(
+                h_disk,
+                IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                None,
+                0,
+                Some(&mut sdn as *mut _ as *mut c_void),
+                size_of::<STORAGE_DEVICE_NUMBER>() as u32,
+                Some(&mut br),
+                None,
+            )
+            .is_ok();
+            let _ = CloseHandle(h_disk);
+
+            if !got || sdn.DeviceNumber != disk_number {
+                continue;
+            }
+
+            let mut dev_inst: u32 = dev_info.DevInst;
+            for _ in 0..32 {
+                if dev_inst == 0 {
+                    break;
+                }
+                let mut inst_id = [0u16; 512];
+                if CM_Get_Device_IDW(dev_inst, inst_id.as_mut_slice(), 0) != CR_SUCCESS {
+                    break;
+                }
+                let id_end = inst_id.iter().position(|&c| c == 0).unwrap_or(inst_id.len());
+                let id_wide = &inst_id[..id_end];
+                let id = String::from_utf16_lossy(id_wide);
+                if id.len() >= 8 && id[..8].eq_ignore_ascii_case("USBSTOR\\") {
+                    if let Some(last_slash) = id.rfind('\\') {
+                        let tail = &id[last_slash + 1..];
+                        let ser = if let Some(amp) = tail.rfind('&') {
+                            if amp > 0 {
+                                &tail[..amp]
+                            } else {
+                                tail
+                            }
+                        } else {
+                            tail
+                        };
+                        let ser = ser.trim_end_matches([' ', '\t']).to_string();
+                        if !ser.is_empty() {
+                            found_serial = Some(ser);
+                        }
+                    }
+                    break;
+                }
+                let mut parent: u32 = 0;
+                if CM_Get_Parent(&mut parent, dev_inst, 0) != CR_SUCCESS {
+                    break;
+                }
+                dev_inst = parent;
+            }
+            break;
+        }
+
+        let _ = SetupDiDestroyDeviceInfoList(devs);
+        found_serial
     }
 
     let mut drives_buf = [0u16; 512];
@@ -71,7 +190,7 @@ fn platform_enumerate() -> Result<Vec<UsbDevice>, LicenseError> {
         if end == 0 {
             break;
         }
-        let drive_slice = &drives_buf[offset..offset + end + 1]; // include null
+        let drive_slice = &drives_buf[offset..offset + end + 1];
         offset += end + 1;
 
         let drive_type = unsafe { GetDriveTypeW(PCWSTR(drive_slice.as_ptr())) };
@@ -85,71 +204,52 @@ fn platform_enumerate() -> Result<Vec<UsbDevice>, LicenseError> {
             .chain(std::iter::once(0))
             .collect();
 
-        let handle = unsafe {
+        let h_vol = match unsafe {
             CreateFileW(
                 PCWSTR(device_path.as_ptr()),
-                0, // no read/write needed for property query
+                0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
                 Default::default(),
                 HANDLE::default(),
             )
-        };
-
-        let handle: HANDLE = match handle {
+        } {
             Ok(h) => h,
             Err(_) => continue,
         };
 
-        let query = StoragePropertyQuery {
-            property_id: 0, // StorageDeviceProperty
-            query_type: 0,  // PropertyStandardQuery
-            additional: [0],
-        };
-
-        let mut buf = [0u8; 1024];
-        let mut returned: u32 = 0;
-
-        let ok = unsafe {
+        let mut ext_buf = [0u8; 512];
+        let mut br = 0u32;
+        let ext_ok = unsafe {
             DeviceIoControl(
-                handle,
-                IOCTL_STORAGE_QUERY_PROPERTY,
-                Some(&query as *const _ as *const c_void),
-                std::mem::size_of::<StoragePropertyQuery>() as u32,
-                Some(buf.as_mut_ptr() as *mut c_void),
-                buf.len() as u32,
-                Some(&mut returned),
+                h_vol,
+                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                None,
+                0,
+                Some(ext_buf.as_mut_ptr() as *mut c_void),
+                ext_buf.len() as u32,
+                Some(&mut br),
                 None,
             )
+            .is_ok()
+        };
+        let _ = unsafe { CloseHandle(h_vol) };
+
+        if !ext_ok || br < size_of::<VOLUME_DISK_EXTENTS>() as u32 {
+            continue;
+        }
+
+        let vde = unsafe { &*(ext_buf.as_ptr() as *const VOLUME_DISK_EXTENTS) };
+        if vde.NumberOfDiskExtents < 1 {
+            continue;
+        }
+        let disk_number = vde.Extents[0].DiskNumber;
+
+        let Some(serial) = (unsafe { usb_instance_serial_for_disk_number(disk_number) }) else {
+            continue;
         };
 
-        let _ = unsafe { CloseHandle(handle) };
-
-        if ok.is_err() || returned < std::mem::size_of::<StorageDeviceDescriptor>() as u32 {
-            continue;
-        }
-
-        let desc = unsafe { &*(buf.as_ptr() as *const StorageDeviceDescriptor) };
-        if desc.serial_number_offset == 0 || desc.serial_number_offset as usize >= buf.len() {
-            continue;
-        }
-
-        let serial_start = desc.serial_number_offset as usize;
-        let serial_end = buf[serial_start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| serial_start + p)
-            .unwrap_or(buf.len());
-        let serial = String::from_utf8_lossy(&buf[serial_start..serial_end])
-            .trim()
-            .to_string();
-
-        if serial.is_empty() {
-            continue;
-        }
-
-        // Get volume label
         let mut vol_name = [0u16; 261];
         let vol_ok = unsafe {
             GetVolumeInformationW(
