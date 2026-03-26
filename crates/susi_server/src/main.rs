@@ -985,7 +985,7 @@ async fn handle_get_releases(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let mut releases = Vec::new();
-    for (id, tag, name, body, prerelease, created_at) in &rows {
+    for (id, tag, name, body, prerelease, created_at, _workspace_id) in &rows {
         let assets = db.get_release_assets(*id).unwrap_or_default();
         releases.push(serde_json::json!({
             "tag": tag,
@@ -1043,7 +1043,7 @@ async fn handle_list_releases_admin(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let mut releases = Vec::new();
-    for (id, tag, name, body, prerelease, created_at) in &rows {
+    for (id, tag, name, body, prerelease, created_at, workspace_id) in &rows {
         let assets = db.get_release_assets(*id).unwrap_or_default();
         releases.push(serde_json::json!({
             "tag": tag,
@@ -1051,6 +1051,7 @@ async fn handle_list_releases_admin(
             "body": body,
             "published_at": created_at,
             "prerelease": prerelease,
+            "workspace_id": workspace_id,
             "assets": assets.iter().map(|(name, size)| serde_json::json!({
                 "name": name,
                 "size": size,
@@ -1074,6 +1075,7 @@ async fn handle_upload_release(
     let mut name = String::new();
     let mut body = String::new();
     let mut prerelease = false;
+    let mut workspace_id: Option<String> = None;
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
 
     while let Some(field) = multipart.next_field().await
@@ -1097,6 +1099,13 @@ async fn handle_upload_release(
                 let val = field.text().await
                     .map_err(|e| error_response(StatusCode::BAD_REQUEST, &e.to_string()))?;
                 prerelease = val == "true" || val == "1";
+            }
+            "workspace_id" => {
+                let val = field.text().await
+                    .map_err(|e| error_response(StatusCode::BAD_REQUEST, &e.to_string()))?;
+                if !val.is_empty() {
+                    workspace_id = Some(val);
+                }
             }
             "file" => {
                 let file_name = field.file_name().unwrap_or("unknown").to_string();
@@ -1124,7 +1133,7 @@ async fn handle_upload_release(
         {
             return Err(error_response(StatusCode::CONFLICT, &format!("Release {} already exists", tag)));
         }
-        db.insert_release(&tag, &name, &body, prerelease)
+        db.insert_release(&tag, &name, &body, prerelease, workspace_id.as_deref())
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
     };
 
@@ -1178,6 +1187,356 @@ async fn handle_delete_release(
     log::info!("Release {} deleted", tag);
 
     Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+// ---------------------------------------------------------------------------
+// Workspace endpoints (JWT-protected)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateWorkspaceRequest {
+    name: String,
+    #[serde(default)]
+    product: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateWorkspaceRequest {
+    name: String,
+    #[serde(default)]
+    product: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct AddMemberRequest {
+    username: String,
+    #[serde(default = "default_member_role")]
+    role: String,
+}
+
+fn default_member_role() -> String {
+    "viewer".to_string()
+}
+
+#[derive(Deserialize)]
+struct PushConfigRequest {
+    config_json: String,
+    #[serde(default)]
+    description: String,
+}
+
+async fn handle_create_workspace(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateWorkspaceRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    if req.name.is_empty() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Workspace name is required"));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let db = state.db.lock().unwrap();
+    db.create_workspace(&id, &req.name, &req.product, &req.description, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    log::info!("Workspace '{}' ({}) created by {}", req.name, id, claims.sub);
+
+    Ok((StatusCode::CREATED, Json(serde_json::json!({
+        "id": id,
+        "name": req.name,
+        "product": req.product,
+        "description": req.description,
+        "created_by": claims.sub,
+    }))))
+}
+
+async fn handle_list_workspaces(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    let rows = db.list_workspaces_for_user(&claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    let workspaces: Vec<_> = rows.iter().map(|(id, name, product, desc, created_by, created_at, updated_at, role)| {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "product": product,
+            "description": desc,
+            "created_by": created_by,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "role": role,
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({ "workspaces": workspaces })))
+}
+
+async fn handle_get_workspace(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+
+    let ws = db.get_workspace(&id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Workspace not found"))?;
+
+    let members = db.list_workspace_members(&id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "id": ws.0,
+        "name": ws.1,
+        "product": ws.2,
+        "description": ws.3,
+        "created_by": ws.4,
+        "created_at": ws.5,
+        "updated_at": ws.6,
+        "role": role,
+        "members": members.iter().map(|(u, r, a)| serde_json::json!({
+            "username": u, "role": r, "added_at": a,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn handle_update_workspace(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateWorkspaceRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    if role != "owner" && role != "editor" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Insufficient permissions"));
+    }
+
+    db.update_workspace(&id, &req.name, &req.product, &req.description)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+async fn handle_delete_workspace(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    if role != "owner" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Only the owner can delete a workspace"));
+    }
+
+    db.delete_workspace(&id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    log::info!("Workspace {} deleted by {}", id, claims.sub);
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+// ---------------------------------------------------------------------------
+// Workspace member endpoints
+// ---------------------------------------------------------------------------
+
+async fn handle_add_workspace_member(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<AddMemberRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&workspace_id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    if role != "owner" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Only the owner can manage members"));
+    }
+
+    if !matches!(req.role.as_str(), "owner" | "editor" | "viewer") {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Role must be owner, editor, or viewer"));
+    }
+
+    db.add_workspace_member(&workspace_id, &req.username, &req.role)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+async fn handle_remove_workspace_member(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((workspace_id, username)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&workspace_id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    if role != "owner" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Only the owner can manage members"));
+    }
+
+    if username == claims.sub {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Cannot remove yourself"));
+    }
+
+    db.remove_workspace_member(&workspace_id, &username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+// ---------------------------------------------------------------------------
+// Config revision endpoints
+// ---------------------------------------------------------------------------
+
+async fn handle_push_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<PushConfigRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&workspace_id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    if role == "viewer" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Viewers cannot push configs"));
+    }
+
+    // Validate JSON
+    serde_json::from_str::<serde_json::Value>(&req.config_json)
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e)))?;
+
+    let version = db.push_config_revision(&workspace_id, &req.config_json, &req.description, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok((StatusCode::CREATED, Json(serde_json::json!({
+        "version": version,
+        "workspace_id": workspace_id,
+    }))))
+}
+
+async fn handle_list_configs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    db.get_workspace_member_role(&workspace_id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+
+    let rows = db.list_config_revisions(&workspace_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    let configs: Vec<_> = rows.iter().map(|(id, version, desc, author, created_at)| {
+        serde_json::json!({
+            "id": id,
+            "version": version,
+            "description": desc,
+            "author": author,
+            "created_at": created_at,
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({ "configs": configs })))
+}
+
+async fn handle_get_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((workspace_id, version)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    db.get_workspace_member_role(&workspace_id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+
+    let rev = db.get_config_revision(&workspace_id, version)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Config revision not found"))?;
+
+    Ok(Json(serde_json::json!({
+        "id": rev.0,
+        "version": rev.1,
+        "config_json": rev.2,
+        "description": rev.3,
+        "author": rev.4,
+        "created_at": rev.5,
+    })))
+}
+
+async fn handle_get_latest_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    db.get_workspace_member_role(&workspace_id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+
+    let rev = db.get_latest_config_revision(&workspace_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "No config revisions in this workspace"))?;
+
+    Ok(Json(serde_json::json!({
+        "id": rev.0,
+        "version": rev.1,
+        "config_json": rev.2,
+        "description": rev.3,
+        "author": rev.4,
+        "created_at": rev.5,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,6 +1630,15 @@ async fn main() -> Result<()> {
         // Releases — admin endpoints (JWT protected)
         .route("/api/v1/releases", get(handle_list_releases_admin).post(handle_upload_release))
         .route("/api/v1/releases/{tag}", axum::routing::delete(handle_delete_release))
+        // Workspace endpoints (JWT protected)
+        .route("/api/v1/workspaces", get(handle_list_workspaces).post(handle_create_workspace))
+        .route("/api/v1/workspaces/{id}", get(handle_get_workspace).put(handle_update_workspace).delete(handle_delete_workspace))
+        .route("/api/v1/workspaces/{id}/members", post(handle_add_workspace_member))
+        .route("/api/v1/workspaces/{id}/members/{username}", axum::routing::delete(handle_remove_workspace_member))
+        // Config revision endpoints (JWT protected)
+        .route("/api/v1/workspaces/{id}/configs", get(handle_list_configs).post(handle_push_config))
+        .route("/api/v1/workspaces/{id}/configs/latest", get(handle_get_latest_config))
+        .route("/api/v1/workspaces/{id}/configs/{version}", get(handle_get_config))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cli.listen)

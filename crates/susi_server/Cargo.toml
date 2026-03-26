@@ -27,3 +27,4 @@ argon2 = "0.5"
 jsonwebtoken = "9"
 totp-rs = { version = "5", features = ["qr"] }
 rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
