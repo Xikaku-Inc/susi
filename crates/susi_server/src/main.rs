@@ -1570,6 +1570,42 @@ async fn handle_get_latest_config(
     })))
 }
 
+/// List releases visible to a workspace (workspace-specific + global).
+async fn handle_workspace_releases(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+
+    let db = state.db.lock().unwrap();
+    db.get_workspace_member_role(&workspace_id, &claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+
+    let rows = db.list_releases_for_workspace(&workspace_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    let mut releases = Vec::new();
+    for (id, tag, name, body, prerelease, created_at) in &rows {
+        let assets = db.get_release_assets(*id).unwrap_or_default();
+        releases.push(serde_json::json!({
+            "tag": tag,
+            "name": name,
+            "body": body,
+            "published_at": created_at,
+            "prerelease": prerelease,
+            "assets": assets.iter().map(|(name, size)| serde_json::json!({
+                "name": name,
+                "size": size,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+
+    Ok(Json(serde_json::json!({ "releases": releases })))
+}
+
 // ---------------------------------------------------------------------------
 // Relay endpoints
 // ---------------------------------------------------------------------------
@@ -1869,6 +1905,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/workspaces/{id}/configs", get(handle_list_configs).post(handle_push_config))
         .route("/api/v1/workspaces/{id}/configs/latest", get(handle_get_latest_config))
         .route("/api/v1/workspaces/{id}/configs/{version}", get(handle_get_config))
+        .route("/api/v1/workspaces/{id}/releases", get(handle_workspace_releases))
         // Relay endpoints
         .route("/api/v1/relay/connect", get(handle_relay_connect))
         .route("/api/v1/relay/devices", get(handle_list_relay_devices))
