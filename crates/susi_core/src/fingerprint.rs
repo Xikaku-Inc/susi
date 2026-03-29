@@ -17,11 +17,6 @@ pub fn get_machine_code() -> Result<String, LicenseError> {
     Ok(hex::encode(hash))
 }
 
-/// Format a hex string as a nice display string.
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 // ---- Platform-specific implementations ----
 
 #[cfg(target_os = "windows")]
@@ -69,7 +64,7 @@ fn get_mac_addresses() -> Result<Vec<String>, LicenseError> {
             let mac = &a.PhysicalAddress[..phys_len];
             // Skip all-zero MACs
             if mac.iter().any(|&b| b != 0) {
-                macs.push(hex_encode(mac));
+                macs.push(hex::encode(mac));
             }
         }
         adapter = a.Next;
