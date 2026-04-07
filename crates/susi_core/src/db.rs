@@ -812,11 +812,18 @@ impl LicenseDb {
         author: &str,
     ) -> Result<i64, LicenseError> {
         let now = Utc::now().to_rfc3339();
+        let next_version: i64 = self.conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), -1) + 1 FROM config_revisions WHERE workspace_id = ?1",
+                params![workspace_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| LicenseError::Other(format!("DB query max version: {}", e)))?;
         self.conn
             .execute(
                 "INSERT INTO config_revisions (workspace_id, version, config_json, name, description, author, created_at)
-                 VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6)",
-                params![workspace_id, config_json, name, description, author, now],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![workspace_id, next_version, config_json, name, description, author, now],
             )
             .map_err(|e| LicenseError::Other(format!("DB insert config: {}", e)))?;
         Ok(self.conn.last_insert_rowid())
@@ -1463,7 +1470,7 @@ mod tests {
         let db = test_db();
         db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
         db.add_workspace_member("ws-1", "user1", "viewer").unwrap();
-        db.push_config_revision("ws-1", "{}", "init", "admin").unwrap();
+        db.push_config_revision("ws-1", "{}", "init", "", "admin").unwrap();
 
         db.delete_workspace("ws-1").unwrap();
 
@@ -1481,28 +1488,27 @@ mod tests {
         let db = test_db();
         db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
 
-        let v1 = db.push_config_revision("ws-1", r#"{"a":1}"#, "first", "admin").unwrap();
-        let v2 = db.push_config_revision("ws-1", r#"{"a":2}"#, "second", "admin").unwrap();
+        let v1 = db.push_config_revision("ws-1", r#"{"a":1}"#, "first", "", "admin").unwrap();
+        let v2 = db.push_config_revision("ws-1", r#"{"a":2}"#, "second", "", "admin").unwrap();
         assert_eq!(v1, 1);
         assert_eq!(v2, 2);
 
         let list = db.list_config_revisions("ws-1").unwrap();
         assert_eq!(list.len(), 2);
-        // Newest first
-        assert_eq!(list[0].1, 2);
-        assert_eq!(list[1].1, 1);
+        // Newest first (field .1 = name)
+        assert_eq!(list[0].1, "second");
+        assert_eq!(list[1].1, "first");
     }
 
     #[test]
     fn test_get_config_revision() {
         let db = test_db();
         db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
-        db.push_config_revision("ws-1", r#"{"key":"value"}"#, "test", "admin").unwrap();
+        db.push_config_revision("ws-1", r#"{"key":"value"}"#, "test", "", "admin").unwrap();
 
         let rev = db.get_config_revision("ws-1", 1).unwrap().unwrap();
-        assert_eq!(rev.1, 1); // version
-        assert_eq!(rev.2, r#"{"key":"value"}"#); // config_json
-        assert_eq!(rev.3, "test"); // description
+        assert_eq!(rev.1, r#"{"key":"value"}"#); // config_json
+        assert_eq!(rev.2, "test"); // name
 
         assert!(db.get_config_revision("ws-1", 99).unwrap().is_none());
     }
@@ -1514,12 +1520,12 @@ mod tests {
 
         assert!(db.get_latest_config_revision("ws-1").unwrap().is_none());
 
-        db.push_config_revision("ws-1", r#"{"v":1}"#, "v1", "admin").unwrap();
-        db.push_config_revision("ws-1", r#"{"v":2}"#, "v2", "admin").unwrap();
+        db.push_config_revision("ws-1", r#"{"v":1}"#, "v1", "", "admin").unwrap();
+        db.push_config_revision("ws-1", r#"{"v":2}"#, "v2", "", "admin").unwrap();
 
         let latest = db.get_latest_config_revision("ws-1").unwrap().unwrap();
-        assert_eq!(latest.1, 2);
-        assert_eq!(latest.2, r#"{"v":2}"#);
+        assert_eq!(latest.1, r#"{"v":2}"#); // config_json
+        assert_eq!(latest.2, "v2"); // name
     }
 
     #[test]
