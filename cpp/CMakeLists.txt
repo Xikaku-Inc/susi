@@ -34,6 +34,7 @@ if(WIN32)
     target_link_libraries(susi PRIVATE wbemuuid ole32 oleaut32 setupapi cfgmgr32)
 endif()
 
+# macOS: IOKit + CoreFoundation (fingerprint)
 if(APPLE)
     find_library(IOKIT_LIBRARY IOKit REQUIRED)
     find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
