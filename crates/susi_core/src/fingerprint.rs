@@ -7,7 +7,6 @@ use crate::error::LicenseError;
 pub fn get_machine_code() -> Result<String, LicenseError> {
     let (a, b) = get_hardware_ids()?;
     let combined = format!("{}|{}", normalize(&a), normalize(&b));
-    println!("Combined hardware IDs: {}", combined);
     let hash = Sha256::digest(combined.as_bytes());
     Ok(hex::encode(hash))
 }

@@ -189,7 +189,6 @@ static std::string getMachineCode()
     }
 
     std::string combined = normalizeId(biosUuid) + "|" + normalizeId(processorId);
-    SUSI_LOG("Machine code: %s", combined.c_str());
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char*>(combined.data()), combined.size(), hash);
     return hexEncode(hash, SHA256_DIGEST_LENGTH);
@@ -242,7 +241,6 @@ static std::string getMachineCode()
     std::string uuid = getIOPlatformValue("IOPlatformUUID");
     std::string serial = getIOPlatformValue("IOPlatformSerialNumber");
     std::string combined = normalizeId(uuid) + "|" + normalizeId(serial);
-    SUSI_LOG("Machine code: %s", combined.c_str());
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char*>(combined.data()), combined.size(), hash);
     return hexEncode(hash, SHA256_DIGEST_LENGTH);
@@ -325,7 +323,6 @@ static std::string getMachineCode()
     std::string diskSerial = getRootDiskSerial();
 
     std::string combined = normalizeId(machineId) + "|" + normalizeId(diskSerial);
-    SUSI_LOG("Machine code: %s", combined.c_str());
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char*>(combined.data()), combined.size(), hash);
     return hexEncode(hash, SHA256_DIGEST_LENGTH);
