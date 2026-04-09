@@ -41,6 +41,7 @@
 #if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <sys/mount.h>
 #endif
 #endif
 
@@ -912,7 +913,7 @@ static std::vector<UsbDeviceInfo> enumerateUsbDevices()
     CFDictionarySetValue(matching, CFSTR("Whole"), kCFBooleanTrue);
 
     io_iterator_t iter = IO_OBJECT_NULL;
-    if (IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &iter) != KERN_SUCCESS)
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) != KERN_SUCCESS)
         return devices;
 
     io_service_t media;
