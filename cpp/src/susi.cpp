@@ -34,6 +34,7 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 #else
 #include <climits>
 #include <dirent.h>
@@ -72,6 +73,21 @@ static std::vector<unsigned char> base64Decode(const std::string& encoded)
     if (len < 0) return {};
     out.resize(static_cast<size_t>(len));
     return out;
+}
+
+static std::string base64Encode(const unsigned char* data, size_t len)
+{
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    BIO* bmem = BIO_new(BIO_s_mem());
+    b64 = BIO_push(b64, bmem);
+    BIO_write(b64, data, static_cast<int>(len));
+    BIO_flush(b64);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(b64, &bptr);
+    std::string result(bptr->data, bptr->length);
+    BIO_free_all(b64);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +385,90 @@ std::string SusiClient::getPublicKeyPem()
 }
 
 // ---------------------------------------------------------------------------
+// Certificate chain extraction from binary code signature
+// ---------------------------------------------------------------------------
+static std::vector<std::vector<uint8_t>> getSigningCertChain()
+{
+    std::vector<std::vector<uint8_t>> chain;
+
+#if defined(_WIN32)
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH))
+        return chain;
+
+    HCERTSTORE hStore = nullptr;
+    HCRYPTMSG  hMsg   = nullptr;
+    DWORD contentType = 0, formatType = 0, encodingType = 0;
+
+    BOOL ok = CryptQueryObject(
+        CERT_QUERY_OBJECT_FILE,
+        exePath,
+        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+        CERT_QUERY_FORMAT_FLAG_ALL,
+        0,
+        &encodingType, &contentType, &formatType,
+        &hStore, &hMsg, nullptr
+    );
+
+    if (!ok || !hStore) {
+        if (hMsg) CryptMsgClose(hMsg);
+        return chain;
+    }
+
+    PCCERT_CONTEXT pCtx = nullptr;
+    while ((pCtx = CertEnumCertificatesInStore(hStore, pCtx)) != nullptr) {
+        chain.emplace_back(
+            pCtx->pbCertEncoded,
+            pCtx->pbCertEncoded + pCtx->cbCertEncoded
+        );
+    }
+
+    if (hMsg) CryptMsgClose(hMsg);
+    CertCloseStore(hStore, CERT_CLOSE_STORE_FORCE_FLAG);
+
+#elif defined(__APPLE__)
+    char exePath[PATH_MAX] = {};
+    uint32_t size = sizeof(exePath);
+    if (_NSGetExecutablePath(exePath, &size) != 0)
+        return chain;
+
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+        nullptr, reinterpret_cast<const UInt8*>(exePath), strlen(exePath), false);
+    if (!url) return chain;
+
+    SecStaticCodeRef code = nullptr;
+    OSStatus status = SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code);
+    CFRelease(url);
+    if (status != errSecSuccess || !code) return chain;
+
+    CFDictionaryRef info = nullptr;
+    status = SecCodeCopySigningInformation(code, kSecCSSigningInformation, &info);
+    CFRelease(code);
+    if (status != errSecSuccess || !info) return chain;
+
+    auto certsVal = CFDictionaryGetValue(info, kSecCodeInfoCertificates);
+    if (certsVal) {
+        auto certs = reinterpret_cast<CFArrayRef>(certsVal);
+        CFIndex count = CFArrayGetCount(certs);
+        for (CFIndex i = 0; i < count; ++i) {
+            auto cert = reinterpret_cast<SecCertificateRef>(
+                const_cast<void*>(CFArrayGetValueAtIndex(certs, i)));
+            CFDataRef data = SecCertificateCopyData(cert);
+            if (data) {
+                const uint8_t* ptr = CFDataGetBytePtr(data);
+                CFIndex len = CFDataGetLength(data);
+                chain.emplace_back(ptr, ptr + len);
+                CFRelease(data);
+            }
+        }
+    }
+    CFRelease(info);
+#endif
+
+    return chain;
+}
+
+// ---------------------------------------------------------------------------
 // Binary signing verification
 // ---------------------------------------------------------------------------
 static bool isBinarySigned()
@@ -630,6 +730,14 @@ SusiClient::LicenseStatus SusiClient::checkLicenseAndRefresh(const std::filesyst
         body["license_key"] = licenseKey;
         body["machine_code"] = getMachineCode();
         body["friendly_name"] = getHostname();
+
+        auto certChain = getSigningCertChain();
+        if (!certChain.empty()) {
+            json chainArr = json::array();
+            for (const auto& der : certChain)
+                chainArr.push_back(base64Encode(der.data(), der.size()));
+            body["signing_cert_chain"] = chainArr;
+        }
 
         std::string response;
         long httpCode = httpPost(url, body.dump(), response);

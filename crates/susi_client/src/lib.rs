@@ -267,11 +267,19 @@ impl LicenseClient {
             });
 
         let url = format!("{}/activate", server_url.trim_end_matches('/'));
-        let body = serde_json::json!({
+        let chain = binary_signing::extract_signing_cert_chain();
+        let mut body = serde_json::json!({
             "license_key": license_key,
             "machine_code": machine_code,
             "friendly_name": friendly_name,
         });
+        if !chain.is_empty() {
+            use base64::Engine;
+            let chain_b64: Vec<String> = chain.iter()
+                .map(|der| base64::engine::general_purpose::STANDARD.encode(der))
+                .collect();
+            body["signing_cert_chain"] = serde_json::json!(chain_b64);
+        }
 
         let response = reqwest::blocking::Client::new()
             .post(&url)
