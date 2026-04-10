@@ -3,228 +3,123 @@ use sha2::{Digest, Sha256};
 use crate::error::LicenseError;
 
 /// Compute a machine fingerprint from hardware identifiers.
-/// Returns a hex-encoded SHA256 hash of sorted MAC addresses + hostname.
+/// Returns a hex-encoded SHA256 hash of platform-specific hardware IDs.
 pub fn get_machine_code() -> Result<String, LicenseError> {
-    let macs = get_mac_addresses()?;
-    let hostname = get_hostname()?;
-
-    let mut components: Vec<String> = macs;
-    components.sort();
-    components.push(hostname);
-
-    let combined = components.join("|");
+    let (a, b) = get_hardware_ids()?;
+    let combined = format!("{}|{}", normalize(&a), normalize(&b));
     let hash = Sha256::digest(combined.as_bytes());
     Ok(hex::encode(hash))
 }
 
+fn normalize(s: &str) -> String {
+    s.chars().filter(|&c| c != '-').map(|c| c.to_ascii_lowercase()).collect()
+}
+
 // ---- Platform-specific implementations ----
 
+/// Windows: BIOS UUID + CPU ProcessorId (via WMI ROOT\CIMV2)
 #[cfg(target_os = "windows")]
-fn get_mac_addresses() -> Result<Vec<String>, LicenseError> {
-    use windows::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
-        IP_ADAPTER_ADDRESSES_LH,
+fn get_hardware_ids() -> Result<(String, String), LicenseError> {
+    use std::collections::HashMap;
+    use wmi::{Variant, WMIConnection};
+
+    let wmi_con = WMIConnection::new()
+        .map_err(|e| LicenseError::Other(format!("WMI: {}", e)))?;
+
+    let query_first = |query: &str, prop: &str| -> String {
+        wmi_con
+            .raw_query(query)
+            .ok()
+            .and_then(|mut rows: Vec<HashMap<String, Variant>>| {
+                rows.first_mut()?.remove(prop)
+            })
+            .and_then(|v| if let Variant::String(s) = v { Some(s) } else { None })
+            .unwrap_or_default()
     };
-    use windows::Win32::Networking::WinSock::AF_UNSPEC;
 
-    let mut buf_len: u32 = 15000;
-    let mut buffer: Vec<u8>;
-
-    loop {
-        buffer = vec![0u8; buf_len as usize];
-        let ret = unsafe {
-            GetAdaptersAddresses(
-                AF_UNSPEC.0 as u32,
-                GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
-                None,
-                Some(buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
-                &mut buf_len,
-            )
-        };
-        if ret == 0 {
-            break;
-        }
-        if ret == 111 {
-            // ERROR_BUFFER_OVERFLOW, try again with larger buffer
-            continue;
-        }
-        return Err(LicenseError::Other(format!(
-            "GetAdaptersAddresses failed with error {}",
-            ret
-        )));
-    }
-
-    let mut macs = Vec::new();
-    let mut adapter = buffer.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
-
-    while !adapter.is_null() {
-        let a = unsafe { &*adapter };
-        let phys_len = a.PhysicalAddressLength as usize;
-        if phys_len == 6 {
-            let mac = &a.PhysicalAddress[..phys_len];
-            // Skip all-zero MACs
-            if mac.iter().any(|&b| b != 0) {
-                macs.push(hex::encode(mac));
-            }
-        }
-        adapter = a.Next;
-    }
-
-    macs.sort();
-    macs.dedup();
-    Ok(macs)
+    let bios_uuid = query_first("SELECT UUID FROM Win32_ComputerSystemProduct", "UUID");
+    let processor_id = query_first("SELECT ProcessorId FROM Win32_Processor", "ProcessorId");
+    Ok((bios_uuid, processor_id))
 }
 
-#[cfg(target_os = "windows")]
-fn get_hostname() -> Result<String, LicenseError> {
-    use windows::core::PWSTR;
-    use windows::Win32::System::SystemInformation::{
-        ComputerNamePhysicalDnsHostname, GetComputerNameExW,
-    };
+/// Linux: /etc/machine-id + root disk serial
+#[cfg(target_os = "linux")]
+fn get_hardware_ids() -> Result<(String, String), LicenseError> {
+    let machine_id = std::fs::read_to_string("/etc/machine-id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
 
-    let mut size: u32 = 0;
-    // First call to get required buffer size
-    unsafe {
-        let _ = GetComputerNameExW(
-            ComputerNamePhysicalDnsHostname,
-            PWSTR(std::ptr::null_mut()),
-            &mut size,
-        );
-    }
-
-    let mut buffer = vec![0u16; size as usize];
-    unsafe {
-        GetComputerNameExW(
-            ComputerNamePhysicalDnsHostname,
-            PWSTR(buffer.as_mut_ptr()),
-            &mut size,
-        )
-        .map_err(|e| LicenseError::Other(format!("GetComputerNameExW failed: {}", e)))?;
-    }
-
-    Ok(String::from_utf16_lossy(&buffer[..size as usize]))
+    let disk_serial = root_disk_serial();
+    Ok((machine_id, disk_serial))
 }
 
 #[cfg(target_os = "linux")]
-fn get_mac_addresses() -> Result<Vec<String>, LicenseError> {
-    let mut macs = Vec::new();
+fn root_disk_serial() -> String {
+    // Find the device mounted at "/"
+    let root_dev = std::fs::read_to_string("/proc/mounts").ok().and_then(|s| {
+        s.lines()
+            .find(|l| l.split_whitespace().nth(1) == Some("/"))
+            .and_then(|l| l.split_whitespace().next())
+            .filter(|d| d.starts_with("/dev/"))
+            .map(|d| d[5..].to_string()) // strip "/dev/"
+    });
 
-    let entries = std::fs::read_dir("/sys/class/net")
-        .map_err(|e| LicenseError::Other(format!("Failed to read /sys/class/net: {}", e)))?;
+    let dev = match root_dev {
+        Some(d) => d,
+        None => return String::new(),
+    };
 
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Skip loopback
-        if name == "lo" {
-            continue;
+    // Determine base disk name (strip partition suffix)
+    // NVMe/eMMC: "nvme0n1p1" → "nvme0n1", "mmcblk0p1" → "mmcblk0"
+    // SATA/SCSI: "sda1" → "sda"
+    let disk = if let Some(p) = dev.rfind('p') {
+        let suffix = &dev[p + 1..];
+        if p > 0 && !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            dev[..p].to_string()
+        } else {
+            dev.trim_end_matches(|c: char| c.is_ascii_digit()).to_string()
         }
-        let addr_path = entry.path().join("address");
-        if let Ok(mac) = std::fs::read_to_string(&addr_path) {
-            let mac = mac.trim().to_lowercase();
-            // Skip all-zero MACs
-            if !mac.is_empty() && mac != "00:00:00:00:00:00" {
-                // Normalize: remove colons
-                let normalized: String = mac.chars().filter(|c| *c != ':').collect();
-                macs.push(normalized);
+    } else {
+        dev.trim_end_matches(|c: char| c.is_ascii_digit()).to_string()
+    };
+
+    for path in &[
+        format!("/sys/block/{}/device/serial", disk),
+        format!("/sys/block/{}/serial", disk),
+    ] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                return s;
             }
         }
     }
-
-    macs.sort();
-    macs.dedup();
-    Ok(macs)
+    String::new()
 }
 
-#[cfg(target_os = "linux")]
-fn get_hostname() -> Result<String, LicenseError> {
-    std::fs::read_to_string("/etc/hostname")
-        .map(|h| h.trim().to_string())
-        .or_else(|_| {
-            // Fallback: use gethostname
-            let mut buf = [0u8; 256];
-            let result = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut i8, buf.len()) };
-            if result != 0 {
-                return Err(LicenseError::Other("gethostname failed".to_string()));
-            }
-            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            Ok(String::from_utf8_lossy(&buf[..len]).to_string())
-        })
-}
-
+/// macOS: IOPlatformUUID + IOPlatformSerialNumber (via ioreg)
 #[cfg(target_os = "macos")]
-fn get_mac_addresses() -> Result<Vec<String>, LicenseError> {
-    use std::ptr;
+fn get_hardware_ids() -> Result<(String, String), LicenseError> {
+    let ioreg_value = |key: &str| -> String {
+        std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.contains(key))
+                    .and_then(|l| l.split('"').nth(3))
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default()
+    };
 
-    // AF_LINK on macOS
-    const AF_LINK: i32 = 18;
-
-    // Minimal sockaddr_dl layout for reading MAC addresses
-    #[repr(C)]
-    struct SockaddrDl {
-        sdl_len: u8,
-        sdl_family: u8,
-        _sdl_index: u16,
-        sdl_type: u8,
-        sdl_nlen: u8,
-        sdl_alen: u8,
-        _sdl_slen: u8,
-        sdl_data: [u8; 46],
-    }
-
-    // IFT_ETHER
-    const IFT_ETHER: u8 = 6;
-
-    let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
-        return Err(LicenseError::Other("getifaddrs failed".to_string()));
-    }
-
-    let mut macs = Vec::new();
-    let mut cur = ifap;
-    while !cur.is_null() {
-        let ifa = unsafe { &*cur };
-        if !ifa.ifa_addr.is_null() {
-            let sa = unsafe { &*ifa.ifa_addr };
-            if sa.sa_family as i32 == AF_LINK {
-                let sdl = unsafe { &*(ifa.ifa_addr as *const SockaddrDl) };
-                if sdl.sdl_type == IFT_ETHER && sdl.sdl_alen == 6 {
-                    let offset = sdl.sdl_nlen as usize;
-                    let mac = &sdl.sdl_data[offset..offset + 6];
-                    if mac.iter().any(|&b| b != 0) {
-                        macs.push(hex::encode(mac));
-                    }
-                }
-            }
-        }
-        cur = ifa.ifa_next;
-    }
-
-    unsafe { libc::freeifaddrs(ifap) };
-    macs.sort();
-    macs.dedup();
-    Ok(macs)
-}
-
-#[cfg(target_os = "macos")]
-fn get_hostname() -> Result<String, LicenseError> {
-    let mut buf = [0u8; 256];
-    let result = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut i8, buf.len()) };
-    if result != 0 {
-        return Err(LicenseError::Other("gethostname failed".to_string()));
-    }
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    Ok(String::from_utf8_lossy(&buf[..len]).to_string())
+    Ok((ioreg_value("IOPlatformUUID"), ioreg_value("IOPlatformSerialNumber")))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn get_mac_addresses() -> Result<Vec<String>, LicenseError> {
-    Err(LicenseError::Other(
-        "Platform not supported for hardware fingerprinting".to_string(),
-    ))
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn get_hostname() -> Result<String, LicenseError> {
+fn get_hardware_ids() -> Result<(String, String), LicenseError> {
     Err(LicenseError::Other(
         "Platform not supported for hardware fingerprinting".to_string(),
     ))
