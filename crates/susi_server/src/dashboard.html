@@ -985,6 +985,14 @@ function formatDate(iso) {
     return d.toLocaleDateString('en-CA'); // YYYY-MM-DD
 }
 
+function formatDateTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    const date = d.toLocaleDateString('en-CA'); // YYYY-MM-DD
+    const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+    return date + ' ' + time;
+}
+
 function getStatus(lic) {
     if (lic.revoked) return 'revoked';
     if (lic.expires !== 'perpetual' && new Date(lic.expires) < new Date()) return 'expired';
@@ -1706,7 +1714,7 @@ function renderReleases() {
                 '<div>' +
                     '<div style="font-weight:600;font-size:14px;font-family:monospace;">' + arrow + esc(r.tag) + pre + '</div>' +
                     (r.name && r.name !== r.tag ? '<div style="font-size:13px;color:var(--text2);margin-left:18px;">' + esc(r.name) + '</div>' : '') +
-                    '<div style="font-size:12px;color:var(--text2);margin-top:4px;margin-left:18px;">' + formatDate(r.published_at) + '</div>' +
+                    '<div style="font-size:12px;color:var(--text2);margin-top:4px;margin-left:18px;">' + formatDateTime(r.published_at) + '</div>' +
                 '</div>' +
                 '<div style="display:flex;gap:6px;align-items:center;flex-shrink:0;">' + dlBtns + deleteBtn + '</div>' +
             '</div>' +
