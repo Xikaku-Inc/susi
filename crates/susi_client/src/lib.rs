@@ -1,11 +1,12 @@
 pub mod workspace;
 
-use std::path::Path;
+use std::{path::Path, vec};
 
 use chrono::{DateTime, Utc};
 use susi_core::{
     crypto::{public_key_from_pem, verify_license},
     fingerprint, LicenseError, LicensePayload, SignedLicense,
+    properties::{LicenseMethod, SignedLicenseProperties, verify_properties}
 };
 use rsa::RsaPublicKey;
 
@@ -37,6 +38,7 @@ pub enum LicenseStatus {
     Revoked,
     TokenNotFound,
     FileNotFound(String),
+    LicenseMethodNotAllowed(String),
     Error(String),
 }
 
@@ -93,9 +95,9 @@ impl LicenseStatus {
 /// Client for verifying licenses. Embedded in the FusionHub application.
 pub struct LicenseClient {
     public_key: RsaPublicKey,
-    server_url: Option<String>,
     /// Grace period in hours after lease expiry. Default: 24.
     grace_hours: i64,
+    allowed_license_methods: Vec<LicenseMethod>,
 }
 
 impl LicenseClient {
@@ -104,15 +106,32 @@ impl LicenseClient {
         let public_key = public_key_from_pem(public_key_pem)?;
         Ok(Self {
             public_key,
-            server_url: None,
             grace_hours: susi_core::DEFAULT_LEASE_GRACE_HOURS as i64,
+            allowed_license_methods: vec![LicenseMethod::Token, LicenseMethod::File],
         })
     }
 
     /// Create a new client with an optional server URL for online refresh.
     pub fn with_server(public_key_pem: &str, server_url: String) -> Result<Self, LicenseError> {
         let mut client = Self::new(public_key_pem)?;
-        client.server_url = Some(server_url);
+        client.allowed_license_methods = vec![LicenseMethod::Server { url: server_url.clone() }, LicenseMethod::Token, LicenseMethod::File];
+        Ok(client)
+    }
+
+    pub fn from_properties(public_key_pem: &str, properties_path: &Path) -> Result<Self, LicenseError> {
+        let mut client = Self::new(public_key_pem)?;
+        
+        let content = match std::fs::read_to_string(properties_path) {
+            Ok(c) => c,
+            Err(e) => return Err(LicenseError::InvalidProperties(e.to_string())),
+        };
+        let signed: SignedLicenseProperties = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => return Err(LicenseError::InvalidProperties(e.to_string())),
+        };
+
+        let properties = verify_properties(&client.public_key, &signed)?;
+        client.allowed_license_methods = properties.methods;
         Ok(client)
     }
 
@@ -123,6 +142,10 @@ impl LicenseClient {
 
     /// Verify a signed license file on disk.
     pub fn verify_file(&self, path: &Path) -> LicenseStatus {
+        if !self.allowed_license_methods.contains(&LicenseMethod::File) {
+            return LicenseStatus::LicenseMethodNotAllowed("File-based license check is not allowed by properties.".into());
+        }
+
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => return LicenseStatus::FileNotFound(format!("{}: {}", path.display(), e)),
@@ -194,51 +217,54 @@ impl LicenseClient {
     /// Try to refresh the license from the server, falling back to the local file.
     /// This both renews the lease and verifies the license.
     /// If `friendly_name` is `Some`, use it instead of the system hostname.
-    pub fn verify_and_refresh(&self, path: &Path, license_key: &str, friendly_name: Option<&str>) -> LicenseStatus {
-        if let Some(ref server_url) = self.server_url {
-            match self.try_online_activate(server_url, license_key, friendly_name) {
-                Ok(signed) => {
-                    if let Ok(json) = serde_json::to_string_pretty(&signed) {
-                        let _ = std::fs::write(path, json);
-                    }
-                    return self.verify_signed(&signed);
-                }
-                Err(LicenseError::Revoked) => {
-                    log::warn!("License revoked by server - removing cached file");
-                    if let Err(e) = std::fs::remove_file(path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            log::error!("Failed to remove cached license file: {}", e);
-                        }
-                    }
-                    return LicenseStatus::Revoked;
-                }
-                Err(LicenseError::NotFound) => {
-                    log::warn!("License not found on server - removing cached file");
-                    if let Err(e) = std::fs::remove_file(path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            log::error!("Failed to remove cached license file: {}", e);
-                        }
-                    }
-                    return LicenseStatus::InvalidLicenseKey;
-                }
-                Err(LicenseError::MachineLimitReached(max)) => {
-                    log::warn!("Cannot activate license - machine limit reached");
-                    return LicenseStatus::Error(format!("Machine limit reached: {}", max));
-                }
-                Err(e) => {
-                    log::warn!("Online license refresh failed, using cached file: {}", e);
-                }
-            }
-        } else {
-            log::warn!("No server supplied. Online license check will fail. Falling back to cached file.");
-        }
+    pub fn verify_and_refresh(&self, cache_path: &Path, license_key: &str, friendly_name: Option<&str>) -> LicenseStatus {
+        let Some(server_url) = self.allowed_license_methods.iter().find_map(|m| match m {
+            LicenseMethod::Server { url } => Some(url),
+            _ => None,
+        }) else {
+            return LicenseStatus::LicenseMethodNotAllowed("Server license check is not allowed by properties.".into());
+        };
 
-        if !path.exists() {
-            return LicenseStatus::Error(format!("Online license check failed, cached license file cannot be found: {}", path.display()));
+        match self.try_online_activate(server_url, license_key, friendly_name) {
+            Ok(signed) => {
+                if let Ok(json) = serde_json::to_string_pretty(&signed) {
+                    let _ = std::fs::write(cache_path, json);
+                }
+                return self.verify_signed(&signed);
+            }
+            Err(LicenseError::Revoked) => {
+                log::warn!("License revoked by server - removing cached file");
+                if let Err(e) = std::fs::remove_file(cache_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        log::error!("Failed to remove cached license file: {}", e);
+                    }
+                }
+                return LicenseStatus::Revoked;
+            }
+            Err(LicenseError::NotFound) => {
+                log::warn!("License not found on server - removing cached file");
+                if let Err(e) = std::fs::remove_file(cache_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        log::error!("Failed to remove cached license file: {}", e);
+                    }
+                }
+                return LicenseStatus::InvalidLicenseKey;
+            }
+            Err(LicenseError::MachineLimitReached(max)) => {
+                log::warn!("Cannot activate license - machine limit reached");
+                return LicenseStatus::Error(format!("Machine limit reached: {}", max));
+            }
+            Err(e) => {
+                log::warn!("Online license refresh failed, using cached file: {}", e);
+            }
+        }
+        
+        if !cache_path.exists() {
+            return LicenseStatus::Error(format!("Online license check failed, cached license file cannot be found: {}", cache_path.display()));
         }
 
         // Fall back to local file
-        self.verify_file(path)
+        self.verify_file(cache_path)
     }
 
     fn try_online_activate(
@@ -303,6 +329,10 @@ impl LicenseClient {
     /// Verify a license from a connected USB hardware token.
     /// Scans all connected USB mass storage devices for a valid token.
     pub fn verify_token(&self) -> LicenseStatus {
+        if !self.allowed_license_methods.contains(&LicenseMethod::Token) {
+            return LicenseStatus::LicenseMethodNotAllowed("Token-based license check is not allowed by properties.".into());
+        }
+        
         let devices = match susi_core::usb::enumerate_usb_devices() {
             Ok(d) => d,
             Err(e) => return LicenseStatus::Error(format!("USB enumeration failed: {}", e)),
@@ -350,6 +380,10 @@ impl LicenseClient {
     pub fn get_machine_code() -> Result<String, LicenseError> {
         fingerprint::get_machine_code()
     }
+
+    pub fn get_allowed_license_methods(&self) -> Vec<LicenseMethod> {
+        self.allowed_license_methods.clone()
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +391,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use susi_core::crypto::{generate_keypair, private_key_to_pem, public_key_to_pem, sign_license};
+    use susi_core::properties::{sign_properties, LicenseMethod, LicenseProperties};
 
     fn make_keypair_pems() -> (String, String, rsa::RsaPrivateKey) {
         let (private, public) = generate_keypair(2048).unwrap();
@@ -567,5 +602,139 @@ mod tests {
         assert!(!status.has_feature("anything"));
         assert!(status.features().is_empty());
         assert!(status.expires().is_none());
+    }
+
+    fn unique_tmp(name: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}_{}_{}", name, std::process::id(), nanos))
+    }
+
+    fn write_signed_license(
+        private: &rsa::RsaPrivateKey,
+        payload: &LicensePayload,
+        path: &Path,
+    ) {
+        let signed = sign_license(private, payload).unwrap();
+        let json = serde_json::to_string_pretty(&signed).unwrap();
+        std::fs::write(path, &json).unwrap();
+    }
+
+    fn write_props(private: &rsa::RsaPrivateKey, props: &LicenseProperties, path: &Path) {
+        let signed = sign_properties(private, props).unwrap();
+        std::fs::write(path, serde_json::to_string(&signed).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_verify_with_properties_file_method_success() {
+        let (_, pub_pem, private) = make_keypair_pems();
+        let license_path = unique_tmp("props_file_license.json");
+        let props_path = unique_tmp("props_file_props.json");
+        write_signed_license(&private, &make_valid_payload(None), &license_path);
+
+        let props = LicenseProperties { methods: vec![LicenseMethod::File] };
+        write_props(&private, &props, &props_path);
+
+        let client = LicenseClient::from_properties(&pub_pem, &props_path).unwrap();
+        let status = client.verify_file(&license_path);
+        assert!(status.is_valid(), "expected valid, got {:?}", status);
+        assert!(status.has_feature("full_fusion"));
+
+        let _ = std::fs::remove_file(&license_path);
+        let _ = std::fs::remove_file(&props_path);
+    }
+
+    #[test]
+    fn test_verify_with_properties_invalid_signature() {
+        let (_, pub_pem, _) = make_keypair_pems();
+        let (_, _, other_private) = make_keypair_pems();
+
+        let props_path = unique_tmp("props_bad_sig.json");
+        let props = LicenseProperties { methods: vec![LicenseMethod::Token] };
+        write_props(&other_private, &props, &props_path);
+
+        let err = LicenseClient::from_properties(&pub_pem, &props_path);
+        assert!(err.is_err(), "expected Err for wrong signing key");
+
+        let _ = std::fs::remove_file(&props_path);
+    }
+
+    #[test]
+    fn test_verify_with_properties_tampered_data() {
+        let (_, pub_pem, private) = make_keypair_pems();
+        let props_path = unique_tmp("props_tampered.json");
+
+        let props = LicenseProperties { methods: vec![LicenseMethod::File] };
+        let mut signed = sign_properties(&private, &props).unwrap();
+        signed.properties_data = signed.properties_data.replace("file", "token");
+        std::fs::write(&props_path, serde_json::to_string(&signed).unwrap()).unwrap();
+
+        let err = LicenseClient::from_properties(&pub_pem, &props_path);
+        assert!(err.is_err(), "expected Err for tampered data");
+
+        let _ = std::fs::remove_file(&props_path);
+    }
+
+    #[test]
+    fn test_verify_with_properties_missing_file() {
+        let (_, pub_pem, _) = make_keypair_pems();
+        let err = LicenseClient::from_properties(&pub_pem, Path::new("/does/not/exist/susi-properties.json"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_verify_with_properties_malformed_bytes() {
+        let (_, pub_pem, _) = make_keypair_pems();
+        let props_path = unique_tmp("props_malformed.json");
+        std::fs::write(&props_path, b"not a susi properties file").unwrap();
+
+        let err = LicenseClient::from_properties(&pub_pem, &props_path);
+        assert!(err.is_err());
+
+        let _ = std::fs::remove_file(&props_path);
+    }
+
+    #[test]
+    fn test_verify_with_properties_empty_methods() {
+        let (_, pub_pem, private) = make_keypair_pems();
+        let props_path = unique_tmp("props_empty.json");
+        let props = LicenseProperties { methods: vec![] };
+        write_props(&private, &props, &props_path);
+
+        let client = LicenseClient::from_properties(&pub_pem, &props_path).unwrap();
+        // No methods allowed
+        let status = client.verify_file(Path::new("/tmp/any.json"));
+        assert!(matches!(status, LicenseStatus::LicenseMethodNotAllowed(_)));
+        let status = client.verify_token();
+        assert!(matches!(status, LicenseStatus::LicenseMethodNotAllowed(_)));
+        let status = client.verify_and_refresh(Path::new("/tmp/missing.json"), "AAAA-BBBB-CCCC-DDDD", None);
+        assert!(matches!(status, LicenseStatus::LicenseMethodNotAllowed(_)));
+
+        let _ = std::fs::remove_file(&props_path);
+    }
+
+    #[test]
+    fn test_verify_with_properties_only_allowed() {
+        // Properties listing only File: verify_file allowed, verify_token blocked.
+        let (_, pub_pem, private) = make_keypair_pems();
+        let props_path = unique_tmp("props_order.json");
+        let props = LicenseProperties { methods: vec![LicenseMethod::File] };
+        write_props(&private, &props, &props_path);
+
+        let client = LicenseClient::from_properties(&pub_pem, &props_path).unwrap();
+        // File method allowed
+        let status = client.verify_file(Path::new("/tmp/missing.json"));
+        assert!(matches!(status, LicenseStatus::FileNotFound(_)));
+        // Token method not allowed
+        let status = client.verify_token();
+        assert!(matches!(status, LicenseStatus::LicenseMethodNotAllowed(_)));
+        // Server method not allowed
+        let status = client.verify_and_refresh(Path::new("/tmp/missing.json"), "AAAA-BBBB-CCCC-DDDD", None);
+        assert!(matches!(status, LicenseStatus::LicenseMethodNotAllowed(_)));
+        
+        let _ = std::fs::remove_file(&props_path);
     }
 }
