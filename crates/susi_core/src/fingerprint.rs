@@ -145,44 +145,19 @@ mod tests {
     #[test]
     fn test_machine_code_from_string() {
         let code = machine_code_from_string("test-machine-id");
-        // SHA256 produces 64 hex characters
         assert_eq!(code.len(), 64);
         assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // Deterministic
         let code2 = machine_code_from_string("test-machine-id");
         assert_eq!(code, code2);
 
-        // Different input → different output
         let code3 = machine_code_from_string("other-machine");
         assert_ne!(code, code3);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn test_get_machine_code_windows() {
-        let code = get_machine_code().unwrap();
-        assert_eq!(code.len(), 64);
-        assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
-        // Should be deterministic on same machine
-        let code2 = get_machine_code().unwrap();
-        assert_eq!(code, code2);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_get_machine_code_linux() {
-        let code = get_machine_code().unwrap();
-        assert_eq!(code.len(), 64);
-        assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
-        let code2 = get_machine_code().unwrap();
-        assert_eq!(code, code2);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_get_machine_code_macos() {
-        let code = get_machine_code().unwrap();
+    fn test_get_machine_code_is_stable() {
+        let code = get_machine_code().expect("machine code should be readable");
         assert_eq!(code.len(), 64);
         assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
         let code2 = get_machine_code().unwrap();
