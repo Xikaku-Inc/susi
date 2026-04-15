@@ -571,6 +571,7 @@ A **license properties file** (`susi-properties.json`) lets you, as the software
 # Allow only file-based licenses
 susi-admin properties \
   --methods file \
+  --server-url https://license.example.com/api/v1 \
   --private-key ./keys/private.pem
 
 # Allow server activation first, fall back to file
@@ -587,7 +588,7 @@ susi-admin properties \
   --private-key ./keys/private.pem
 ```
 
-Available methods: `file`, `token`, `server`. The order in `--methods` is preserved and can be used by the implementing application to try verification in this specific order.
+`--server-url` is always required. Available methods: `file`, `token`, `server`. The order in `--methods` is preserved and can be used by the implementing application to try verification in this specific order.
 
 ### Use a properties file in Rust
 
@@ -624,7 +625,7 @@ auto status = susi.checkLicenseAndRefresh("license.json", "XXXXX-XXXXX-XXXXX-XXX
 
 ```json
 {
-  "properties_data": "{\"methods\":[{\"type\":\"server\",\"url\":\"https://license.example.com/api/v1\"},{\"type\":\"file\"}]}",
+  "properties_data": "{\"server_url\":\"https://license.example.com/api/v1\",\"methods\":[{\"type\":\"server\"},{\"type\":\"file\"}]}",
   "signature": "Base64-encoded RSA-SHA256 signature of properties_data"
 }
 ```
