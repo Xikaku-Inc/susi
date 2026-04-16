@@ -134,8 +134,7 @@ impl LicenseDb {
         let _ = self.conn.execute_batch(
             "ALTER TABLE licenses ADD COLUMN lease_duration_hours INTEGER NOT NULL DEFAULT 168;
              ALTER TABLE licenses ADD COLUMN lease_grace_hours INTEGER NOT NULL DEFAULT 24;
-             ALTER TABLE machine_activations ADD COLUMN lease_expires_at TEXT NOT NULL DEFAULT '';
-             ALTER TABLE licenses ADD COLUMN require_signed_binary INTEGER NOT NULL DEFAULT 1;"
+             ALTER TABLE machine_activations ADD COLUMN lease_expires_at TEXT NOT NULL DEFAULT '';"
         );
         // Add workspace_id to releases for per-workspace scoping
         let _ = self.conn.execute_batch(
@@ -167,6 +166,13 @@ impl LicenseDb {
                  DROP TABLE admin_user;"
             );
         }
+
+        // Add require binary signing to licenses table
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE licenses ADD COLUMN require_signed_binary INTEGER NOT NULL DEFAULT 1;"
+        );
+
+        // >> Add new migrations as own execute_batch statements here <<
         Ok(())
     }
 
