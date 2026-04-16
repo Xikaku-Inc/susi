@@ -232,6 +232,15 @@ impl LicenseClient {
                     log::warn!("Cannot activate license - machine limit reached");
                     return LicenseStatus::Error(format!("Machine limit reached: {}", max));
                 }
+                Err(LicenseError::CertificateChainNotTrusted) => {
+                    log::warn!("Binary not signed correctly - removing cached file");
+                    if let Err(e) = std::fs::remove_file(path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            log::error!("Failed to remove cached license file: {}", e);
+                        }
+                    }
+                    return LicenseStatus::UnsignedBinary;
+                }
                 Err(e) => {
                     log::warn!("Online license refresh failed, using cached file: {}", e);
                 }
@@ -311,6 +320,7 @@ impl LicenseClient {
                     .unwrap_or(0);
                 LicenseError::MachineLimitReached(max)
             }
+            403 if msg.contains("certificate chain") => LicenseError::CertificateChainNotTrusted,
             _ => LicenseError::Other(format!("Server returned {}: {}", status, msg)),
         })
     }

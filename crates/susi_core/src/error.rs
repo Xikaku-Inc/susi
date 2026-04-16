@@ -50,6 +50,9 @@ pub enum LicenseError {
     #[error("Token decryption failed: {0}")]
     TokenDecryptionFailed(String),
 
+    #[error("Certificate does not termiante at the trusted CA")]
+    CertificateChainNotTrusted,
+
     #[error("{0}")]
     Other(String),
 }
