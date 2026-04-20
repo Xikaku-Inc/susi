@@ -32,7 +32,7 @@ fn assets_dir(state: &AppState, tag: &str) -> std::path::PathBuf {
 }
 
 /// Reject path components that could escape the asset directory.
-fn safe_filename(name: &str) -> Result<&str, (StatusCode, Json<ErrorResponse>)> {
+pub(crate) fn safe_filename(name: &str) -> Result<&str, (StatusCode, Json<ErrorResponse>)> {
     if name.is_empty()
         || name.contains('/')
         || name.contains('\\')
@@ -45,7 +45,7 @@ fn safe_filename(name: &str) -> Result<&str, (StatusCode, Json<ErrorResponse>)> 
     Ok(name)
 }
 
-fn safe_tag(tag: &str) -> Result<&str, (StatusCode, Json<ErrorResponse>)> {
+pub(crate) fn safe_tag(tag: &str) -> Result<&str, (StatusCode, Json<ErrorResponse>)> {
     if tag.is_empty()
         || tag.contains('/')
         || tag.contains('\\')
@@ -73,6 +73,58 @@ fn content_type_for(name: &str) -> &'static str {
 
 fn db_err(e: LicenseError) -> (StatusCode, Json<ErrorResponse>) {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+}
+
+/// Ensure the release row for `tag` exists and, if it was just created, seed
+/// it with `origin='user'` doc pages + assets from the most recent prior
+/// release. Physical asset files are copied on disk alongside the DB rows.
+/// Returns the release id. Safe to call from any doc-write entry point.
+fn ensure_release_with_seed(
+    state: &AppState,
+    tag: &str,
+    name: &str,
+) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+    // Step 1: create the release row (under the lock) and remember the source
+    // we'll copy from, so the disk-copy step below can drop the lock.
+    let (dst_id, src_tag, asset_names) = {
+        let mut db = state.db.lock().unwrap();
+        let (dst_id, newly_created) = db.ensure_release_created(tag, name).map_err(db_err)?;
+        if !newly_created {
+            return Ok(dst_id);
+        }
+        let prior = db.latest_prior_release_with_user_docs(dst_id).map_err(db_err)?;
+        let Some((src_id, src_tag)) = prior else {
+            return Ok(dst_id);
+        };
+        let n = db.copy_user_doc_pages(src_id, dst_id).map_err(db_err)?;
+        let asset_names = db.copy_user_doc_asset_rows(src_id, dst_id).map_err(db_err)?;
+        log::info!(
+            "Seeded release {} from {}: {} user page(s), {} user asset(s)",
+            tag, src_tag, n, asset_names.len()
+        );
+        (dst_id, src_tag, asset_names)
+    };
+
+    // Step 2: copy asset files on disk outside the DB lock.
+    if !asset_names.is_empty() {
+        let src_dir = assets_dir(state, &src_tag);
+        let dst_dir = assets_dir(state, tag);
+        if let Err(e) = std::fs::create_dir_all(&dst_dir) {
+            log::warn!("Could not create asset dir {}: {}", dst_dir.display(), e);
+        } else {
+            for name in &asset_names {
+                let sp = src_dir.join(name);
+                let dp = dst_dir.join(name);
+                if let Err(e) = std::fs::copy(&sp, &dp) {
+                    log::warn!(
+                        "Asset {} copy {} -> {} failed: {}",
+                        name, sp.display(), dp.display(), e
+                    );
+                }
+            }
+        }
+    }
+    Ok(dst_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -226,15 +278,14 @@ pub async fn handle_upsert_doc_page(
     require_admin(&state, &claims.sub)?;
     safe_tag(&tag)?;
 
-    let db = state.db.lock().unwrap();
-    let release_id = match db.get_release_by_tag(&tag).map_err(db_err)? {
-        Some(id) => id,
-        None => db
-            .ensure_release(&tag, req.release_name.as_deref().unwrap_or(""))
-            .map_err(db_err)?,
-    };
-    let id = db
-        .upsert_doc_page(
+    let release_id = ensure_release_with_seed(
+        &state,
+        &tag,
+        req.release_name.as_deref().unwrap_or(""),
+    )?;
+    let id = {
+        let db = state.db.lock().unwrap();
+        db.upsert_doc_page(
             release_id,
             &slug,
             &req.title,
@@ -242,7 +293,8 @@ pub async fn handle_upsert_doc_page(
             req.parent_slug.as_deref(),
             req.ord,
         )
-        .map_err(db_err)?;
+        .map_err(db_err)?
+    };
     Ok(Json(json!({ "id": id, "tag": tag, "slug": slug })))
 }
 
@@ -406,15 +458,17 @@ pub async fn handle_bulk_import_docs(
         })
         .collect();
 
-    let release_id = {
+    let release_id = ensure_release_with_seed(&state, &tag, &release_name)?;
+    let (written_pages, skipped_user_slugs) = {
         let mut db = state.db.lock().unwrap();
-        let release_id = db.ensure_release(&tag, &release_name).map_err(db_err)?;
-        db.upsert_doc_pages(release_id, &row_data).map_err(db_err)?;
-        release_id
+        db.upsert_doc_pages(release_id, &row_data).map_err(db_err)?
     };
 
-    // Upsert assets on disk + DB without touching pre-existing files.
+    // Pipeline-side asset upsert on disk + DB. User-owned assets with the same
+    // file_name are left alone (both on disk and in DB).
     let asset_path = assets_dir(&state, &tag);
+    let mut written_assets = 0usize;
+    let mut skipped_user_assets: Vec<String> = Vec::new();
     if !assets.is_empty() {
         std::fs::create_dir_all(&asset_path).map_err(|e| {
             error_response(
@@ -424,6 +478,13 @@ pub async fn handle_bulk_import_docs(
         })?;
         let db = state.db.lock().unwrap();
         for (name, bytes) in &assets {
+            let wrote = db
+                .upsert_doc_asset_pipeline(release_id, name, bytes.len() as u64)
+                .map_err(db_err)?;
+            if !wrote {
+                skipped_user_assets.push(name.clone());
+                continue;
+            }
             let p = asset_path.join(name);
             std::fs::write(&p, bytes).map_err(|e| {
                 error_response(
@@ -431,23 +492,22 @@ pub async fn handle_bulk_import_docs(
                     &format!("Write asset {}: {}", name, e),
                 )
             })?;
-            db.upsert_doc_asset(release_id, name, bytes.len() as u64)
-                .map_err(db_err)?;
+            written_assets += 1;
         }
     }
 
     log::info!(
-        "Docs imported for release {}: {} page(s), {} asset(s)",
-        tag,
-        row_data.len(),
-        assets.len()
+        "Docs imported for release {}: {} page(s) written, {} skipped (user-owned); {} asset(s) written, {} skipped",
+        tag, written_pages, skipped_user_slugs.len(), written_assets, skipped_user_assets.len(),
     );
 
     Ok(Json(json!({
         "status": "OK",
         "tag": tag,
-        "pages": row_data.len(),
-        "assets": assets.len(),
+        "pages_written": written_pages,
+        "pages_skipped_user": skipped_user_slugs,
+        "assets_written": written_assets,
+        "assets_skipped_user": skipped_user_assets,
     })))
 }
 
@@ -487,13 +547,7 @@ pub async fn handle_upload_doc_asset(
     safe_filename(&file_name)?;
 
     // Ensure the release exists so the asset has a valid parent row.
-    let release_id = {
-        let db = state.db.lock().unwrap();
-        match db.get_release_by_tag(&tag).map_err(db_err)? {
-            Some(id) => id,
-            None => db.ensure_release(&tag, "").map_err(db_err)?,
-        }
-    };
+    let release_id = ensure_release_with_seed(&state, &tag, "")?;
 
     let dir = assets_dir(&state, &tag);
     std::fs::create_dir_all(&dir).map_err(|e| {

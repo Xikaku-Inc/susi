@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
@@ -12,6 +12,22 @@ pub struct UserInfo {
     pub totp_enabled: bool,
     pub must_change_password: bool,
     pub created_at: String,
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceInfo {
+    pub fingerprint: String,
+    pub label: String,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+#[derive(Debug)]
+pub struct LoginTokenRow {
+    pub username: String,
+    pub device_fp: String,
+    pub device_label: String,
 }
 
 pub struct LicenseDb {
@@ -132,6 +148,7 @@ impl LicenseDb {
                 parent_slug TEXT,
                 ord INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'user',
                 FOREIGN KEY (release_id) REFERENCES releases(id) ON DELETE CASCADE,
                 UNIQUE(release_id, slug)
             );
@@ -143,10 +160,32 @@ impl LicenseDb {
                 release_id INTEGER NOT NULL,
                 file_name TEXT NOT NULL,
                 file_size INTEGER NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT 'user',
                 FOREIGN KEY (release_id) REFERENCES releases(id) ON DELETE CASCADE,
                 UNIQUE(release_id, file_name)
             );
-            CREATE INDEX IF NOT EXISTS idx_doc_assets_release ON doc_assets(release_id);",
+            CREATE INDEX IF NOT EXISTS idx_doc_assets_release ON doc_assets(release_id);
+
+            CREATE TABLE IF NOT EXISTS known_devices (
+                username TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                PRIMARY KEY (username, fingerprint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_known_devices_user ON known_devices(username);
+
+            CREATE TABLE IF NOT EXISTS login_tokens (
+                token_hash TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                device_fp TEXT NOT NULL,
+                device_label TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_login_tokens_expires ON login_tokens(expires_at);",
             )
             .map_err(|e| LicenseError::Other(format!("DB init: {}", e)))?;
         self.migrate()?;
@@ -173,6 +212,21 @@ impl LicenseDb {
         // Add role column to users (existing users default to admin)
         let _ = self.conn.execute_batch(
             "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin';"
+        );
+
+        // Tag doc pages / assets with their origin so a new release tag can
+        // inherit hand-authored pages from the prior release without dragging
+        // along the pipeline-regenerated ones. Existing rows default to 'user'
+        // — safe because it keeps them in the carry-over set; next pipeline run
+        // re-stamps its own pages as 'pipeline'.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE doc_pages ADD COLUMN origin TEXT NOT NULL DEFAULT 'user';
+             ALTER TABLE doc_assets ADD COLUMN origin TEXT NOT NULL DEFAULT 'user';"
+        );
+
+        // Add email column to users (nullable — admin sets it per user)
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE users ADD COLUMN email TEXT;"
         );
 
         // Migrate single-admin table to multi-user table
@@ -584,7 +638,7 @@ impl LicenseDb {
     pub fn list_users(&self) -> Result<Vec<UserInfo>, LicenseError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT username, role, totp_enabled, must_change_password, created_at FROM users ORDER BY created_at")
+            .prepare("SELECT username, role, totp_enabled, must_change_password, created_at, email FROM users ORDER BY created_at")
             .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
         let users = stmt
             .query_map([], |r| {
@@ -594,12 +648,189 @@ impl LicenseDb {
                     totp_enabled: r.get::<_, i32>(2)? != 0,
                     must_change_password: r.get::<_, i32>(3)? != 0,
                     created_at: r.get(4)?,
+                    email: r.get(5)?,
                 })
             })
             .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(users)
+    }
+
+    pub fn get_user_email(&self, username: &str) -> Result<Option<String>, LicenseError> {
+        self.conn
+            .query_row(
+                "SELECT email FROM users WHERE username = ?1",
+                params![username],
+                |r| r.get(0),
+            )
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))
+    }
+
+    pub fn set_user_email(&self, username: &str, email: Option<&str>) -> Result<(), LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE users SET email = ?1, updated_at = ?2 WHERE username = ?3",
+                params![email, now, username],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Known devices (trusted-device gate for login)
+    // -----------------------------------------------------------------------
+
+    pub fn is_device_known(&self, username: &str, fingerprint: &str) -> Result<bool, LicenseError> {
+        let count: i64 = self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM known_devices WHERE username = ?1 AND fingerprint = ?2",
+                params![username, fingerprint],
+                |r| r.get(0),
+            )
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
+        Ok(count > 0)
+    }
+
+    /// Insert a new trusted-device row, or refresh last_seen + label if it already exists.
+    pub fn register_device(
+        &self,
+        username: &str,
+        fingerprint: &str,
+        label: &str,
+    ) -> Result<(), LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO known_devices (username, fingerprint, label, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(username, fingerprint) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    label = CASE WHEN excluded.label != '' THEN excluded.label ELSE known_devices.label END",
+                params![username, fingerprint, label, now],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB upsert: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn touch_device(&self, username: &str, fingerprint: &str) -> Result<(), LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE known_devices SET last_seen = ?1 WHERE username = ?2 AND fingerprint = ?3",
+                params![now, username, fingerprint],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn list_devices(&self, username: &str) -> Result<Vec<DeviceInfo>, LicenseError> {
+        let mut stmt = self.conn
+            .prepare("SELECT fingerprint, label, first_seen, last_seen FROM known_devices WHERE username = ?1 ORDER BY last_seen DESC")
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map(params![username], |r| {
+                Ok(DeviceInfo {
+                    fingerprint: r.get(0)?,
+                    label: r.get(1)?,
+                    first_seen: r.get(2)?,
+                    last_seen: r.get(3)?,
+                })
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn revoke_device(&self, username: &str, fingerprint: &str) -> Result<bool, LicenseError> {
+        let n = self.conn
+            .execute(
+                "DELETE FROM known_devices WHERE username = ?1 AND fingerprint = ?2",
+                params![username, fingerprint],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB delete: {}", e)))?;
+        Ok(n > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Magic-link login tokens
+    // -----------------------------------------------------------------------
+
+    pub fn insert_login_token(
+        &self,
+        token_hash: &str,
+        username: &str,
+        device_fp: &str,
+        device_label: &str,
+        ttl_seconds: i64,
+    ) -> Result<(), LicenseError> {
+        let now = Utc::now();
+        let expires = now + Duration::seconds(ttl_seconds);
+        self.conn
+            .execute(
+                "INSERT INTO login_tokens (token_hash, username, device_fp, device_label, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![token_hash, username, device_fp, device_label, now.to_rfc3339(), expires.to_rfc3339()],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB insert: {}", e)))?;
+        Ok(())
+    }
+
+    /// Validate a magic-link token and mark it as consumed.
+    ///
+    /// Returns the (username, device_fp, device_label) on success. Returns
+    /// `Ok(None)` if the token is unknown, already used, or expired. The token
+    /// is single-use — once consumed, subsequent lookups return `None`.
+    pub fn consume_login_token(&self, token_hash: &str) -> Result<Option<LoginTokenRow>, LicenseError> {
+        let row: Option<(String, String, String, String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT username, device_fp, device_label, expires_at, used_at FROM login_tokens WHERE token_hash = ?1",
+                params![token_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
+
+        let Some((username, device_fp, device_label, expires_at, used_at)) = row else {
+            return Ok(None);
+        };
+        if used_at.is_some() {
+            return Ok(None);
+        }
+        let expires: DateTime<Utc> = DateTime::parse_from_rfc3339(&expires_at)
+            .map_err(|e| LicenseError::Other(format!("Bad token expires_at: {}", e)))?
+            .with_timezone(&Utc);
+        if Utc::now() > expires {
+            return Ok(None);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let n = self.conn
+            .execute(
+                "UPDATE login_tokens SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL",
+                params![now, token_hash],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
+        if n == 0 {
+            // Race — another consumer beat us to it.
+            return Ok(None);
+        }
+        Ok(Some(LoginTokenRow { username, device_fp, device_label }))
+    }
+
+    /// Delete expired or consumed tokens older than 24h. Housekeeping; safe to ignore errors.
+    pub fn purge_old_login_tokens(&self) -> Result<(), LicenseError> {
+        let cutoff = (Utc::now() - Duration::hours(24)).to_rfc3339();
+        self.conn
+            .execute(
+                "DELETE FROM login_tokens WHERE expires_at < ?1 OR (used_at IS NOT NULL AND used_at < ?1)",
+                params![cutoff],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB delete: {}", e)))?;
+        Ok(())
     }
 
     pub fn create_user(&self, username: &str, password_hash: &str, role: &str) -> Result<(), LicenseError> {
@@ -1240,7 +1471,9 @@ impl LicenseDb {
     // Documentation pages (per-release knowledge base)
     // -----------------------------------------------------------------------
 
-    /// Insert or replace a page within a release. Returns the page id.
+    /// Upsert a single page authored via the editor. Always marks the row as
+    /// `origin='user'` — even if a prior pipeline run had planted the slug.
+    /// Manual edits imply ownership: next pipeline run will skip it.
     pub fn upsert_doc_page(
         &self,
         release_id: i64,
@@ -1253,14 +1486,15 @@ impl LicenseDb {
         let now = Utc::now().to_rfc3339();
         self.conn
             .execute(
-                "INSERT INTO doc_pages (release_id, slug, title, body_md, parent_slug, ord, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO doc_pages (release_id, slug, title, body_md, parent_slug, ord, updated_at, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'user')
                  ON CONFLICT(release_id, slug) DO UPDATE SET
                    title = excluded.title,
                    body_md = excluded.body_md,
                    parent_slug = excluded.parent_slug,
                    ord = excluded.ord,
-                   updated_at = excluded.updated_at",
+                   updated_at = excluded.updated_at,
+                   origin = 'user'",
                 params![release_id, slug, title, body_md, parent_slug, ord, now],
             )
             .map_err(|e| LicenseError::Other(format!("DB upsert doc page: {}", e)))?;
@@ -1366,37 +1600,57 @@ impl LicenseDb {
         Ok(true)
     }
 
-    /// Replace all pages of a release in one transaction (used by bulk import).
-    /// Upsert a batch of pages within a single transaction. Pages not present
-    /// in the batch are left untouched, so hand-authored pages survive a
-    /// pipeline-driven bulk import.
+    /// Bulk-upsert pages originating from the auto-generated pipeline. Within
+    /// a single transaction: for each slug, if an existing row is
+    /// `origin='user'` (i.e. the user has taken ownership via the editor) the
+    /// page is left untouched and its slug is returned in the skipped list.
+    /// Everything else is inserted or refreshed as `origin='pipeline'`.
+    /// Returns (written_count, skipped_user_slugs).
     pub fn upsert_doc_pages(
         &mut self,
         release_id: i64,
         pages: &[(String, String, String, Option<String>, i64)],
-    ) -> Result<usize, LicenseError> {
+    ) -> Result<(usize, Vec<String>), LicenseError> {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.transaction()
             .map_err(|e| LicenseError::Other(format!("DB tx: {}", e)))?;
+        let mut written = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
         for (slug, title, body_md, parent_slug, ord) in pages {
+            let existing_origin: Option<String> = tx
+                .query_row(
+                    "SELECT origin FROM doc_pages WHERE release_id = ?1 AND slug = ?2",
+                    params![release_id, slug],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| LicenseError::Other(format!("DB origin probe {}: {}", slug, e)))?;
+            if existing_origin.as_deref() == Some("user") {
+                skipped.push(slug.clone());
+                continue;
+            }
             tx.execute(
-                "INSERT INTO doc_pages (release_id, slug, title, body_md, parent_slug, ord, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO doc_pages (release_id, slug, title, body_md, parent_slug, ord, updated_at, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pipeline')
                  ON CONFLICT(release_id, slug) DO UPDATE SET
                    title = excluded.title,
                    body_md = excluded.body_md,
                    parent_slug = excluded.parent_slug,
                    ord = excluded.ord,
-                   updated_at = excluded.updated_at",
+                   updated_at = excluded.updated_at,
+                   origin = 'pipeline'",
                 params![release_id, slug, title, body_md, parent_slug.as_deref(), ord, now],
             )
             .map_err(|e| LicenseError::Other(format!("DB upsert page {}: {}", slug, e)))?;
+            written += 1;
         }
         tx.commit()
             .map_err(|e| LicenseError::Other(format!("DB commit: {}", e)))?;
-        Ok(pages.len())
+        Ok((written, skipped))
     }
 
+    /// Upsert an asset uploaded via the editor — always marks origin='user',
+    /// including when overwriting a prior pipeline-planted row.
     pub fn upsert_doc_asset(
         &self,
         release_id: i64,
@@ -1405,12 +1659,47 @@ impl LicenseDb {
     ) -> Result<(), LicenseError> {
         self.conn
             .execute(
-                "INSERT INTO doc_assets (release_id, file_name, file_size) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(release_id, file_name) DO UPDATE SET file_size = excluded.file_size",
+                "INSERT INTO doc_assets (release_id, file_name, file_size, origin)
+                 VALUES (?1, ?2, ?3, 'user')
+                 ON CONFLICT(release_id, file_name) DO UPDATE SET
+                   file_size = excluded.file_size,
+                   origin = 'user'",
                 params![release_id, file_name, file_size as i64],
             )
             .map_err(|e| LicenseError::Other(format!("DB upsert asset: {}", e)))?;
         Ok(())
+    }
+
+    /// Pipeline-side asset upsert. Skips rows whose existing origin='user' so
+    /// hand-uploaded assets aren't clobbered. Returns true if written.
+    pub fn upsert_doc_asset_pipeline(
+        &self,
+        release_id: i64,
+        file_name: &str,
+        file_size: u64,
+    ) -> Result<bool, LicenseError> {
+        let existing: Option<String> = self.conn
+            .query_row(
+                "SELECT origin FROM doc_assets WHERE release_id = ?1 AND file_name = ?2",
+                params![release_id, file_name],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB asset origin probe: {}", e)))?;
+        if existing.as_deref() == Some("user") {
+            return Ok(false);
+        }
+        self.conn
+            .execute(
+                "INSERT INTO doc_assets (release_id, file_name, file_size, origin)
+                 VALUES (?1, ?2, ?3, 'pipeline')
+                 ON CONFLICT(release_id, file_name) DO UPDATE SET
+                   file_size = excluded.file_size,
+                   origin = 'pipeline'",
+                params![release_id, file_name, file_size as i64],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB upsert asset: {}", e)))?;
+        Ok(true)
     }
 
     pub fn list_doc_assets(
@@ -1475,10 +1764,103 @@ impl LicenseDb {
         tag: &str,
         name: &str,
     ) -> Result<i64, LicenseError> {
+        Ok(self.ensure_release_created(tag, name)?.0)
+    }
+
+    /// Same as `ensure_release` but also signals whether the row was created
+    /// (true) or already existed (false). Callers use the boolean to trigger
+    /// one-shot seeding (e.g. copying hand-authored doc pages forward).
+    pub fn ensure_release_created(
+        &self,
+        tag: &str,
+        name: &str,
+    ) -> Result<(i64, bool), LicenseError> {
         if let Some(id) = self.get_release_by_tag(tag)? {
-            return Ok(id);
+            return Ok((id, false));
         }
-        self.insert_release(tag, name, "", false, None)
+        let id = self.insert_release(tag, name, "", false, None)?;
+        Ok((id, true))
+    }
+
+    /// Return (id, tag) of the most recent release that has at least one
+    /// `origin='user'` doc page, excluding a given release id. Used to seed a
+    /// brand-new release tag with hand-authored content from the prior one.
+    pub fn latest_prior_release_with_user_docs(
+        &self,
+        exclude_id: i64,
+    ) -> Result<Option<(i64, String)>, LicenseError> {
+        self.conn
+            .query_row(
+                "SELECT r.id, r.tag FROM releases r
+                 WHERE r.id != ?1
+                   AND EXISTS (
+                       SELECT 1 FROM doc_pages p
+                       WHERE p.release_id = r.id AND p.origin = 'user'
+                   )
+                 ORDER BY r.id DESC LIMIT 1",
+                params![exclude_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB prior release: {}", e)))
+    }
+
+    /// Clone all `origin='user'` doc pages from `src_release_id` into
+    /// `dst_release_id`. Slugs that already exist in the destination are left
+    /// untouched (which shouldn't happen for a freshly created release, but
+    /// makes the helper idempotent). Returns the number of pages inserted.
+    pub fn copy_user_doc_pages(
+        &mut self,
+        src_release_id: i64,
+        dst_release_id: i64,
+    ) -> Result<usize, LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        let n = self.conn
+            .execute(
+                "INSERT OR IGNORE INTO doc_pages
+                   (release_id, slug, title, body_md, parent_slug, ord, updated_at, origin)
+                 SELECT ?1, slug, title, body_md, parent_slug, ord, ?2, 'user'
+                 FROM doc_pages
+                 WHERE release_id = ?3 AND origin = 'user'",
+                params![dst_release_id, now, src_release_id],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB copy user pages: {}", e)))?;
+        Ok(n)
+    }
+
+    /// Clone `origin='user'` asset rows between releases. Returns the list of
+    /// file names so the caller can copy the backing files on disk (the DB
+    /// only knows about metadata).
+    pub fn copy_user_doc_asset_rows(
+        &self,
+        src_release_id: i64,
+        dst_release_id: i64,
+    ) -> Result<Vec<String>, LicenseError> {
+        let mut stmt = self.conn
+            .prepare(
+                "SELECT file_name, file_size FROM doc_assets
+                 WHERE release_id = ?1 AND origin = 'user'",
+            )
+            .map_err(|e| LicenseError::Other(format!("DB prep: {}", e)))?;
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![src_release_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut copied = Vec::with_capacity(rows.len());
+        for (name, size) in rows {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO doc_assets (release_id, file_name, file_size, origin)
+                     VALUES (?1, ?2, ?3, 'user')",
+                    params![dst_release_id, name, size],
+                )
+                .map_err(|e| LicenseError::Other(format!("DB insert asset: {}", e)))?;
+            copied.push(name);
+        }
+        Ok(copied)
     }
 }
 
@@ -1494,6 +1876,68 @@ mod tests {
 
     fn lease_expires(hours: i64) -> Option<DateTime<Utc>> {
         Some(Utc::now() + Duration::hours(hours))
+    }
+
+    #[test]
+    fn test_user_email_roundtrip() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+        assert_eq!(db.get_user_email("admin").unwrap(), None);
+        db.set_user_email("admin", Some("klaus@lp-research.com")).unwrap();
+        assert_eq!(db.get_user_email("admin").unwrap().as_deref(), Some("klaus@lp-research.com"));
+        db.set_user_email("admin", None).unwrap();
+        assert_eq!(db.get_user_email("admin").unwrap(), None);
+    }
+
+    #[test]
+    fn test_known_device_lifecycle() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+        assert!(!db.is_device_known("admin", "fp1").unwrap());
+        db.register_device("admin", "fp1", "Chrome / Linux").unwrap();
+        assert!(db.is_device_known("admin", "fp1").unwrap());
+
+        // Upsert on repeat — last_seen should update but no duplicate row.
+        db.register_device("admin", "fp1", "").unwrap();
+        let devices = db.list_devices("admin").unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].label, "Chrome / Linux");
+
+        // Revoke
+        assert!(db.revoke_device("admin", "fp1").unwrap());
+        assert!(!db.is_device_known("admin", "fp1").unwrap());
+        assert!(!db.revoke_device("admin", "fp1").unwrap());
+    }
+
+    #[test]
+    fn test_login_token_consume_once() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+        db.insert_login_token("hash1", "admin", "fp1", "Chrome", 900).unwrap();
+
+        let row = db.consume_login_token("hash1").unwrap().expect("token valid");
+        assert_eq!(row.username, "admin");
+        assert_eq!(row.device_fp, "fp1");
+        assert_eq!(row.device_label, "Chrome");
+
+        // Second consume returns None (single-use).
+        assert!(db.consume_login_token("hash1").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_login_token_expired() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+        // Insert with -1 TTL → already expired.
+        db.insert_login_token("hash2", "admin", "fp1", "", -1).unwrap();
+        assert!(db.consume_login_token("hash2").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_login_token_unknown_returns_none() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+        assert!(db.consume_login_token("nonexistent").unwrap().is_none());
     }
 
     #[test]
@@ -1873,42 +2317,120 @@ mod tests {
     }
 
     #[test]
-    fn test_doc_pages_crud_and_bulk_replace() {
+    fn test_doc_pages_crud_and_bulk_upsert() {
         let mut db = test_db();
         let rid = db.insert_release("v1.0", "FusionHub 1.0", "", false, None).unwrap();
 
-        // Single upsert
+        // Editor upsert marks as user
         db.upsert_doc_page(rid, "imu", "IMU Source", "# IMU", Some("sources"), 1).unwrap();
         let page = db.get_doc_page(rid, "imu").unwrap().unwrap();
         assert_eq!(page.0, "IMU Source");
         assert_eq!(page.1, "# IMU");
         assert_eq!(page.2.as_deref(), Some("sources"));
 
-        // Update via upsert
         db.upsert_doc_page(rid, "imu", "IMU Source v2", "# v2", Some("sources"), 2).unwrap();
         let page = db.get_doc_page(rid, "imu").unwrap().unwrap();
         assert_eq!(page.0, "IMU Source v2");
         assert_eq!(page.3, 2);
 
-        // List
         db.upsert_doc_page(rid, "sources", "Sources", "Index", None, 0).unwrap();
-        let pages = db.list_doc_pages(rid).unwrap();
-        assert_eq!(pages.len(), 2);
+        assert_eq!(db.list_doc_pages(rid).unwrap().len(), 2);
 
-        // Bulk replace — should wipe prior pages
+        // Bulk (pipeline) upsert: skips user-owned `imu`, writes new slugs as pipeline.
         let new_pages = vec![
+            ("imu".to_string(), "Pipeline IMU".to_string(), "pipe".to_string(), Some("sources".to_string()), 5),
             ("a".to_string(), "A".to_string(), "body a".to_string(), None, 0),
             ("b".to_string(), "B".to_string(), "body b".to_string(), Some("a".to_string()), 1),
         ];
-        let n = db.replace_doc_pages(rid, &new_pages).unwrap();
-        assert_eq!(n, 2);
-        let pages = db.list_doc_pages(rid).unwrap();
-        assert_eq!(pages.len(), 2);
-        assert!(db.get_doc_page(rid, "imu").unwrap().is_none());
+        let (written, skipped) = db.upsert_doc_pages(rid, &new_pages).unwrap();
+        assert_eq!(written, 2);
+        assert_eq!(skipped, vec!["imu".to_string()]);
+        // imu is still the user's edit, untouched.
+        let imu = db.get_doc_page(rid, "imu").unwrap().unwrap();
+        assert_eq!(imu.0, "IMU Source v2");
+        assert_eq!(db.list_doc_pages(rid).unwrap().len(), 4);
 
         // Cascade delete with release
         assert!(db.delete_release("v1.0").unwrap());
         assert!(db.get_doc_page(rid, "a").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_doc_page_origin_tracking() {
+        let mut db = test_db();
+        let rid = db.insert_release("v1.0", "", "", false, None).unwrap();
+
+        // Pipeline bulk plants a page.
+        db.upsert_doc_pages(rid, &[(
+            "imu".into(), "IMU".into(), "pipe body".into(), None, 0,
+        )]).unwrap();
+        let origin: String = db.conn.query_row(
+            "SELECT origin FROM doc_pages WHERE release_id = ?1 AND slug = ?2",
+            params![rid, "imu"], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(origin, "pipeline");
+
+        // Editor edit on the same slug promotes it to user.
+        db.upsert_doc_page(rid, "imu", "IMU (edited)", "user body", None, 0).unwrap();
+        let origin: String = db.conn.query_row(
+            "SELECT origin FROM doc_pages WHERE release_id = ?1 AND slug = ?2",
+            params![rid, "imu"], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(origin, "user");
+
+        // Pipeline re-run now skips the user page.
+        let (written, skipped) = db.upsert_doc_pages(rid, &[(
+            "imu".into(), "IMU".into(), "pipe again".into(), None, 0,
+        )]).unwrap();
+        assert_eq!(written, 0);
+        assert_eq!(skipped, vec!["imu".to_string()]);
+        let body = db.get_doc_page(rid, "imu").unwrap().unwrap().1;
+        assert_eq!(body, "user body");
+    }
+
+    #[test]
+    fn test_copy_user_docs_to_new_release() {
+        let mut db = test_db();
+        let old = db.insert_release("v1.0", "", "", false, None).unwrap();
+
+        // Mixed origins under the old release.
+        db.upsert_doc_pages(old, &[
+            ("imu".into(), "IMU".into(), "pipe".into(), Some("sources".into()), 0),
+            ("sources".into(), "Sources".into(), "auto".into(), None, 10),
+        ]).unwrap();
+        db.upsert_doc_page(old, "general", "General", "# General\nHand-authored", None, 0).unwrap();
+        db.upsert_doc_page(old, "getting-started", "Getting Started", "guide", Some("general"), 1).unwrap();
+
+        // Brand-new release tag.
+        let (new_id, created) = db.ensure_release_created("v1.1", "FusionHub 1.1").unwrap();
+        assert!(created);
+
+        let prior = db.latest_prior_release_with_user_docs(new_id).unwrap();
+        assert_eq!(prior.as_ref().map(|p| p.1.as_str()), Some("v1.0"));
+        let (src_id, _src_tag) = prior.unwrap();
+
+        let n = db.copy_user_doc_pages(src_id, new_id).unwrap();
+        assert_eq!(n, 2); // general + getting-started
+
+        let pages: Vec<String> = db.list_doc_pages(new_id).unwrap()
+            .into_iter().map(|p| p.0).collect();
+        assert!(pages.contains(&"general".to_string()));
+        assert!(pages.contains(&"getting-started".to_string()));
+        assert!(!pages.contains(&"imu".to_string()));
+        assert!(!pages.contains(&"sources".to_string()));
+
+        // All carried pages retain origin='user'.
+        for slug in &pages {
+            let o: String = db.conn.query_row(
+                "SELECT origin FROM doc_pages WHERE release_id = ?1 AND slug = ?2",
+                params![new_id, slug], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(o, "user", "slug {} should be user", slug);
+        }
+
+        // Re-ensuring the existing tag reports not-newly-created.
+        let (_, created) = db.ensure_release_created("v1.1", "").unwrap();
+        assert!(!created);
     }
 
     #[test]
