@@ -1,12 +1,16 @@
 mod docs;
+mod email;
 
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result};
 use argon2::{self, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::SaltString;
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -15,13 +19,16 @@ use axum::{
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::Parser;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use rand::Rng;
+use rand::{Rng, RngCore};
+use sha2::{Digest, Sha256};
 use susi_core::crypto::{private_key_from_pem, sign_license};
 use susi_core::db::LicenseDb;
 use susi_core::{License, DEFAULT_LEASE_DURATION_HOURS, DEFAULT_LEASE_GRACE_HOURS};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use totp_rs::{Algorithm, Secret, TOTP};
+
+use crate::email::{EmailConfig, EmailService};
 #[derive(Parser)]
 #[command(name = "susi-server", about = "Susi License Server")]
 struct Cli {
@@ -40,6 +47,42 @@ struct Cli {
     /// Directory for persistent data (keys, database, release assets)
     #[arg(long, default_value = "/data")]
     data_dir: String,
+
+    // -------- SMTP / magic-link settings --------
+    //
+    // If `smtp_host` is empty, magic-link verification is disabled entirely
+    // and new devices are accepted without email confirmation (bootstrap mode).
+    // Enabling requires `smtp_host`, `smtp_user`, `smtp_password`, and
+    // `magic_link_base_url` to all be set.
+
+    /// SMTP relay host (e.g. smtp.gmail.com). Empty = disable magic-link.
+    #[arg(long, env = "SUSI_SMTP_HOST", default_value = "")]
+    smtp_host: String,
+
+    /// SMTP relay port.
+    #[arg(long, env = "SUSI_SMTP_PORT", default_value_t = 587)]
+    smtp_port: u16,
+
+    /// SMTP auth username (e.g. klaus@lp-research.com).
+    #[arg(long, env = "SUSI_SMTP_USER", default_value = "")]
+    smtp_user: String,
+
+    /// SMTP auth password (Google App Password). Prefer setting via env.
+    #[arg(long, env = "SUSI_SMTP_PASSWORD", default_value = "")]
+    smtp_password: String,
+
+    /// Display name used in the From header.
+    #[arg(long, env = "SUSI_SMTP_FROM_NAME", default_value = "Susi")]
+    smtp_from_name: String,
+
+    /// Sender address for outbound mail (typically an alias of `smtp_user`).
+    #[arg(long, env = "SUSI_SMTP_FROM_ADDR", default_value = "")]
+    smtp_from_addr: String,
+
+    /// Public base URL where the dashboard is reachable. Used to build magic
+    /// links in outbound email. Must include scheme, e.g. `https://susi.lp-research.com`.
+    #[arg(long, env = "SUSI_MAGIC_LINK_BASE_URL", default_value = "")]
+    magic_link_base_url: String,
 }
 
 struct AppState {
@@ -47,6 +90,69 @@ struct AppState {
     private_key: RsaPrivateKey,
     jwt_secret: [u8; 32],
     data_dir: String,
+    login_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    email: Option<EmailService>,
+    magic_link_base_url: String,
+}
+
+// Magic-link TTL: long enough for a user to switch to their mail client and
+// back, short enough that a leaked link is useless a few minutes later.
+const MAGIC_LINK_TTL_MINUTES: i64 = 15;
+
+// Sliding-window rate limit on /api/v1/auth/login — throttles brute force
+// against weak passwords and caps credential-stuffing throughput.
+const LOGIN_WINDOW: StdDuration = StdDuration::from_secs(60);
+const LOGIN_MAX_ATTEMPTS: usize = 10;
+
+fn check_login_rate_limit(
+    state: &AppState,
+    ip: IpAddr,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let mut map = state.login_attempts.lock().unwrap();
+    let now = Instant::now();
+    let entry = map.entry(ip).or_default();
+    entry.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+    if entry.len() >= LOGIN_MAX_ATTEMPTS {
+        log::warn!("Login rate limit exceeded for {}", ip);
+        return Err(error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many login attempts, try again later",
+        ));
+    }
+    entry.push(now);
+    // Opportunistic cleanup so the map does not grow unbounded.
+    if map.len() > 4096 {
+        map.retain(|_, v| {
+            v.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+            !v.is_empty()
+        });
+    }
+    Ok(())
+}
+
+// Extract the originating client IP. When the Rust server is fronted by a
+// trusted reverse proxy (nginx) the TCP peer is 127.0.0.1; in that case we
+// consult X-Forwarded-For / X-Real-IP. For requests that arrive directly we
+// use the TCP peer and ignore the forwarded headers (they would be attacker
+// controlled).
+fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    let peer_ip = peer.ip();
+    let from_loopback = peer_ip.is_loopback();
+    if from_loopback {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first) = xff.split(',').next() {
+                if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                    return ip;
+                }
+            }
+        }
+        if let Some(xri) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            if let Ok(ip) = xri.trim().parse::<IpAddr>() {
+                return ip;
+            }
+        }
+    }
+    peer_ip
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -277,6 +383,16 @@ fn require_admin(
     if role != "admin" {
         return Err(error_response(StatusCode::FORBIDDEN, "Admin access required"));
     }
+    // Hard-enforce 2FA for admins. They can still hit auth/status and the
+    // 2FA-setup endpoints (those don't call require_admin), so they have a
+    // path to enroll. Everything else is gated.
+    let totp_enabled = db.user_totp_enabled(username).unwrap_or(false);
+    if !totp_enabled {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Admin accounts must enable two-factor authentication before performing this action",
+        ));
+    }
     Ok(())
 }
 
@@ -308,23 +424,142 @@ struct LoginRequest {
     username: String,
     password: String,
     totp_code: Option<String>,
+    /// Client-generated stable identifier for this browser. Stored in
+    /// localStorage. When absent, every login counts as a new device.
+    #[serde(default)]
+    device_fp: String,
+    /// Optional human-readable label ("Chrome / Linux") shown in the devices
+    /// list and in the new-device email.
+    #[serde(default)]
+    device_label: String,
+}
+
+fn hash_token(token: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    hex::encode(h.finalize())
+}
+
+fn random_magic_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn mask_email(addr: &str) -> String {
+    // "klaus@lp-research.com" -> "k***@lp-research.com" — shown to the user so
+    // they can confirm they're checking the right inbox without leaking the
+    // full address to someone who's only guessed a username.
+    if let Some((local, domain)) = addr.split_once('@') {
+        let first = local.chars().next().unwrap_or('*');
+        format!("{}***@{}", first, domain)
+    } else {
+        "***".into()
+    }
+}
+
+fn magic_link_disabled(state: &AppState) -> bool {
+    state.email.is_none() || state.magic_link_base_url.is_empty()
 }
 
 async fn handle_login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let db = state.db.lock().unwrap();
-    let hash = db
-        .get_user_password_hash(&req.username)
-        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"))?;
+    let ip = client_ip(peer, &headers);
+    check_login_rate_limit(&state, ip)?;
 
-    if !verify_password(&req.password, &hash)? {
-        return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"));
+    // Phase 1 — password check.
+    let (must_change, role, totp_enabled, user_email, device_known) = {
+        let db = state.db.lock().unwrap();
+        let hash = db
+            .get_user_password_hash(&req.username)
+            .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"))?;
+        if !verify_password(&req.password, &hash)? {
+            return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"));
+        }
+        let must_change = db.user_must_change_password(&req.username).unwrap_or(false);
+        let role = db.get_user_role(&req.username).unwrap_or_else(|_| "user".into());
+        let totp_enabled = db.user_totp_enabled(&req.username).unwrap_or(false);
+        let email = db.get_user_email(&req.username).ok().flatten();
+        let device_known = !req.device_fp.is_empty()
+            && db.is_device_known(&req.username, &req.device_fp).unwrap_or(false);
+        (must_change, role, totp_enabled, email, device_known)
+    };
+
+    // Phase 2 — decide what the new-device gate demands.
+    //
+    //   known device                → password only, issue JWT
+    //   new device + email + SMTP   → require magic link (and TOTP if enabled)
+    //   new device + no email/SMTP  → bootstrap: just issue JWT, but log warning
+    if !device_known {
+        let magic_disabled = magic_link_disabled(&state);
+        if let (Some(email_addr), false) = (user_email.as_ref(), magic_disabled) {
+            // Issue magic link. Do NOT issue JWT yet — the user has to click
+            // the link in their inbox, which proves email control.
+            let raw_token = random_magic_token();
+            let token_hash = hash_token(&raw_token);
+            {
+                let db = state.db.lock().unwrap();
+                let _ = db.purge_old_login_tokens();
+                db.insert_login_token(
+                    &token_hash,
+                    &req.username,
+                    &req.device_fp,
+                    &req.device_label,
+                    MAGIC_LINK_TTL_MINUTES * 60,
+                )
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+            }
+
+            let link = format!(
+                "{}/#/magic/{}",
+                state.magic_link_base_url.trim_end_matches('/'),
+                raw_token
+            );
+
+            // Fire off the email. We log but don't leak failures back to the
+            // caller — telling an unauthenticated client that an address is
+            // unreachable would be a small info leak.
+            let email_service = state.email.clone().expect("checked above");
+            let to = email_addr.clone();
+            let uname = req.username.clone();
+            let device_label = if req.device_label.is_empty() {
+                "(unknown device)".to_string()
+            } else {
+                req.device_label.clone()
+            };
+            let ip_str = ip.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = email_service
+                    .send_magic_link(&to, &uname, &link, MAGIC_LINK_TTL_MINUTES, &device_label, &ip_str)
+                    .await
+                {
+                    log::error!("Failed to send magic-link email to {}: {:#}", to, e);
+                }
+            });
+
+            return Ok(Json(serde_json::json!({
+                "magic_link_sent": true,
+                "email_hint": mask_email(email_addr),
+                "ttl_minutes": MAGIC_LINK_TTL_MINUTES,
+                "totp_required_after_magic": totp_enabled,
+            })));
+        }
+
+        // Bootstrap path — no email on file or SMTP disabled.
+        log::warn!(
+            "New-device login for user '{}' accepted without email verification (email set: {}, smtp enabled: {})",
+            req.username,
+            user_email.is_some(),
+            !magic_link_disabled(&state),
+        );
     }
 
-    let totp_enabled = db.user_totp_enabled(&req.username).unwrap_or(false);
-    if totp_enabled {
+    // Phase 3 — TOTP. Only enforced on new devices when enabled.
+    if totp_enabled && !device_known {
         match &req.totp_code {
             None => {
                 return Ok(Json(serde_json::json!({
@@ -333,26 +568,20 @@ async fn handle_login(
                 })));
             }
             Some(code) => {
-                let secret_b32 = db
-                    .get_user_totp_secret(&req.username)
-                    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
-                    .ok_or_else(|| error_response(StatusCode::INTERNAL_SERVER_ERROR, "TOTP secret missing"))?;
-                let secret_bytes = Secret::Encoded(secret_b32)
-                    .to_bytes()
-                    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-                let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes,
-                    Some("Susi License Server".into()), req.username.clone().into())
-                    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-                if !totp.check_current(code).unwrap_or(false) {
-                    return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid TOTP code"));
-                }
+                verify_totp_or_backup(&state, &req.username, code)?;
             }
         }
     }
 
-    let must_change = db.user_must_change_password(&req.username).unwrap_or(false);
-    let role = db.get_user_role(&req.username).unwrap_or_else(|_| "user".into());
-    drop(db);
+    // Phase 4 — register this device as trusted (if fp provided) and issue JWT.
+    if !req.device_fp.is_empty() {
+        let db = state.db.lock().unwrap();
+        if device_known {
+            let _ = db.touch_device(&req.username, &req.device_fp);
+        } else {
+            let _ = db.register_device(&req.username, &req.device_fp, &req.device_label);
+        }
+    }
 
     let token = create_jwt(&state.jwt_secret, &req.username)?;
     Ok(Json(serde_json::json!({
@@ -360,6 +589,199 @@ async fn handle_login(
         "must_change_password": must_change,
         "totp_enabled": totp_enabled,
         "role": role
+    })))
+}
+
+// Check a 6-digit TOTP code only (used by 2FA enable/disable paths where
+// backup codes are not accepted).
+fn verify_totp_code(
+    state: &AppState,
+    username: &str,
+    code: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let db = state.db.lock().unwrap();
+    let secret_b32 = db
+        .get_user_totp_secret(username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::INTERNAL_SERVER_ERROR, "TOTP secret missing"))?;
+    let secret_bytes = Secret::Encoded(secret_b32)
+        .to_bytes()
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let totp = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret_bytes,
+        Some("Susi License Server".into()),
+        username.to_string(),
+    )
+    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !totp.check_current(code).unwrap_or(false) {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid TOTP code"));
+    }
+    Ok(())
+}
+
+// Verify either a 6-digit TOTP or a backup code. Backup codes are consumed
+// on success. Used by login + magic-exchange, where the user may have lost
+// their authenticator.
+fn verify_totp_or_backup(
+    state: &AppState,
+    username: &str,
+    code: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let trimmed = code.trim();
+    // TOTP is always exactly 6 digits. Anything else is treated as a backup code.
+    if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return verify_totp_code(state, username, trimmed);
+    }
+    // Backup-code path — strip separators users might type in (space or dash).
+    let normalized: String = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_uppercase();
+    if normalized.is_empty() {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid 2FA code"));
+    }
+    let candidates = {
+        let db = state.db.lock().unwrap();
+        db.list_unused_backup_codes(username)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+    for (id, hash) in candidates {
+        let Ok(parsed) = PasswordHash::new(&hash) else { continue };
+        if Argon2::default()
+            .verify_password(normalized.as_bytes(), &parsed)
+            .is_ok()
+        {
+            let db = state.db.lock().unwrap();
+            let consumed = db
+                .consume_backup_code(id)
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+            if consumed {
+                return Ok(());
+            } else {
+                // Race: someone else just used this code. Treat as failure;
+                // the user can try another backup code.
+                break;
+            }
+        }
+    }
+    Err(error_response(StatusCode::UNAUTHORIZED, "Invalid 2FA code"))
+}
+
+// Generate N fresh backup codes. Each is 10 characters from an unambiguous
+// alphabet (no 0/O/1/I/L), displayed to the user in "XXXXX-XXXXX" form.
+// ~50 bits of entropy per code — plenty given login rate limiting.
+fn generate_backup_codes(n: usize) -> Vec<String> {
+    const ALPHA: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::thread_rng();
+    (0..n)
+        .map(|_| {
+            (0..10)
+                .map(|_| ALPHA[rng.gen_range(0..ALPHA.len())] as char)
+                .collect::<String>()
+        })
+        .collect()
+}
+
+fn format_backup_code_for_display(code: &str) -> String {
+    // Insert a dash in the middle so it's easier to read/type.
+    if code.len() == 10 {
+        format!("{}-{}", &code[..5], &code[5..])
+    } else {
+        code.to_string()
+    }
+}
+
+fn hash_backup_code(code: &str) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let salt = SaltString::generate(&mut rand::thread_rng());
+    Argon2::default()
+        .hash_password(code.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+}
+
+// Exchange a magic-link token for a JWT. Also registers the device as trusted.
+#[derive(Deserialize)]
+struct MagicExchangeRequest {
+    token: String,
+    #[serde(default)]
+    totp_code: Option<String>,
+}
+
+async fn handle_magic_exchange(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<MagicExchangeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let ip = client_ip(peer, &headers);
+    check_login_rate_limit(&state, ip)?;
+
+    let token_hash = hash_token(&req.token);
+
+    // Peek first so we can surface a TOTP prompt without consuming the token.
+    // Consuming on the first call would leave a TOTP-enabled user stuck if
+    // they clicked the link and then had to fetch their auth-app code.
+    let row = {
+        let db = state.db.lock().unwrap();
+        db.peek_login_token(&token_hash)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+    let row = row.ok_or_else(|| {
+        error_response(StatusCode::UNAUTHORIZED, "Link is invalid, already used, or expired")
+    })?;
+
+    let (must_change, role, totp_enabled) = {
+        let db = state.db.lock().unwrap();
+        (
+            db.user_must_change_password(&row.username).unwrap_or(false),
+            db.get_user_role(&row.username).unwrap_or_else(|_| "user".into()),
+            db.user_totp_enabled(&row.username).unwrap_or(false),
+        )
+    };
+    if totp_enabled {
+        let Some(code) = req.totp_code.as_deref() else {
+            return Ok(Json(serde_json::json!({
+                "error": "TOTP code required",
+                "totp_required": true,
+                "token": req.token,
+            })));
+        };
+        verify_totp_or_backup(&state, &row.username, code)?;
+    }
+
+    // All gates passed — NOW consume the token (atomic flip; guards against
+    // a concurrent second click). Anything below this point must succeed,
+    // since after consumption a retry would fail.
+    let consumed = {
+        let db = state.db.lock().unwrap();
+        db.consume_login_token(&token_hash)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+    if consumed.is_none() {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "Link is invalid, already used, or expired",
+        ));
+    }
+
+    // Trust this device going forward.
+    if !row.device_fp.is_empty() {
+        let db = state.db.lock().unwrap();
+        let _ = db.register_device(&row.username, &row.device_fp, &row.device_label);
+    }
+
+    let jwt = create_jwt(&state.jwt_secret, &row.username)?;
+    Ok(Json(serde_json::json!({
+        "token": jwt,
+        "must_change_password": must_change,
+        "totp_enabled": totp_enabled,
+        "role": role,
+        "username": row.username,
     })))
 }
 
@@ -372,11 +794,18 @@ async fn handle_auth_status(
     let must_change = db.user_must_change_password(&claims.sub).unwrap_or(false);
     let totp_enabled = db.user_totp_enabled(&claims.sub).unwrap_or(false);
     let role = db.get_user_role(&claims.sub).unwrap_or_else(|_| "user".into());
+    let email = db.get_user_email(&claims.sub).ok().flatten();
+    let backup_codes_remaining = db.count_unused_backup_codes(&claims.sub).unwrap_or(0);
+    let must_enable_totp = role == "admin" && !totp_enabled;
     Ok(Json(serde_json::json!({
         "must_change_password": must_change,
         "totp_enabled": totp_enabled,
         "username": claims.sub,
-        "role": role
+        "role": role,
+        "email": email,
+        "magic_link_enabled": !magic_link_disabled(&state),
+        "must_enable_totp": must_enable_totp,
+        "backup_codes_remaining": backup_codes_remaining,
     })))
 }
 
@@ -475,8 +904,28 @@ async fn handle_verify_2fa(
 
     db.enable_user_totp(&claims.sub)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    drop(db);
 
-    Ok(Json(serde_json::json!({ "status": "OK" })))
+    // Generate fresh backup codes atomically with enable — the user should
+    // see them once, right now, and have no chance of losing access later
+    // because they never saved them.
+    let raw_codes = generate_backup_codes(8);
+    let mut hashes = Vec::with_capacity(raw_codes.len());
+    for c in &raw_codes {
+        hashes.push(hash_backup_code(c)?);
+    }
+    {
+        let db = state.db.lock().unwrap();
+        db.replace_backup_codes(&claims.sub, &hashes)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    }
+
+    let display_codes: Vec<String> =
+        raw_codes.iter().map(|c| format_backup_code_for_display(c)).collect();
+    Ok(Json(serde_json::json!({
+        "status": "OK",
+        "backup_codes": display_codes,
+    })))
 }
 
 async fn handle_disable_2fa(
@@ -506,8 +955,56 @@ async fn handle_disable_2fa(
 
     db.disable_user_totp(&claims.sub)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    // Wipe backup codes too — they were bound to the (now gone) 2FA factor.
+    let _ = db.clear_backup_codes(&claims.sub);
 
     Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+// Regenerate backup codes. Password-gated so a stolen session alone can't
+// rotate them out from under the real user.
+#[derive(Deserialize)]
+struct RegenerateBackupCodesRequest {
+    current_password: String,
+}
+
+async fn handle_regenerate_backup_codes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<RegenerateBackupCodesRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+
+    {
+        let db = state.db.lock().unwrap();
+        let hash = db
+            .get_user_password_hash(&claims.sub)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        if !verify_password(&req.current_password, &hash)? {
+            return Err(error_response(StatusCode::UNAUTHORIZED, "Password is incorrect"));
+        }
+        if !db.user_totp_enabled(&claims.sub).unwrap_or(false) {
+            return Err(error_response(StatusCode::BAD_REQUEST, "Enable 2FA first"));
+        }
+    }
+
+    let raw_codes = generate_backup_codes(8);
+    let mut hashes = Vec::with_capacity(raw_codes.len());
+    for c in &raw_codes {
+        hashes.push(hash_backup_code(c)?);
+    }
+    {
+        let db = state.db.lock().unwrap();
+        db.replace_backup_codes(&claims.sub, &hashes)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    }
+
+    let display_codes: Vec<String> =
+        raw_codes.iter().map(|c| format_backup_code_for_display(c)).collect();
+    Ok(Json(serde_json::json!({
+        "status": "OK",
+        "backup_codes": display_codes,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1583,97 @@ async fn handle_reset_user_password(
 }
 
 // ---------------------------------------------------------------------------
+// Email + trusted devices
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SetEmailRequest {
+    /// Pass `null` or empty string to clear.
+    #[serde(default)]
+    email: Option<String>,
+}
+
+fn normalize_email(raw: &str) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // Very light validation — the real check is "does the magic link arrive".
+    // We just catch obvious typos so we don't store garbage.
+    if !trimmed.contains('@') || trimmed.contains(' ') || trimmed.len() > 254 {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Invalid email address"));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+async fn handle_set_my_email(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<SetEmailRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let normalized = match req.email.as_deref() {
+        Some(s) => normalize_email(s)?,
+        None => None,
+    };
+    let db = state.db.lock().unwrap();
+    db.set_user_email(&claims.sub, normalized.as_deref())
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(serde_json::json!({ "status": "OK", "email": normalized })))
+}
+
+async fn handle_set_user_email(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+    Json(req): Json<SetEmailRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    require_password_changed(&state, &claims.sub)?;
+    require_admin(&state, &claims.sub)?;
+
+    let normalized = match req.email.as_deref() {
+        Some(s) => normalize_email(s)?,
+        None => None,
+    };
+    let db = state.db.lock().unwrap();
+    if !db.user_exists(&username).unwrap_or(false) {
+        return Err(error_response(StatusCode::NOT_FOUND, "User not found"));
+    }
+    db.set_user_email(&username, normalized.as_deref())
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(serde_json::json!({ "status": "OK", "email": normalized })))
+}
+
+async fn handle_list_my_devices(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<susi_core::db::DeviceInfo>>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let db = state.db.lock().unwrap();
+    let devices = db
+        .list_devices(&claims.sub)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(devices))
+}
+
+async fn handle_revoke_my_device(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(fingerprint): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let db = state.db.lock().unwrap();
+    let removed = db
+        .revoke_device(&claims.sub, &fingerprint)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !removed {
+        return Err(error_response(StatusCode::NOT_FOUND, "Device not found"));
+    }
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+// ---------------------------------------------------------------------------
 // Release endpoints
 // ---------------------------------------------------------------------------
 
@@ -1168,13 +1756,25 @@ async fn handle_download_asset(
         return Err(error_response(StatusCode::UNAUTHORIZED, "Authentication required"));
     }
 
-    let file_path = releases_dir(&state).join(&tag).join(&asset_name);
-    if !file_path.exists() {
-        return Err(error_response(StatusCode::NOT_FOUND, "Asset not found"));
+    // Reject traversal / empty / nul before building the path, and confirm the
+    // canonicalized result stays inside the releases directory. Defense in depth
+    // against a future regression in the name checks.
+    let safe_tag = docs::safe_tag(&tag)?;
+    let safe_asset = docs::safe_filename(&asset_name)?;
+
+    let base = releases_dir(&state).canonicalize()
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Releases directory unavailable"))?;
+    let file_path = base.join(safe_tag).join(safe_asset);
+    let canonical = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Err(error_response(StatusCode::NOT_FOUND, "Asset not found")),
+    };
+    if !canonical.starts_with(&base) {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Invalid asset path"));
     }
 
-    let bytes = std::fs::read(&file_path)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Read error: {}", e)))?;
+    let bytes = std::fs::read(&canonical)
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Read error"))?;
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
@@ -1891,11 +2491,51 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&docs_dir)
         .with_context(|| format!("Failed to create docs dir at {}", docs_dir.display()))?;
 
+    let email_service = if cli.smtp_host.is_empty() {
+        log::info!("SMTP not configured (--smtp-host empty) — magic-link login disabled");
+        None
+    } else if cli.smtp_user.is_empty() || cli.smtp_password.is_empty() || cli.smtp_from_addr.is_empty() {
+        log::warn!(
+            "--smtp-host set but --smtp-user / --smtp-password / --smtp-from-addr not all set; magic-link disabled"
+        );
+        None
+    } else {
+        let cfg = EmailConfig::from_parts(
+            cli.smtp_host.clone(),
+            cli.smtp_port,
+            cli.smtp_user.clone(),
+            cli.smtp_password.clone(),
+            &cli.smtp_from_name,
+            &cli.smtp_from_addr,
+        )
+        .context("Invalid SMTP configuration")?;
+        match EmailService::new(cfg) {
+            Ok(svc) => {
+                log::info!(
+                    "SMTP ready: relay {}:{}, from {} <{}>",
+                    cli.smtp_host, cli.smtp_port, cli.smtp_from_name, cli.smtp_from_addr
+                );
+                Some(svc)
+            }
+            Err(e) => {
+                log::error!("Failed to init SMTP transport: {:#} — magic-link disabled", e);
+                None
+            }
+        }
+    };
+
+    if email_service.is_some() && cli.magic_link_base_url.is_empty() {
+        log::warn!("SMTP is configured but --magic-link-base-url is empty; magic-link login will NOT be enforced");
+    }
+
     let state = Arc::new(AppState {
         db: Mutex::new(db),
         private_key,
         jwt_secret,
         data_dir: cli.data_dir,
+        login_attempts: Mutex::new(HashMap::new()),
+        email: email_service,
+        magic_link_base_url: cli.magic_link_base_url.clone(),
     });
 
     let app = Router::new()
@@ -1911,15 +2551,21 @@ async fn main() -> Result<()> {
         .route("/api/v1/features", get(handle_features))
         // Auth endpoints
         .route("/api/v1/auth/login", post(handle_login))
+        .route("/api/v1/auth/magic", post(handle_magic_exchange))
         .route("/api/v1/auth/status", get(handle_auth_status))
         .route("/api/v1/auth/change-password", post(handle_change_password))
         .route("/api/v1/auth/setup-2fa", post(handle_setup_2fa))
         .route("/api/v1/auth/verify-2fa", post(handle_verify_2fa))
         .route("/api/v1/auth/disable-2fa", post(handle_disable_2fa))
+        .route("/api/v1/auth/regenerate-backup-codes", post(handle_regenerate_backup_codes))
+        .route("/api/v1/auth/me/email", axum::routing::put(handle_set_my_email))
+        .route("/api/v1/auth/me/devices", get(handle_list_my_devices))
+        .route("/api/v1/auth/me/devices/{fingerprint}", axum::routing::delete(handle_revoke_my_device))
         // User management
         .route("/api/v1/auth/users", get(handle_list_users))
         .route("/api/v1/auth/users", post(handle_create_user))
         .route("/api/v1/auth/users/{username}", axum::routing::delete(handle_delete_user))
+        .route("/api/v1/auth/users/{username}/email", axum::routing::put(handle_set_user_email))
         .route("/api/v1/auth/users/{username}/rename", post(handle_rename_user))
         .route("/api/v1/auth/users/{username}/reset-password", post(handle_reset_user_password))
         // Public client endpoints
@@ -1991,7 +2637,7 @@ async fn main() -> Result<()> {
 
     log::info!("License server listening on {}", cli.listen);
     log::info!("Dashboard: http://{}", cli.listen);
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("Server error")?;
 
