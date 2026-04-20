@@ -384,6 +384,23 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
     margin: 8px 0;
 }
 
+.backup-codes-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 6px;
+    margin: 8px 0;
+}
+.backup-code {
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 13px;
+    letter-spacing: 1px;
+    background: var(--bg);
+    padding: 8px 10px;
+    border-radius: var(--radius);
+    text-align: center;
+    user-select: all;
+}
+
 /* Header buttons */
 .header-actions { display: flex; gap: 8px; align-items: center; }
 .header-left { display: flex; align-items: center; gap: 24px; }
@@ -791,10 +808,40 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
             <input type="password" id="loginPassword" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')submitLogin()">
         </div>
         <div id="loginTotpRow" class="form-row" style="display:none;">
-            <label>2FA Code</label>
-            <input type="text" id="loginTotp" placeholder="6-digit code" maxlength="6" autocomplete="one-time-code" onkeydown="if(event.key==='Enter')submitLogin()">
+            <label>2FA Code <span style="font-weight:400;color:var(--text2);font-size:11px;">(or a backup code)</span></label>
+            <input type="text" id="loginTotp" placeholder="6-digit code, or XXXXX-XXXXX" maxlength="20" autocomplete="one-time-code" onkeydown="if(event.key==='Enter')submitLogin()">
         </div>
         <button onclick="submitLogin()">Sign In</button>
+    </div>
+</div>
+
+<!-- Magic-link "check your email" overlay -->
+<div id="magicLinkOverlay" class="auth-overlay">
+    <div class="auth-card">
+        <h2>Check your email</h2>
+        <div class="subtitle" id="magicLinkHint">We sent a sign-in link to your inbox.</div>
+        <p style="color:var(--text2);font-size:13px;line-height:1.5;margin-top:12px;">
+            Click the link in the email to authorize this device. The link expires in <span id="magicLinkTtl">15</span> minutes.
+            You can close this tab — the link will open the dashboard directly.
+        </p>
+        <div class="form-actions">
+            <button class="secondary" onclick="document.getElementById('magicLinkOverlay').classList.remove('visible');showLogin();">Back to sign in</button>
+        </div>
+    </div>
+</div>
+
+<!-- Magic-link exchange overlay (shown when user lands on /#/magic/<token>) -->
+<div id="magicExchangeOverlay" class="auth-overlay">
+    <div class="auth-card">
+        <h2 id="magicExchangeTitle">Signing you in...</h2>
+        <div id="magicExchangeError" class="auth-error"></div>
+        <div id="magicExchangeTotpRow" class="form-row" style="display:none;">
+            <label>2FA Code <span style="font-weight:400;color:var(--text2);font-size:11px;">(or a backup code)</span></label>
+            <input type="text" id="magicExchangeTotp" placeholder="6-digit code, or XXXXX-XXXXX" maxlength="20" autocomplete="one-time-code" onkeydown="if(event.key==='Enter')completeMagicExchange()">
+        </div>
+        <div id="magicExchangeActions" class="form-actions" style="display:none;">
+            <button onclick="completeMagicExchange()">Sign in</button>
+        </div>
     </div>
 </div>
 
@@ -833,12 +880,31 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
 
 <!-- Users Management Modal -->
 <div id="usersModal" class="modal-overlay" onclick="if(event.target===this)closeUsersModal()">
-    <div class="modal" style="max-width:820px;">
+    <div class="modal" style="max-width:min(1200px,95vw);width:min(1200px,95vw);">
+        <style>
+            /* Scoped overrides — the global button/badge has a min-width:180px
+               from the status-pill design elsewhere that's wrong for inline
+               row actions here. */
+            #usersModal .role-pill { min-width: 0; padding: 2px 10px; }
+            #usersModal td, #usersModal th { white-space: nowrap; }
+            #usersModal td.col-actions { text-align: right; }
+            #usersModal button.small { min-width: 0; margin-left: 4px; }
+            /* Keep the Set/Edit button pinned to the right edge of the email
+               column so the buttons line up across rows regardless of the
+               address length. */
+            #usersModal .email-cell {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                min-width: 260px;
+            }
+            #usersModal .email-cell > .email-value { flex: 1 1 auto; }
+        </style>
         <h2>User Management</h2>
-        <div id="usersTableContainer" style="margin-bottom:16px;max-height:50vh;overflow-y:auto;">
+        <div id="usersTableContainer" style="margin-bottom:16px;max-height:50vh;overflow:auto;">
             <table>
-                <thead><tr><th>Username</th><th>Role</th><th>2FA</th><th>Status</th><th></th></tr></thead>
-                <tbody id="usersTableBody"><tr><td colspan="5">Loading...</td></tr></tbody>
+                <thead><tr><th>Username</th><th>Role</th><th>Email</th><th>2FA</th><th>Status</th><th></th></tr></thead>
+                <tbody id="usersTableBody"><tr><td colspan="6">Loading...</td></tr></tbody>
             </table>
         </div>
         <div style="border-top:1px solid var(--border);padding-top:16px;">
@@ -863,10 +929,34 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
 const API = '/api/v1';
 let authToken = '';
 let currentUsername = '';
+
+// Stable per-browser identifier. Generated once and persisted in localStorage;
+// clearing site data = new device on next login (by design — it re-triggers
+// the magic-link check). Not a security signal on its own, just a marker.
+function getDeviceFp() {
+    let fp = localStorage.getItem('device_fp');
+    if (!fp) {
+        if (window.crypto && crypto.randomUUID) {
+            fp = crypto.randomUUID();
+        } else {
+            // Very old browser fallback — 128 bits from Math.random.
+            fp = 'fp-' + Array.from({length: 8}, () => Math.random().toString(36).slice(2, 6)).join('');
+        }
+        localStorage.setItem('device_fp', fp);
+    }
+    return fp;
+}
+function getDeviceLabel() {
+    // Short, human-readable — no PII beyond the UA string.
+    const ua = navigator.userAgent || 'unknown';
+    return ua.length > 200 ? ua.slice(0, 200) : ua;
+}
 let userRole = '';
 let licenses = [];
 let selectedKey = null;
 let totpEnabled = false;
+let backupCodesRemaining = null;
+let mustEnableTotp = false;
 
 // Theme: 'dark' | 'light' | 'system' — persisted in localStorage.
 function applyTheme(t) {
@@ -897,8 +987,34 @@ if (window.matchMedia) {
     });
 }
 
+// Declared before init() so startMagicExchange() can write to it on the
+// magic-link path. `let` bindings are in the TDZ until this line executes;
+// writing from an early IIFE would throw ReferenceError and silently kill the
+// whole magic flow.
+let pendingMagicToken = '';
+
 (function init() {
     authToken = localStorage.getItem('auth_token') || '';
+
+    // Intercept magic-link landings (#/magic/<token>) before any routing runs.
+    // This works whether or not the user is already signed in.
+    const magicMatch = window.location.hash.match(/^#\/magic\/([A-Za-z0-9]+)/);
+    if (magicMatch) {
+        // Clear the hash so reloading the page doesn't try to reuse the token.
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+        startMagicExchange(magicMatch[1]).catch(e => {
+            console.error('Magic-link exchange crashed:', e);
+            const err = document.getElementById('magicExchangeError');
+            if (err) {
+                document.getElementById('magicExchangeOverlay').classList.add('visible');
+                document.getElementById('magicExchangeTitle').textContent = 'Sign-in failed';
+                err.textContent = 'Something went wrong. Reload and try again.';
+                err.classList.add('visible');
+            }
+        });
+        return;
+    }
+
     window.addEventListener('hashchange', route);
     if (!authToken) {
         renderNav();
@@ -978,7 +1094,12 @@ async function submitLogin() {
     if (!username) { errEl.textContent = 'Username is required'; errEl.classList.add('visible'); return; }
     if (!password) { errEl.textContent = 'Password is required'; errEl.classList.add('visible'); return; }
 
-    const body = { username, password };
+    const body = {
+        username,
+        password,
+        device_fp: getDeviceFp(),
+        device_label: getDeviceLabel(),
+    };
     const totpCode = document.getElementById('loginTotp').value.trim();
     if (totpCode) body.totp_code = totpCode;
 
@@ -989,6 +1110,15 @@ async function submitLogin() {
             body: JSON.stringify(body),
         });
         const data = await resp.json();
+
+        if (data.magic_link_sent) {
+            document.getElementById('loginOverlay').classList.remove('visible');
+            const hint = data.email_hint ? 'We sent a sign-in link to ' + data.email_hint + '.' : 'We sent a sign-in link to your inbox.';
+            document.getElementById('magicLinkHint').textContent = hint;
+            document.getElementById('magicLinkTtl').textContent = data.ttl_minutes || 15;
+            document.getElementById('magicLinkOverlay').classList.add('visible');
+            return;
+        }
 
         if (data.totp_required) {
             document.getElementById('loginTotpRow').style.display = '';
@@ -1019,6 +1149,72 @@ async function submitLogin() {
     } catch (e) {
         errEl.textContent = 'Connection failed: ' + e.message;
         errEl.classList.add('visible');
+    }
+}
+
+// -- Magic-link exchange --
+// pendingMagicToken is declared near the top of the script so the init IIFE
+// can trigger startMagicExchange without hitting its TDZ.
+
+async function startMagicExchange(token) {
+    pendingMagicToken = token;
+    document.getElementById('magicExchangeOverlay').classList.add('visible');
+    document.getElementById('magicExchangeError').classList.remove('visible');
+    document.getElementById('magicExchangeTotpRow').style.display = 'none';
+    document.getElementById('magicExchangeActions').style.display = 'none';
+    document.getElementById('magicExchangeTitle').textContent = 'Signing you in...';
+    await completeMagicExchange();
+}
+
+async function completeMagicExchange() {
+    const errEl = document.getElementById('magicExchangeError');
+    errEl.classList.remove('visible');
+
+    const body = { token: pendingMagicToken };
+    const totp = document.getElementById('magicExchangeTotp').value.trim();
+    if (totp) body.totp_code = totp;
+
+    try {
+        const resp = await fetch(API + '/auth/magic', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+
+        if (data.totp_required) {
+            document.getElementById('magicExchangeTitle').textContent = 'Enter your 2FA code';
+            document.getElementById('magicExchangeTotpRow').style.display = '';
+            document.getElementById('magicExchangeActions').style.display = '';
+            document.getElementById('magicExchangeTotp').focus();
+            return;
+        }
+        if (!resp.ok) {
+            document.getElementById('magicExchangeTitle').textContent = 'Sign-in failed';
+            errEl.textContent = data.error || 'Invalid or expired link';
+            errEl.classList.add('visible');
+            document.getElementById('magicExchangeActions').style.display = '';
+            return;
+        }
+
+        // Success — store the UUID of this device server-side for next time.
+        // (Server already called register_device under our fingerprint; we
+        // just finish the client-side session.)
+        authToken = data.token;
+        localStorage.setItem('auth_token', authToken);
+        userRole = data.role || 'user';
+        // Strip the token from the URL so a refresh doesn't re-trigger.
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+        document.getElementById('magicExchangeOverlay').classList.remove('visible');
+        if (data.must_change_password) {
+            showChangePassword();
+        } else {
+            enterDashboard();
+        }
+    } catch (e) {
+        errEl.textContent = 'Connection failed: ' + e.message;
+        errEl.classList.add('visible');
+        document.getElementById('magicExchangeActions').style.display = '';
     }
 }
 
@@ -1076,12 +1272,18 @@ async function checkAuthStatus() {
         }
         const data = await resp.json();
         totpEnabled = data.totp_enabled;
+        backupCodesRemaining = (typeof data.backup_codes_remaining === 'number') ? data.backup_codes_remaining : null;
+        mustEnableTotp = !!data.must_enable_totp;
         currentUsername = data.username || '';
         userRole = data.role || 'user';
         if (data.must_change_password) {
             showChangePassword();
         } else {
             enterDashboard();
+            if (mustEnableTotp) {
+                toast('Admin accounts must enable 2FA. Complete enrollment now.', 'error');
+                show2FAModal(true);
+            }
         }
     } catch (e) {
         renderNav();
@@ -1171,7 +1373,14 @@ async function loadLicenses() {
             return;
         }
         if (resp.status === 403) {
-            showChangePassword();
+            // 403 now has two flavors: must_change_password OR must_enable_totp.
+            // checkAuthStatus already sets global flags before this runs, so
+            // consult them instead of blindly assuming change-password.
+            if (mustEnableTotp) {
+                show2FAModal(true);
+            } else {
+                showChangePassword();
+            }
             return;
         }
         licenses = await resp.json();
@@ -1550,14 +1759,27 @@ async function doExport() {
 }
 
 // 2FA settings
-function show2FAModal() {
+function show2FAModal(force) {
     const content = document.getElementById('tfaContent');
     if (totpEnabled) {
+        const remaining = (typeof backupCodesRemaining === 'number') ? backupCodesRemaining : null;
+        const backupLine = remaining === null
+            ? ''
+            : '<p style="font-size:12px;color:var(--text2);margin-bottom:14px;">' +
+              'Backup codes remaining: <strong>' + remaining + '</strong> of 8. ' +
+              '<a href="#" onclick="showRegenerateBackupCodes();return false;">Regenerate</a>' +
+              '</p>';
         content.innerHTML =
-            '<p style="margin-bottom:14px;">Two-factor authentication is <strong style="color:var(--green);">enabled</strong>.</p>' +
+            '<p style="margin-bottom:6px;">Two-factor authentication is <strong style="color:var(--green);">enabled</strong>.</p>' +
+            backupLine +
             '<div class="form-row"><label>Enter current 2FA code to disable</label>' +
             '<input type="text" id="tfaDisableCode" placeholder="6-digit code" maxlength="6" autocomplete="one-time-code"></div>' +
             '<button class="danger" onclick="disable2FA()">Disable 2FA</button>';
+    } else if (force) {
+        content.innerHTML =
+            '<p style="margin-bottom:8px;">Your admin account must have two-factor authentication enabled.</p>' +
+            '<p style="font-size:12px;color:var(--text2);margin-bottom:14px;">You can&#39;t access admin features until you complete enrollment.</p>' +
+            '<button onclick="setup2FA()">Enable 2FA</button>';
     } else {
         content.innerHTML =
             '<p style="margin-bottom:14px;">Two-factor authentication is <strong style="color:var(--text2);">disabled</strong>.</p>' +
@@ -1606,14 +1828,78 @@ async function verify2FA() {
             headers: authHeaders(),
             body: JSON.stringify({ totp_code: code }),
         });
+        const data = await resp.json();
         if (!resp.ok) {
-            const data = await resp.json();
             toast('Error: ' + data.error, 'error');
             return;
         }
         totpEnabled = true;
-        toast('2FA enabled successfully', 'success');
-        closeTFAModal();
+        mustEnableTotp = false;
+        backupCodesRemaining = (data.backup_codes || []).length;
+        showBackupCodes(data.backup_codes || [], /*firstTime*/ true);
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+function showBackupCodes(codes, firstTime) {
+    const content = document.getElementById('tfaContent');
+    const codeList = codes.map(c => '<div class="backup-code">' + esc(c) + '</div>').join('');
+    const heading = firstTime ? '2FA enabled — save your backup codes' : 'Your new backup codes';
+    content.innerHTML =
+        '<p style="margin-bottom:4px;"><strong>' + heading + '</strong></p>' +
+        '<p style="font-size:12px;color:var(--text2);margin-bottom:12px;">' +
+        'Each code works once if you lose your authenticator. Copy them somewhere safe — ' +
+        'you will not see them again.' +
+        '</p>' +
+        '<div class="backup-codes-grid">' + codeList + '</div>' +
+        '<div style="display:flex;gap:8px;margin-top:14px;">' +
+        '<button class="secondary" onclick="copyBackupCodes(' + JSON.stringify(codes).replace(/"/g, '&quot;') + ')">Copy all</button>' +
+        '<button onclick="closeTFAModal()">I&#39;ve saved them</button>' +
+        '</div>';
+}
+
+function copyBackupCodes(codes) {
+    const text = codes.join('\n');
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(
+            () => toast('Backup codes copied to clipboard', 'success'),
+            () => toast('Copy failed — select and copy manually', 'error'),
+        );
+    } else {
+        toast('Clipboard not supported — select and copy manually', 'error');
+    }
+}
+
+function showRegenerateBackupCodes() {
+    const content = document.getElementById('tfaContent');
+    content.innerHTML =
+        '<p style="margin-bottom:6px;"><strong>Regenerate backup codes</strong></p>' +
+        '<p style="font-size:12px;color:var(--text2);margin-bottom:12px;">' +
+        'Your old backup codes will stop working. Enter your password to confirm.' +
+        '</p>' +
+        '<div class="form-row"><label>Current password</label>' +
+        '<input type="password" id="tfaRegenPw" autocomplete="current-password"></div>' +
+        '<div style="display:flex;gap:8px;">' +
+        '<button class="secondary" onclick="show2FAModal()">Cancel</button>' +
+        '<button onclick="submitRegenerateBackupCodes()">Regenerate</button>' +
+        '</div>';
+    setTimeout(() => document.getElementById('tfaRegenPw').focus(), 50);
+}
+
+async function submitRegenerateBackupCodes() {
+    const pw = document.getElementById('tfaRegenPw').value;
+    if (!pw) { toast('Enter your password', 'error'); return; }
+    try {
+        const resp = await fetch(API + '/auth/regenerate-backup-codes', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({ current_password: pw }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { toast('Error: ' + data.error, 'error'); return; }
+        backupCodesRemaining = (data.backup_codes || []).length;
+        showBackupCodes(data.backup_codes || [], /*firstTime*/ false);
     } catch (e) {
         toast('Failed: ' + e.message, 'error');
     }
@@ -1663,14 +1949,25 @@ async function loadUsers() {
             const status = u.must_change_password ? '<span style="color:var(--yellow);">Must change password</span>' : '<span style="color:var(--green);">Active</span>';
             const tfa = u.totp_enabled ? '<span style="color:var(--green);">Enabled</span>' : '<span style="color:var(--text2);">Off</span>';
             const roleBadge = u.role === 'admin'
-                ? '<span class="badge" style="background:rgba(108,140,255,0.15);color:var(--accent);">admin</span>'
-                : '<span class="badge" style="background:var(--bg3);color:var(--text2);">user</span>';
+                ? '<span class="badge role-pill" style="background:rgba(108,140,255,0.15);color:var(--accent);">admin</span>'
+                : '<span class="badge role-pill" style="background:var(--bg3);color:var(--text2);">user</span>';
+            // esc(JSON.stringify(x)) is HTML-safe for both the " and ' in the
+            // inline onclick attribute. A bare JSON.stringify would break the
+            // attribute quoting, which silently stopped the Edit button from
+            // firing.
+            const emailArg = u.email ? esc(JSON.stringify(u.email)) : "''";
+            const emailInner = u.email
+                ? '<span class="email-value">' + esc(u.email) + '</span>'
+                  + '<button class="small secondary" onclick="setUserEmail(\'' + esc(u.username) + '\',' + emailArg + ')">Edit</button>'
+                : '<span class="email-value" style="color:var(--text2);font-size:11px;">(none)</span>'
+                  + '<button class="small secondary" onclick="setUserEmail(\'' + esc(u.username) + '\',\'\')">Set</button>';
+            const emailCell = '<span class="email-cell">' + emailInner + '</span>';
             const actions = isSelf
                 ? '<span style="color:var(--text2);font-size:11px;">You</span>'
-                : '<button class="small secondary" onclick="renameUser(\'' + esc(u.username) + '\')">Rename</button> ' +
-                  '<button class="small secondary" onclick="resetUserPassword(\'' + esc(u.username) + '\')">Reset PW</button> ' +
+                : '<button class="small secondary" onclick="renameUser(\'' + esc(u.username) + '\')">Rename</button>' +
+                  '<button class="small secondary" onclick="resetUserPassword(\'' + esc(u.username) + '\')">Reset PW</button>' +
                   '<button class="small danger" onclick="deleteUser(\'' + esc(u.username) + '\')">Delete</button>';
-            return '<tr><td>' + esc(u.username) + '</td><td>' + roleBadge + '</td><td>' + tfa + '</td><td>' + status + '</td><td style="text-align:right;">' + actions + '</td></tr>';
+            return '<tr><td>' + esc(u.username) + '</td><td>' + roleBadge + '</td><td class="col-email">' + emailCell + '</td><td>' + tfa + '</td><td>' + status + '</td><td class="col-actions">' + actions + '</td></tr>';
         }).join('');
     } catch (e) {
         toast('Failed to load users: ' + e.message, 'error');
@@ -1762,6 +2059,27 @@ async function resetUserPassword(username) {
             return;
         }
         toast('Password reset for "' + username + '"', 'success');
+        await loadUsers();
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function setUserEmail(username, current) {
+    const val = prompt('Email for "' + username + '" (empty to clear):', current || '');
+    if (val === null) return;
+    try {
+        const resp = await fetch(API + '/auth/users/' + encodeURIComponent(username) + '/email', {
+            method: 'PUT',
+            headers: authHeaders(),
+            body: JSON.stringify({ email: val.trim() }),
+        });
+        if (!resp.ok) {
+            const data = await resp.json();
+            toast('Error: ' + data.error, 'error');
+            return;
+        }
+        toast('Email updated for "' + username + '"', 'success');
         await loadUsers();
     } catch (e) {
         toast('Failed: ' + e.message, 'error');
@@ -2018,11 +2336,6 @@ function renderWorkspaces() {
     `).join('');
 }
 
-function esc(str) {
-    const div = document.createElement('div');
-    div.textContent = str || '';
-    return div.innerHTML;
-}
 
 async function showWsDetail(id) {
     selectedWsId = id;

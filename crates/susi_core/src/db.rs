@@ -185,7 +185,16 @@ impl LicenseDb {
                 expires_at TEXT NOT NULL,
                 used_at TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_login_tokens_expires ON login_tokens(expires_at);",
+            CREATE INDEX IF NOT EXISTS idx_login_tokens_expires ON login_tokens(expires_at);
+
+            CREATE TABLE IF NOT EXISTS totp_backup_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                code_hash TEXT NOT NULL,
+                used_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_totp_backup_user ON totp_backup_codes(username);",
             )
             .map_err(|e| LicenseError::Other(format!("DB init: {}", e)))?;
         self.migrate()?;
@@ -778,6 +787,39 @@ impl LicenseDb {
         Ok(())
     }
 
+    /// Look up a magic-link token WITHOUT consuming it. Returns the row only
+    /// if it is unknown-unused AND still within its TTL — the same validity
+    /// rules `consume_login_token` applies, minus the mark-as-used step.
+    ///
+    /// This exists because magic-link exchange may require a second input
+    /// (e.g. a TOTP code) before the server has enough to issue a JWT. If we
+    /// consumed up-front, a legitimate user who missed the TOTP prompt would
+    /// be stuck with a spent token.
+    pub fn peek_login_token(&self, token_hash: &str) -> Result<Option<LoginTokenRow>, LicenseError> {
+        let row: Option<(String, String, String, String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT username, device_fp, device_label, expires_at, used_at FROM login_tokens WHERE token_hash = ?1",
+                params![token_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
+        let Some((username, device_fp, device_label, expires_at, used_at)) = row else {
+            return Ok(None);
+        };
+        if used_at.is_some() {
+            return Ok(None);
+        }
+        let expires: DateTime<Utc> = DateTime::parse_from_rfc3339(&expires_at)
+            .map_err(|e| LicenseError::Other(format!("Bad token expires_at: {}", e)))?
+            .with_timezone(&Utc);
+        if Utc::now() > expires {
+            return Ok(None);
+        }
+        Ok(Some(LoginTokenRow { username, device_fp, device_label }))
+    }
+
     /// Validate a magic-link token and mark it as consumed.
     ///
     /// Returns the (username, device_fp, device_label) on success. Returns
@@ -819,6 +861,85 @@ impl LicenseDb {
             return Ok(None);
         }
         Ok(Some(LoginTokenRow { username, device_fp, device_label }))
+    }
+
+    // -----------------------------------------------------------------------
+    // TOTP backup codes
+    // -----------------------------------------------------------------------
+
+    /// Replace the set of backup codes for a user. Atomic: wipes previous rows
+    /// (used or not) before inserting the new hashes. The caller is expected
+    /// to keep the raw codes only until they've been shown to the user.
+    pub fn replace_backup_codes(
+        &self,
+        username: &str,
+        hashes: &[String],
+    ) -> Result<(), LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()
+            .map_err(|e| LicenseError::Other(format!("DB tx: {}", e)))?;
+        tx.execute("DELETE FROM totp_backup_codes WHERE username = ?1", params![username])
+            .map_err(|e| LicenseError::Other(format!("DB delete: {}", e)))?;
+        for h in hashes {
+            tx.execute(
+                "INSERT INTO totp_backup_codes (username, code_hash, created_at) VALUES (?1, ?2, ?3)",
+                params![username, h, now],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB insert backup: {}", e)))?;
+        }
+        tx.commit().map_err(|e| LicenseError::Other(format!("DB commit: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn clear_backup_codes(&self, username: &str) -> Result<(), LicenseError> {
+        self.conn
+            .execute("DELETE FROM totp_backup_codes WHERE username = ?1", params![username])
+            .map_err(|e| LicenseError::Other(format!("DB delete: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn list_unused_backup_codes(
+        &self,
+        username: &str,
+    ) -> Result<Vec<(i64, String)>, LicenseError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, code_hash FROM totp_backup_codes WHERE username = ?1 AND used_at IS NULL",
+            )
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map(params![username], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn count_unused_backup_codes(&self, username: &str) -> Result<usize, LicenseError> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM totp_backup_codes WHERE username = ?1 AND used_at IS NULL",
+                params![username],
+                |r| r.get(0),
+            )
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
+        Ok(n as usize)
+    }
+
+    /// Mark a backup-code row used. Returns true iff a previously-unused row
+    /// was flipped — false for already-used or unknown IDs (guards against race).
+    pub fn consume_backup_code(&self, id: i64) -> Result<bool, LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        let n = self
+            .conn
+            .execute(
+                "UPDATE totp_backup_codes SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
+                params![now, id],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
+        Ok(n > 0)
     }
 
     /// Delete expired or consumed tokens older than 24h. Housekeeping; safe to ignore errors.
@@ -1925,12 +2046,49 @@ mod tests {
     }
 
     #[test]
+    fn test_peek_does_not_consume() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+        db.insert_login_token("hashP", "admin", "fp1", "", 900).unwrap();
+        // Peek twice — token should still be consumable after.
+        assert!(db.peek_login_token("hashP").unwrap().is_some());
+        assert!(db.peek_login_token("hashP").unwrap().is_some());
+        assert!(db.consume_login_token("hashP").unwrap().is_some());
+        // After consume, both peek and consume see nothing.
+        assert!(db.peek_login_token("hashP").unwrap().is_none());
+        assert!(db.consume_login_token("hashP").unwrap().is_none());
+    }
+
+    #[test]
     fn test_login_token_expired() {
         let db = test_db();
         db.seed_admin("hash").unwrap();
         // Insert with -1 TTL → already expired.
         db.insert_login_token("hash2", "admin", "fp1", "", -1).unwrap();
         assert!(db.consume_login_token("hash2").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_backup_codes_replace_and_consume() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+        assert_eq!(db.count_unused_backup_codes("admin").unwrap(), 0);
+
+        let hashes: Vec<String> = (0..8).map(|i| format!("hash-{}", i)).collect();
+        db.replace_backup_codes("admin", &hashes).unwrap();
+        assert_eq!(db.count_unused_backup_codes("admin").unwrap(), 8);
+
+        let unused = db.list_unused_backup_codes("admin").unwrap();
+        let id = unused[0].0;
+        assert!(db.consume_backup_code(id).unwrap());
+        assert_eq!(db.count_unused_backup_codes("admin").unwrap(), 7);
+        // Double-consume returns false — race protection.
+        assert!(!db.consume_backup_code(id).unwrap());
+
+        // Replace wipes old rows (including used ones).
+        let new_hashes: Vec<String> = (0..8).map(|i| format!("new-{}", i)).collect();
+        db.replace_backup_codes("admin", &new_hashes).unwrap();
+        assert_eq!(db.count_unused_backup_codes("admin").unwrap(), 8);
     }
 
     #[test]
