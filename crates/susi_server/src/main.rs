@@ -1,12 +1,15 @@
 mod docs;
 
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result};
 use argon2::{self, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::SaltString;
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -47,6 +50,63 @@ struct AppState {
     private_key: RsaPrivateKey,
     jwt_secret: [u8; 32],
     data_dir: String,
+    login_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+}
+
+// Sliding-window rate limit on /api/v1/auth/login — throttles brute force
+// against weak passwords and caps credential-stuffing throughput.
+const LOGIN_WINDOW: StdDuration = StdDuration::from_secs(60);
+const LOGIN_MAX_ATTEMPTS: usize = 10;
+
+fn check_login_rate_limit(
+    state: &AppState,
+    ip: IpAddr,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let mut map = state.login_attempts.lock().unwrap();
+    let now = Instant::now();
+    let entry = map.entry(ip).or_default();
+    entry.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+    if entry.len() >= LOGIN_MAX_ATTEMPTS {
+        log::warn!("Login rate limit exceeded for {}", ip);
+        return Err(error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many login attempts, try again later",
+        ));
+    }
+    entry.push(now);
+    // Opportunistic cleanup so the map does not grow unbounded.
+    if map.len() > 4096 {
+        map.retain(|_, v| {
+            v.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+            !v.is_empty()
+        });
+    }
+    Ok(())
+}
+
+// Extract the originating client IP. When the Rust server is fronted by a
+// trusted reverse proxy (nginx) the TCP peer is 127.0.0.1; in that case we
+// consult X-Forwarded-For / X-Real-IP. For requests that arrive directly we
+// use the TCP peer and ignore the forwarded headers (they would be attacker
+// controlled).
+fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    let peer_ip = peer.ip();
+    let from_loopback = peer_ip.is_loopback();
+    if from_loopback {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first) = xff.split(',').next() {
+                if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                    return ip;
+                }
+            }
+        }
+        if let Some(xri) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            if let Ok(ip) = xri.trim().parse::<IpAddr>() {
+                return ip;
+            }
+        }
+    }
+    peer_ip
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -312,8 +372,13 @@ struct LoginRequest {
 
 async fn handle_login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let ip = client_ip(peer, &headers);
+    check_login_rate_limit(&state, ip)?;
+
     let db = state.db.lock().unwrap();
     let hash = db
         .get_user_password_hash(&req.username)
@@ -1168,13 +1233,25 @@ async fn handle_download_asset(
         return Err(error_response(StatusCode::UNAUTHORIZED, "Authentication required"));
     }
 
-    let file_path = releases_dir(&state).join(&tag).join(&asset_name);
-    if !file_path.exists() {
-        return Err(error_response(StatusCode::NOT_FOUND, "Asset not found"));
+    // Reject traversal / empty / nul before building the path, and confirm the
+    // canonicalized result stays inside the releases directory. Defense in depth
+    // against a future regression in the name checks.
+    let safe_tag = docs::safe_tag(&tag)?;
+    let safe_asset = docs::safe_filename(&asset_name)?;
+
+    let base = releases_dir(&state).canonicalize()
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Releases directory unavailable"))?;
+    let file_path = base.join(safe_tag).join(safe_asset);
+    let canonical = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Err(error_response(StatusCode::NOT_FOUND, "Asset not found")),
+    };
+    if !canonical.starts_with(&base) {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Invalid asset path"));
     }
 
-    let bytes = std::fs::read(&file_path)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Read error: {}", e)))?;
+    let bytes = std::fs::read(&canonical)
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Read error"))?;
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
@@ -1896,6 +1973,7 @@ async fn main() -> Result<()> {
         private_key,
         jwt_secret,
         data_dir: cli.data_dir,
+        login_attempts: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -1991,7 +2069,7 @@ async fn main() -> Result<()> {
 
     log::info!("License server listening on {}", cli.listen);
     log::info!("Dashboard: http://{}", cli.listen);
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("Server error")?;
 
