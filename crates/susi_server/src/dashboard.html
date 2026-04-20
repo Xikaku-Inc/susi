@@ -944,7 +944,7 @@ function renderNav() {
     const items = [
         { page: 'docs', label: 'Documentation', href: '/docs', show: true },
         { page: 'workspaces', label: 'Workspaces', href: '#/workspaces', show: !!authToken },
-        { page: 'releases', label: 'Releases', href: '#/releases', show: !!authToken && isAdmin },
+        { page: 'releases', label: 'Releases', href: '#/releases', show: !!authToken },
         { page: 'licenses', label: 'Licenses', href: '#/licenses', show: !!authToken && isAdmin },
     ];
     nav.innerHTML = items.filter(i => i.show).map(i =>
