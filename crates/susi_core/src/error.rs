@@ -29,6 +29,9 @@ pub enum LicenseError {
     #[error("License revoked")]
     Revoked,
 
+    #[error("Machine deactivated by administrator")]
+    Deactivated,
+
     #[error("License not found")]
     NotFound,
 
