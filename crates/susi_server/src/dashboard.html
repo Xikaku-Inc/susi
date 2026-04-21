@@ -1045,29 +1045,46 @@ if (window.matchMedia) {
 // whole magic flow.
 let pendingMagicToken = '';
 
+// Intercept magic-link landings (#/magic/<token>). Runs on both initial
+// page load AND on hashchange — the latter matters when the email link
+// opens in an already-open tab, which only fires hashchange (not a full
+// reload). Returns true if a magic token was found and consumed.
+function tryHandleMagicLink() {
+    const magicMatch = window.location.hash.match(/^#\/magic\/([A-Za-z0-9]+)/);
+    if (!magicMatch) return false;
+    // Clear any stale overlays from the tab's prior state (login prompt,
+    // change-password prompt from an old session) so the magic-exchange
+    // overlay is the only thing showing.
+    ['loginOverlay', 'changePasswordOverlay'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.remove('visible');
+    });
+    // Clear the hash so reloading the page doesn't try to reuse the token.
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    startMagicExchange(magicMatch[1]).catch(e => {
+        console.error('Magic-link exchange crashed:', e);
+        const err = document.getElementById('magicExchangeError');
+        if (err) {
+            document.getElementById('magicExchangeOverlay').classList.add('visible');
+            document.getElementById('magicExchangeTitle').textContent = 'Sign-in failed';
+            err.textContent = 'Something went wrong. Reload and try again.';
+            err.classList.add('visible');
+        }
+    });
+    return true;
+}
+
 (function init() {
     authToken = localStorage.getItem('auth_token') || '';
 
-    // Intercept magic-link landings (#/magic/<token>) before any routing runs.
-    // This works whether or not the user is already signed in.
-    const magicMatch = window.location.hash.match(/^#\/magic\/([A-Za-z0-9]+)/);
-    if (magicMatch) {
-        // Clear the hash so reloading the page doesn't try to reuse the token.
-        history.replaceState(null, '', window.location.pathname + window.location.search);
-        startMagicExchange(magicMatch[1]).catch(e => {
-            console.error('Magic-link exchange crashed:', e);
-            const err = document.getElementById('magicExchangeError');
-            if (err) {
-                document.getElementById('magicExchangeOverlay').classList.add('visible');
-                document.getElementById('magicExchangeTitle').textContent = 'Sign-in failed';
-                err.textContent = 'Something went wrong. Reload and try again.';
-                err.classList.add('visible');
-            }
-        });
-        return;
-    }
+    if (tryHandleMagicLink()) return;
 
-    window.addEventListener('hashchange', route);
+    window.addEventListener('hashchange', () => {
+        // An email link that opens in an already-open tab only fires
+        // hashchange, not a full reload. Catch #/magic/<token> here too.
+        if (tryHandleMagicLink()) return;
+        route();
+    });
     if (!authToken) {
         renderNav();
         route();
