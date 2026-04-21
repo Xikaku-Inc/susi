@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use susi_core::error::LicenseError;
 
-use crate::{error_response, require_admin, require_password_changed, validate_jwt, AppState, ErrorResponse};
+use crate::{error_response, require_admin, require_password_changed, validate_principal, AppState, ErrorResponse};
 
 // ---------------------------------------------------------------------------
 // Disk layout
@@ -273,9 +273,9 @@ pub async fn handle_upsert_doc_page(
     Path((tag, slug)): Path<(String, String)>,
     Json(req): Json<UpsertPageRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
 
     let release_id = ensure_release_with_seed(
@@ -309,9 +309,9 @@ pub async fn handle_rename_doc_page(
     Path((tag, slug)): Path<(String, String)>,
     Json(req): Json<RenamePageRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
     let new_slug = req.new_slug.trim();
     if new_slug.is_empty() || new_slug.contains('/') || new_slug.contains('\\') || new_slug.contains('\0') {
@@ -342,9 +342,9 @@ pub async fn handle_delete_doc_page(
     headers: HeaderMap,
     Path((tag, slug)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
 
     let db = state.db.lock().unwrap();
@@ -379,9 +379,9 @@ pub async fn handle_bulk_import_docs(
     Path(tag): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
 
     let mut release_name = String::new();
@@ -518,9 +518,9 @@ pub async fn handle_upload_doc_asset(
     Path(tag): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
 
     // Pull the first "file" field from the multipart body.
@@ -574,9 +574,9 @@ pub async fn handle_delete_doc_asset(
     headers: HeaderMap,
     Path((tag, file_name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
     safe_filename(&file_name)?;
 

@@ -457,6 +457,7 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
         <button id="btnTheme" class="small secondary" onclick="cycleTheme()" title="Toggle theme">🌓</button>
         <button id="btnUsers" class="small secondary" onclick="showUsersModal()" style="display:none;">Users</button>
         <button id="btn2FA" class="small secondary" onclick="show2FAModal()" style="display:none;">2FA</button>
+        <button id="btnApiTokens" class="small secondary" onclick="showApiTokensModal()" style="display:none;">API Tokens</button>
         <button id="btnLogout" class="small secondary" onclick="logout()" style="display:none;">Logout</button>
         <button id="btnLogin" class="small secondary" onclick="showLogin()" style="display:none;">Login</button>
     </div>
@@ -925,6 +926,57 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
     </div>
 </div>
 
+<!-- API Tokens Modal -->
+<div id="apiTokensModal" class="modal-overlay" onclick="if(event.target===this)closeApiTokensModal()">
+    <div class="modal" style="max-width:min(1000px,95vw);width:min(1000px,95vw);">
+        <style>
+            #apiTokensModal td, #apiTokensModal th { white-space: nowrap; vertical-align: middle; }
+            #apiTokensModal td.col-actions { text-align: right; }
+            #apiTokensModal button.small { min-width: 0; margin-left: 4px; }
+            #apiTokensModal .pat-prefix {
+                font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+                font-size: 12px;
+                background: var(--bg);
+                padding: 2px 8px;
+                border-radius: 4px;
+            }
+            #apiTokensModal .pat-revoked { color: var(--red); }
+            #apiTokensModal .pat-active { color: var(--green); }
+        </style>
+        <h2>API Tokens</h2>
+        <p style="color:var(--text2);font-size:13px;margin:0 0 12px;">
+            Long-lived bearer tokens for headless clients (CI scripts, services). Send as
+            <span class="pat-prefix">Authorization: Bearer susi_pat_…</span>.
+            Tokens inherit your role and bypass the interactive 2FA gate — treat them like passwords.
+        </p>
+        <div id="apiTokensTableContainer" style="margin-bottom:16px;max-height:50vh;overflow:auto;">
+            <table>
+                <thead><tr><th>Name</th><th>Prefix</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+                <tbody id="apiTokensTableBody"><tr><td colspan="6">Loading...</td></tr></tbody>
+            </table>
+        </div>
+        <div style="border-top:1px solid var(--border);padding-top:16px;">
+            <h3 style="font-size:14px;margin-bottom:12px;">Create new token</h3>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <input type="text" id="newApiTokenName" placeholder="Name (e.g. github-actions release)" style="flex:1;min-width:200px;">
+                <button onclick="createApiToken()" style="width:auto;">Create</button>
+            </div>
+        </div>
+        <div id="apiAdminSection" style="border-top:1px solid var(--border);padding-top:16px;margin-top:16px;display:none;">
+            <h3 style="font-size:14px;margin-bottom:8px;">All tokens (admin)</h3>
+            <div id="apiAllTokensContainer" style="max-height:30vh;overflow:auto;">
+                <table>
+                    <thead><tr><th>Owner</th><th>Name</th><th>Prefix</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+                    <tbody id="apiAllTokensBody"><tr><td colspan="6">Loading...</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+        <div class="form-actions">
+            <button class="secondary" onclick="closeApiTokensModal()">Close</button>
+        </div>
+    </div>
+</div>
+
 <script>
 const API = '/api/v1';
 let authToken = '';
@@ -1072,6 +1124,7 @@ function renderNav() {
     document.getElementById('currentUser').style.display = authToken ? '' : 'none';
     document.getElementById('btn2FA').style.display = authToken ? '' : 'none';
     document.getElementById('btnUsers').style.display = (authToken && isAdmin) ? '' : 'none';
+    document.getElementById('btnApiTokens').style.display = authToken ? '' : 'none';
 }
 
 function showLogin() {
@@ -2084,6 +2137,163 @@ async function setUserEmail(username, current) {
     } catch (e) {
         toast('Failed: ' + e.message, 'error');
     }
+}
+
+// ----- API tokens -----
+
+function showApiTokensModal() {
+    document.getElementById('apiTokensModal').classList.add('visible');
+    document.getElementById('newApiTokenName').value = '';
+    loadMyApiTokens();
+    if (userRole === 'admin') {
+        document.getElementById('apiAdminSection').style.display = '';
+        loadAllApiTokens();
+    } else {
+        document.getElementById('apiAdminSection').style.display = 'none';
+    }
+}
+
+function closeApiTokensModal() {
+    document.getElementById('apiTokensModal').classList.remove('visible');
+}
+
+function fmtTokenStatus(t) {
+    if (t.revoked_at) return '<span class="pat-revoked">Revoked</span>';
+    return '<span class="pat-active">Active</span>';
+}
+function fmtTokenDate(s) {
+    if (!s) return '<span style="color:var(--text2);">–</span>';
+    return esc(new Date(s).toLocaleString());
+}
+
+async function loadMyApiTokens() {
+    try {
+        const resp = await fetch(API + '/auth/api-tokens', { headers: authHeaders() });
+        if (!resp.ok) return;
+        const tokens = await resp.json();
+        const tbody = document.getElementById('apiTokensTableBody');
+        if (tokens.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text2);text-align:center;padding:16px;">No tokens yet.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = tokens.map(t => {
+            const actions = t.revoked_at
+                ? '<span style="color:var(--text2);font-size:11px;">–</span>'
+                : '<button class="small danger" onclick="revokeMyApiToken(' + t.id + ')">Revoke</button>';
+            return '<tr>'
+                + '<td>' + esc(t.name) + '</td>'
+                + '<td><span class="pat-prefix">' + esc(t.token_prefix) + '…</span></td>'
+                + '<td>' + fmtTokenDate(t.created_at) + '</td>'
+                + '<td>' + fmtTokenDate(t.last_used_at) + '</td>'
+                + '<td>' + fmtTokenStatus(t) + '</td>'
+                + '<td class="col-actions">' + actions + '</td>'
+                + '</tr>';
+        }).join('');
+    } catch (e) {
+        toast('Failed to load tokens: ' + e.message, 'error');
+    }
+}
+
+async function loadAllApiTokens() {
+    try {
+        const resp = await fetch(API + '/auth/api-tokens/all', { headers: authHeaders() });
+        if (!resp.ok) return;
+        const tokens = await resp.json();
+        const tbody = document.getElementById('apiAllTokensBody');
+        if (tokens.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text2);text-align:center;padding:16px;">No tokens.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = tokens.map(t => {
+            const actions = t.revoked_at
+                ? '<span style="color:var(--text2);font-size:11px;">–</span>'
+                : '<button class="small danger" onclick="revokeAnyApiToken(' + t.id + ')">Revoke</button>';
+            return '<tr>'
+                + '<td>' + esc(t.username) + '</td>'
+                + '<td>' + esc(t.name) + '</td>'
+                + '<td><span class="pat-prefix">' + esc(t.token_prefix) + '…</span></td>'
+                + '<td>' + fmtTokenDate(t.last_used_at) + '</td>'
+                + '<td>' + fmtTokenStatus(t) + '</td>'
+                + '<td class="col-actions">' + actions + '</td>'
+                + '</tr>';
+        }).join('');
+    } catch (e) {
+        toast('Failed to load admin tokens: ' + e.message, 'error');
+    }
+}
+
+async function createApiToken() {
+    const name = document.getElementById('newApiTokenName').value.trim();
+    if (!name) { toast('Token name is required', 'error'); return; }
+    try {
+        const resp = await fetch(API + '/auth/api-tokens', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({ name }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { toast('Error: ' + data.error, 'error'); return; }
+        showNewApiTokenOnce(data.token, data.name);
+        document.getElementById('newApiTokenName').value = '';
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+function showNewApiTokenOnce(rawToken, name) {
+    // Reuse the backup-codes display style for "save this once" context.
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay visible';
+    overlay.style.zIndex = '10000';
+    overlay.innerHTML =
+        '<div class="modal" style="max-width:600px;">' +
+        '<h2>Token created</h2>' +
+        '<p style="margin-bottom:6px;">Token: <strong>' + esc(name) + '</strong></p>' +
+        '<p style="font-size:12px;color:var(--text2);margin-bottom:12px;">' +
+        'Copy this now — it will not be shown again. Store it like a password.' +
+        '</p>' +
+        '<div class="secret-display" id="newPatRaw">' + esc(rawToken) + '</div>' +
+        '<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end;">' +
+        '<button class="secondary" id="newPatCopy">Copy</button>' +
+        '<button id="newPatDone">I&#39;ve saved it</button>' +
+        '</div>' +
+        '</div>';
+    document.body.appendChild(overlay);
+    overlay.querySelector('#newPatCopy').onclick = () => {
+        if (navigator.clipboard) {
+            navigator.clipboard.writeText(rawToken).then(
+                () => toast('Token copied to clipboard', 'success'),
+                () => toast('Copy failed — select and copy manually', 'error'),
+            );
+        }
+    };
+    overlay.querySelector('#newPatDone').onclick = () => {
+        overlay.remove();
+        loadMyApiTokens();
+        if (userRole === 'admin') loadAllApiTokens();
+    };
+}
+
+async function revokeMyApiToken(id) {
+    if (!confirm('Revoke this token? Any client using it will stop working immediately.')) return;
+    try {
+        const resp = await fetch(API + '/auth/api-tokens/' + id, { method: 'DELETE', headers: authHeaders() });
+        if (!resp.ok) { const d = await resp.json(); toast('Error: ' + d.error, 'error'); return; }
+        toast('Token revoked', 'success');
+        await loadMyApiTokens();
+        if (userRole === 'admin') await loadAllApiTokens();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function revokeAnyApiToken(id) {
+    if (!confirm('Revoke this token (admin)? Any client using it will stop working immediately.')) return;
+    try {
+        const resp = await fetch(API + '/auth/api-tokens/all/' + id, { method: 'DELETE', headers: authHeaders() });
+        if (!resp.ok) { const d = await resp.json(); toast('Error: ' + d.error, 'error'); return; }
+        toast('Token revoked', 'success');
+        await loadAllApiTokens();
+        await loadMyApiTokens();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
 }
 
 // Releases

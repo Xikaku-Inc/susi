@@ -361,12 +361,76 @@ fn validate_jwt(
         })
 }
 
+// Authenticated source — JWT means an interactive browser session (subject to
+// password-change and TOTP gates), ApiToken means a long-lived bearer issued
+// via the management UI (intended for service accounts; bypasses interactive gates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthSource {
+    Jwt,
+    ApiToken,
+}
+
+#[derive(Debug)]
+struct Principal {
+    username: String,
+    source: AuthSource,
+}
+
+const API_TOKEN_PREFIX: &str = "susi_pat_";
+
+/// Verify the Authorization header and resolve to a Principal. Accepts either:
+///   - Bearer <JWT>      → AuthSource::Jwt
+///   - Bearer susi_pat_… → AuthSource::ApiToken
+fn validate_principal(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<Principal, (StatusCode, Json<ErrorResponse>)> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    if token.is_empty() {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "Missing authentication token"));
+    }
+
+    if token.starts_with(API_TOKEN_PREFIX) {
+        let token_hash = hash_token(token);
+        let row = {
+            let db = state.db.lock().unwrap();
+            db.find_api_token_by_hash(&token_hash)
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        };
+        let Some(row) = row else {
+            return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid API token"));
+        };
+        if row.revoked {
+            return Err(error_response(StatusCode::UNAUTHORIZED, "API token revoked"));
+        }
+        // Best-effort touch — auth must not fail on a transient DB hiccup here.
+        {
+            let db = state.db.lock().unwrap();
+            let _ = db.touch_api_token_used(row.id);
+        }
+        return Ok(Principal { username: row.username, source: AuthSource::ApiToken });
+    }
+
+    let claims = validate_jwt(headers, &state.jwt_secret)?;
+    Ok(Principal { username: claims.sub, source: AuthSource::Jwt })
+}
+
 fn require_password_changed(
     state: &AppState,
-    username: &str,
+    principal: &Principal,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    // API tokens are minted explicitly per service account. Whether the
+    // owning user "must change password" is a UI bootstrap concept that
+    // doesn't apply to a headless caller.
+    if principal.source == AuthSource::ApiToken {
+        return Ok(());
+    }
     let db = state.db.lock().unwrap();
-    if db.user_must_change_password(username).unwrap_or(true) {
+    if db.user_must_change_password(&principal.username).unwrap_or(true) {
         return Err(error_response(
             StatusCode::FORBIDDEN,
             "Password change required before accessing admin features",
@@ -377,22 +441,25 @@ fn require_password_changed(
 
 fn require_admin(
     state: &AppState,
-    username: &str,
+    principal: &Principal,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let db = state.db.lock().unwrap();
-    let role = db.get_user_role(username).unwrap_or_default();
+    let role = db.get_user_role(&principal.username).unwrap_or_default();
     if role != "admin" {
         return Err(error_response(StatusCode::FORBIDDEN, "Admin access required"));
     }
-    // Hard-enforce 2FA for admins. They can still hit auth/status and the
-    // 2FA-setup endpoints (those don't call require_admin), so they have a
-    // path to enroll. Everything else is gated.
-    let totp_enabled = db.user_totp_enabled(username).unwrap_or(false);
-    if !totp_enabled {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "Admin accounts must enable two-factor authentication before performing this action",
-        ));
+    // 2FA is only enforced for interactive (JWT) sessions. API tokens are
+    // themselves a strong factor — adding TOTP would mean storing a TOTP seed
+    // in CI alongside the bearer, which raises attack surface without raising
+    // the bar.
+    if principal.source == AuthSource::Jwt {
+        let totp_enabled = db.user_totp_enabled(&principal.username).unwrap_or(false);
+        if !totp_enabled {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "Admin accounts must enable two-factor authentication before performing this action",
+            ));
+        }
     }
     Ok(())
 }
@@ -790,18 +857,18 @@ async fn handle_auth_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let principal = validate_principal(&headers, &state)?;
     let db = state.db.lock().unwrap();
-    let must_change = db.user_must_change_password(&claims.sub).unwrap_or(false);
-    let totp_enabled = db.user_totp_enabled(&claims.sub).unwrap_or(false);
-    let role = db.get_user_role(&claims.sub).unwrap_or_else(|_| "user".into());
-    let email = db.get_user_email(&claims.sub).ok().flatten();
-    let backup_codes_remaining = db.count_unused_backup_codes(&claims.sub).unwrap_or(0);
+    let must_change = db.user_must_change_password(&principal.username).unwrap_or(false);
+    let totp_enabled = db.user_totp_enabled(&principal.username).unwrap_or(false);
+    let role = db.get_user_role(&principal.username).unwrap_or_else(|_| "user".into());
+    let email = db.get_user_email(&principal.username).ok().flatten();
+    let backup_codes_remaining = db.count_unused_backup_codes(&principal.username).unwrap_or(0);
     let must_enable_totp = role == "admin" && !totp_enabled;
     Ok(Json(serde_json::json!({
         "must_change_password": must_change,
         "totp_enabled": totp_enabled,
-        "username": claims.sub,
+        "username": principal.username,
         "role": role,
         "email": email,
         "magic_link_enabled": !magic_link_disabled(&state),
@@ -821,7 +888,7 @@ async fn handle_change_password(
     headers: HeaderMap,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let principal = validate_principal(&headers, &state)?;
 
     if req.new_password.len() < 8 {
         return Err(error_response(StatusCode::BAD_REQUEST, "Password must be at least 8 characters"));
@@ -829,7 +896,7 @@ async fn handle_change_password(
 
     let db = state.db.lock().unwrap();
     let hash = db
-        .get_user_password_hash(&claims.sub)
+        .get_user_password_hash(&principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     if !verify_password(&req.current_password, &hash)? {
@@ -837,7 +904,7 @@ async fn handle_change_password(
     }
 
     let new_hash = hash_password(&req.new_password)?;
-    db.update_user_password(&claims.sub, &new_hash)
+    db.update_user_password(&principal.username, &new_hash)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "status": "OK" })))
@@ -847,15 +914,15 @@ async fn handle_setup_2fa(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let secret_bytes: [u8; 20] = rand::thread_rng().gen();
     let secret = Secret::Raw(secret_bytes.to_vec());
     let secret_b32 = secret.to_encoded().to_string();
 
     let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes.to_vec(),
-        Some("Susi License Server".into()), claims.sub.clone().into())
+        Some("Susi License Server".into()), principal.username.clone().into())
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let qr_code = totp
@@ -863,7 +930,7 @@ async fn handle_setup_2fa(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let db = state.db.lock().unwrap();
-    db.set_user_totp_secret(&claims.sub, &secret_b32)
+    db.set_user_totp_secret(&principal.username, &secret_b32)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -883,11 +950,11 @@ async fn handle_verify_2fa(
     headers: HeaderMap,
     Json(req): Json<TotpCodeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let principal = validate_principal(&headers, &state)?;
 
     let db = state.db.lock().unwrap();
     let secret_b32 = db
-        .get_user_totp_secret(&claims.sub)
+        .get_user_totp_secret(&principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "No 2FA setup in progress"))?;
 
@@ -896,14 +963,14 @@ async fn handle_verify_2fa(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret,
-        Some("Susi License Server".into()), claims.sub.clone().into())
+        Some("Susi License Server".into()), principal.username.clone().into())
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     if !totp.check_current(&req.totp_code).unwrap_or(false) {
         return Err(error_response(StatusCode::BAD_REQUEST, "Invalid TOTP code"));
     }
 
-    db.enable_user_totp(&claims.sub)
+    db.enable_user_totp(&principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     drop(db);
 
@@ -917,7 +984,7 @@ async fn handle_verify_2fa(
     }
     {
         let db = state.db.lock().unwrap();
-        db.replace_backup_codes(&claims.sub, &hashes)
+        db.replace_backup_codes(&principal.username, &hashes)
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     }
 
@@ -934,11 +1001,11 @@ async fn handle_disable_2fa(
     headers: HeaderMap,
     Json(req): Json<TotpCodeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let principal = validate_principal(&headers, &state)?;
 
     let db = state.db.lock().unwrap();
     let secret_b32 = db
-        .get_user_totp_secret(&claims.sub)
+        .get_user_totp_secret(&principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "2FA is not enabled"))?;
 
@@ -947,17 +1014,17 @@ async fn handle_disable_2fa(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret,
-        Some("Susi License Server".into()), claims.sub.clone().into())
+        Some("Susi License Server".into()), principal.username.clone().into())
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     if !totp.check_current(&req.totp_code).unwrap_or(false) {
         return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid TOTP code"));
     }
 
-    db.disable_user_totp(&claims.sub)
+    db.disable_user_totp(&principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     // Wipe backup codes too — they were bound to the (now gone) 2FA factor.
-    let _ = db.clear_backup_codes(&claims.sub);
+    let _ = db.clear_backup_codes(&principal.username);
 
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
@@ -974,17 +1041,17 @@ async fn handle_regenerate_backup_codes(
     headers: HeaderMap,
     Json(req): Json<RegenerateBackupCodesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let principal = validate_principal(&headers, &state)?;
 
     {
         let db = state.db.lock().unwrap();
         let hash = db
-            .get_user_password_hash(&claims.sub)
+            .get_user_password_hash(&principal.username)
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
         if !verify_password(&req.current_password, &hash)? {
             return Err(error_response(StatusCode::UNAUTHORIZED, "Password is incorrect"));
         }
-        if !db.user_totp_enabled(&claims.sub).unwrap_or(false) {
+        if !db.user_totp_enabled(&principal.username).unwrap_or(false) {
             return Err(error_response(StatusCode::BAD_REQUEST, "Enable 2FA first"));
         }
     }
@@ -996,7 +1063,7 @@ async fn handle_regenerate_backup_codes(
     }
     {
         let db = state.db.lock().unwrap();
-        db.replace_backup_codes(&claims.sub, &hashes)
+        db.replace_backup_codes(&principal.username, &hashes)
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     }
 
@@ -1198,9 +1265,9 @@ async fn handle_list_licenses(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<LicenseSummary>>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let licenses = db
@@ -1216,9 +1283,9 @@ async fn handle_get_license(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Result<Json<LicenseSummary>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let license = db
@@ -1234,9 +1301,9 @@ async fn handle_create_license(
     headers: HeaderMap,
     Json(req): Json<CreateLicenseRequest>,
 ) -> Result<(StatusCode, Json<LicenseSummary>), (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let expires_dt = if req.perpetual {
         None
@@ -1276,9 +1343,9 @@ async fn handle_revoke_license(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let revoked = db
@@ -1297,9 +1364,9 @@ async fn handle_delete_license(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let deleted = db
@@ -1319,9 +1386,9 @@ async fn handle_update_license(
     Path(key): Path<String>,
     Json(req): Json<UpdateLicenseRequest>,
 ) -> Result<Json<LicenseSummary>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let license = db
@@ -1363,9 +1430,9 @@ async fn handle_export_license(
     Path(key): Path<String>,
     Json(req): Json<ExportRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let license = db
@@ -1429,9 +1496,9 @@ async fn handle_deactivate_machine(
     headers: HeaderMap,
     Path((key, machine_code)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let license = db
@@ -1453,9 +1520,9 @@ async fn handle_list_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<susi_core::db::UserInfo>>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
     let db = state.db.lock().unwrap();
     let users = db
         .list_users()
@@ -1480,9 +1547,9 @@ async fn handle_create_user(
     headers: HeaderMap,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let username = req.username.trim();
     if username.is_empty() || username.len() > 64 {
@@ -1508,11 +1575,11 @@ async fn handle_delete_user(
     headers: HeaderMap,
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
-    if claims.sub == username {
+    if principal.username == username {
         return Err(error_response(StatusCode::BAD_REQUEST, "Cannot delete your own account"));
     }
 
@@ -1534,9 +1601,9 @@ async fn handle_rename_user(
     Path(username): Path<String>,
     Json(req): Json<RenameUserRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let new = req.new_username.trim().to_string();
     if new.is_empty() {
@@ -1567,9 +1634,9 @@ async fn handle_reset_user_password(
     Path(username): Path<String>,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     if req.new_password.len() < 8 {
         return Err(error_response(StatusCode::BAD_REQUEST, "Password must be at least 8 characters"));
@@ -1580,6 +1647,134 @@ async fn handle_reset_user_password(
     db.reset_user_password(&username, &pw_hash)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+// ---------------------------------------------------------------------------
+// API tokens (long-lived bearer tokens for service accounts)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateApiTokenRequest {
+    name: String,
+}
+
+fn generate_api_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("{}{}", API_TOKEN_PREFIX, hex::encode(bytes))
+}
+
+async fn handle_create_api_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateApiTokenRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    // Token management is intentionally JWT-only — using one API token to mint
+    // another would let a leaked token persist beyond a single revoke.
+    if principal.source != AuthSource::Jwt {
+        return Err(error_response(StatusCode::FORBIDDEN, "API tokens can only be managed from a browser session"));
+    }
+
+    let name = req.name.trim();
+    if name.is_empty() || name.len() > 80 {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Name must be 1-80 characters"));
+    }
+
+    let raw = generate_api_token();
+    let token_hash = hash_token(&raw);
+    // Prefix shown in lists so humans can tell tokens apart without seeing the
+    // secret. 12 chars = "susi_pat_" + 3 hex chars.
+    let prefix = raw.chars().take(12).collect::<String>();
+
+    let id = {
+        let db = state.db.lock().unwrap();
+        db.insert_api_token(&principal.username, name, &token_hash, &prefix)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+
+    log::info!("API token '{}' (id={}) created by {}", name, id, principal.username);
+
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "name": name,
+        "token": raw,
+        "token_prefix": prefix,
+    })))
+}
+
+async fn handle_list_my_api_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<susi_core::db::ApiTokenInfo>>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    let db = state.db.lock().unwrap();
+    let rows = db
+        .list_api_tokens_for_user(&principal.username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(rows))
+}
+
+async fn handle_revoke_my_api_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    if principal.source != AuthSource::Jwt {
+        return Err(error_response(StatusCode::FORBIDDEN, "API tokens can only be managed from a browser session"));
+    }
+    let owner = {
+        let db = state.db.lock().unwrap();
+        db.get_api_token_owner(id)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+    let Some(owner) = owner else {
+        return Err(error_response(StatusCode::NOT_FOUND, "Token not found"));
+    };
+    if owner != principal.username {
+        return Err(error_response(StatusCode::FORBIDDEN, "Token belongs to another user"));
+    }
+    let db = state.db.lock().unwrap();
+    let revoked = db.revoke_api_token(id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !revoked {
+        return Err(error_response(StatusCode::CONFLICT, "Token already revoked"));
+    }
+    log::info!("API token id={} revoked by {}", id, principal.username);
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+async fn handle_list_all_api_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<susi_core::db::ApiTokenInfo>>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+    let db = state.db.lock().unwrap();
+    let rows = db
+        .list_all_api_tokens()
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(rows))
+}
+
+async fn handle_revoke_any_api_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+    let db = state.db.lock().unwrap();
+    let revoked = db.revoke_api_token(id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !revoked {
+        return Err(error_response(StatusCode::CONFLICT, "Token already revoked or not found"));
+    }
+    log::info!("API token id={} revoked by admin {}", id, principal.username);
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
 
@@ -1612,13 +1807,13 @@ async fn handle_set_my_email(
     headers: HeaderMap,
     Json(req): Json<SetEmailRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let principal = validate_principal(&headers, &state)?;
     let normalized = match req.email.as_deref() {
         Some(s) => normalize_email(s)?,
         None => None,
     };
     let db = state.db.lock().unwrap();
-    db.set_user_email(&claims.sub, normalized.as_deref())
+    db.set_user_email(&principal.username, normalized.as_deref())
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(serde_json::json!({ "status": "OK", "email": normalized })))
 }
@@ -1629,9 +1824,9 @@ async fn handle_set_user_email(
     Path(username): Path<String>,
     Json(req): Json<SetEmailRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let normalized = match req.email.as_deref() {
         Some(s) => normalize_email(s)?,
@@ -1650,10 +1845,10 @@ async fn handle_list_my_devices(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<susi_core::db::DeviceInfo>>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let principal = validate_principal(&headers, &state)?;
     let db = state.db.lock().unwrap();
     let devices = db
-        .list_devices(&claims.sub)
+        .list_devices(&principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(devices))
 }
@@ -1663,10 +1858,10 @@ async fn handle_revoke_my_device(
     headers: HeaderMap,
     Path(fingerprint): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
+    let principal = validate_principal(&headers, &state)?;
     let db = state.db.lock().unwrap();
     let removed = db
-        .revoke_device(&claims.sub, &fingerprint)
+        .revoke_device(&principal.username, &fingerprint)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     if !removed {
         return Err(error_response(StatusCode::NOT_FOUND, "Device not found"));
@@ -1718,7 +1913,7 @@ async fn handle_get_releases(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // Accept either license key or bearer token
     if validate_license_key(&state, &headers).is_err() {
-        validate_jwt(&headers, &state.jwt_secret)?;
+        validate_principal(&headers, &state)?;
     }
 
     let db = state.db.lock().unwrap();
@@ -1750,10 +1945,10 @@ async fn handle_download_asset(
     headers: HeaderMap,
     Path((tag, asset_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // Allow either license key or JWT auth
+    // Allow either license key or bearer auth (JWT or API token)
     let license_ok = validate_license_key(&state, &headers).is_ok();
-    let jwt_ok = validate_jwt(&headers, &state.jwt_secret).is_ok();
-    if !license_ok && !jwt_ok {
+    let bearer_ok = validate_principal(&headers, &state).is_ok();
+    if !license_ok && !bearer_ok {
         return Err(error_response(StatusCode::UNAUTHORIZED, "Authentication required"));
     }
 
@@ -1793,9 +1988,9 @@ async fn handle_list_releases_admin(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let rows = db.list_releases()
@@ -1827,9 +2022,9 @@ async fn handle_upload_release(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let mut tag = String::new();
     let mut name = String::new();
@@ -1936,9 +2131,9 @@ async fn handle_delete_release(
     headers: HeaderMap,
     Path(tag): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     if !db.delete_release(&tag)
@@ -2013,9 +2208,9 @@ async fn handle_create_workspace(
     headers: HeaderMap,
     Json(req): Json<CreateWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     if req.name.is_empty() {
         return Err(error_response(StatusCode::BAD_REQUEST, "Workspace name is required"));
@@ -2023,17 +2218,17 @@ async fn handle_create_workspace(
 
     let id = uuid::Uuid::new_v4().to_string();
     let db = state.db.lock().unwrap();
-    db.create_workspace(&id, &req.name, &req.product, &req.description, &claims.sub)
+    db.create_workspace(&id, &req.name, &req.product, &req.description, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
-    log::info!("Workspace '{}' ({}) created by {}", req.name, id, claims.sub);
+    log::info!("Workspace '{}' ({}) created by {}", req.name, id, principal.username);
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({
         "id": id,
         "name": req.name,
         "product": req.product,
         "description": req.description,
-        "created_by": claims.sub,
+        "created_by": principal.username,
     }))))
 }
 
@@ -2041,11 +2236,11 @@ async fn handle_list_workspaces(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    let rows = db.list_workspaces_for_user(&claims.sub)
+    let rows = db.list_workspaces_for_user(&principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let workspaces: Vec<_> = rows.iter().map(|(id, name, product, desc, created_by, created_at, updated_at, role)| {
@@ -2069,11 +2264,11 @@ async fn handle_get_workspace(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    let role = db.get_workspace_member_role(&id, &claims.sub)
+    let role = db.get_workspace_member_role(&id, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
 
@@ -2105,11 +2300,11 @@ async fn handle_update_workspace(
     Path(id): Path<String>,
     Json(req): Json<UpdateWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    let role = db.get_workspace_member_role(&id, &claims.sub)
+    let role = db.get_workspace_member_role(&id, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
     if role != "owner" && role != "editor" {
@@ -2127,15 +2322,15 @@ async fn handle_delete_workspace(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     db.delete_workspace(&id)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
-    log::info!("Workspace {} deleted by {}", id, claims.sub);
+    log::info!("Workspace {} deleted by {}", id, principal.username);
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
 
@@ -2149,9 +2344,9 @@ async fn handle_add_workspace_member(
     Path(workspace_id): Path<String>,
     Json(req): Json<AddMemberRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
 
@@ -2174,9 +2369,9 @@ async fn handle_remove_workspace_member(
     headers: HeaderMap,
     Path((workspace_id, username)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
-    require_admin(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     db.remove_workspace_member(&workspace_id, &username)
@@ -2195,11 +2390,11 @@ async fn handle_push_config(
     Path(workspace_id): Path<String>,
     Json(req): Json<PushConfigRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    let role = db.get_workspace_member_role(&workspace_id, &claims.sub)
+    let role = db.get_workspace_member_role(&workspace_id, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
     if role == "viewer" {
@@ -2210,7 +2405,7 @@ async fn handle_push_config(
     serde_json::from_str::<serde_json::Value>(&req.config_json)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e)))?;
 
-    let id = db.push_config_revision(&workspace_id, &req.config_json, &req.name, &req.description, &claims.sub)
+    let id = db.push_config_revision(&workspace_id, &req.config_json, &req.name, &req.description, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({
@@ -2224,11 +2419,11 @@ async fn handle_list_configs(
     headers: HeaderMap,
     Path(workspace_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    db.get_workspace_member_role(&workspace_id, &claims.sub)
+    db.get_workspace_member_role(&workspace_id, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
 
@@ -2253,11 +2448,11 @@ async fn handle_get_config(
     headers: HeaderMap,
     Path((workspace_id, config_id)): Path<(String, i64)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    db.get_workspace_member_role(&workspace_id, &claims.sub)
+    db.get_workspace_member_role(&workspace_id, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
 
@@ -2280,11 +2475,11 @@ async fn handle_get_latest_config(
     headers: HeaderMap,
     Path(workspace_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    db.get_workspace_member_role(&workspace_id, &claims.sub)
+    db.get_workspace_member_role(&workspace_id, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
 
@@ -2308,11 +2503,11 @@ async fn handle_update_config(
     Path((workspace_id, config_id)): Path<(String, i64)>,
     Json(req): Json<UpdateConfigRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    let role = db.get_workspace_member_role(&workspace_id, &claims.sub)
+    let role = db.get_workspace_member_role(&workspace_id, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
     if role == "viewer" {
@@ -2333,11 +2528,11 @@ async fn handle_delete_config(
     headers: HeaderMap,
     Path((workspace_id, config_id)): Path<(String, i64)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    let role = db.get_workspace_member_role(&workspace_id, &claims.sub)
+    let role = db.get_workspace_member_role(&workspace_id, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
     if role == "viewer" {
@@ -2359,11 +2554,11 @@ async fn handle_workspace_releases(
     headers: HeaderMap,
     Path(workspace_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let claims = validate_jwt(&headers, &state.jwt_secret)?;
-    require_password_changed(&state, &claims.sub)?;
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
-    db.get_workspace_member_role(&workspace_id, &claims.sub)
+    db.get_workspace_member_role(&workspace_id, &principal.username)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
 
@@ -2562,6 +2757,11 @@ async fn main() -> Result<()> {
         .route("/api/v1/auth/me/email", axum::routing::put(handle_set_my_email))
         .route("/api/v1/auth/me/devices", get(handle_list_my_devices))
         .route("/api/v1/auth/me/devices/{fingerprint}", axum::routing::delete(handle_revoke_my_device))
+        // API tokens (long-lived bearer tokens for headless clients)
+        .route("/api/v1/auth/api-tokens", post(handle_create_api_token).get(handle_list_my_api_tokens))
+        .route("/api/v1/auth/api-tokens/{id}", axum::routing::delete(handle_revoke_my_api_token))
+        .route("/api/v1/auth/api-tokens/all", get(handle_list_all_api_tokens))
+        .route("/api/v1/auth/api-tokens/all/{id}", axum::routing::delete(handle_revoke_any_api_token))
         // User management
         .route("/api/v1/auth/users", get(handle_list_users))
         .route("/api/v1/auth/users", post(handle_create_user))

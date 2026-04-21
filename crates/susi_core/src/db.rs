@@ -30,6 +30,27 @@ pub struct LoginTokenRow {
     pub device_label: String,
 }
 
+/// Minimal info needed to authorize a request via an API token.
+#[derive(Debug)]
+pub struct ApiTokenAuthRow {
+    pub id: i64,
+    pub username: String,
+    pub revoked: bool,
+}
+
+/// Public-facing metadata about a token. Never includes the hash or raw token —
+/// `prefix` is enough for humans to spot which token a row refers to.
+#[derive(Debug, Serialize)]
+pub struct ApiTokenInfo {
+    pub id: i64,
+    pub username: String,
+    pub name: String,
+    pub token_prefix: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
 pub struct LicenseDb {
     conn: Connection,
 }
@@ -194,7 +215,19 @@ impl LicenseDb {
                 used_at TEXT,
                 created_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_totp_backup_user ON totp_backup_codes(username);",
+            CREATE INDEX IF NOT EXISTS idx_totp_backup_user ON totp_backup_codes(username);
+
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                name TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                token_prefix TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT,
+                revoked_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(username);",
             )
             .map_err(|e| LicenseError::Other(format!("DB init: {}", e)))?;
         self.migrate()?;
@@ -940,6 +973,118 @@ impl LicenseDb {
             )
             .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
         Ok(n > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // API tokens (long-lived bearer tokens for service accounts)
+    // -----------------------------------------------------------------------
+
+    pub fn insert_api_token(
+        &self,
+        username: &str,
+        name: &str,
+        token_hash: &str,
+        token_prefix: &str,
+    ) -> Result<i64, LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO api_tokens (username, name, token_hash, token_prefix, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![username, name, token_hash, token_prefix, now],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB insert: {}", e)))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Lookup by hash, returning the minimum needed to authorize a request.
+    /// Auth-hot path — must be cheap.
+    pub fn find_api_token_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<ApiTokenAuthRow>, LicenseError> {
+        self.conn
+            .query_row(
+                "SELECT id, username, revoked_at FROM api_tokens WHERE token_hash = ?1",
+                params![token_hash],
+                |r| {
+                    Ok(ApiTokenAuthRow {
+                        id: r.get(0)?,
+                        username: r.get(1)?,
+                        revoked: r.get::<_, Option<String>>(2)?.is_some(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))
+    }
+
+    /// Update last_used_at. Called on every authenticated request — best-effort,
+    /// callers ignore errors so a transient DB hiccup doesn't 500 the request.
+    pub fn touch_api_token_used(&self, id: i64) -> Result<(), LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute("UPDATE api_tokens SET last_used_at = ?1 WHERE id = ?2", params![now, id])
+            .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn list_api_tokens_for_user(&self, username: &str) -> Result<Vec<ApiTokenInfo>, LicenseError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, username, name, token_prefix, created_at, last_used_at, revoked_at
+                 FROM api_tokens WHERE username = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map(params![username], row_to_api_token_info)
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn list_all_api_tokens(&self) -> Result<Vec<ApiTokenInfo>, LicenseError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, username, name, token_prefix, created_at, last_used_at, revoked_at
+                 FROM api_tokens ORDER BY username, created_at DESC",
+            )
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map([], row_to_api_token_info)
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Mark token revoked. Returns true if a previously-unrevoked row was
+    /// flipped, false if the row was unknown or already revoked.
+    pub fn revoke_api_token(&self, id: i64) -> Result<bool, LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        let n = self.conn
+            .execute(
+                "UPDATE api_tokens SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+                params![now, id],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
+        Ok(n > 0)
+    }
+
+    /// Look up just the owning username — used for permission checks (e.g.
+    /// "is this token-id owned by the caller before they revoke it").
+    pub fn get_api_token_owner(&self, id: i64) -> Result<Option<String>, LicenseError> {
+        self.conn
+            .query_row(
+                "SELECT username FROM api_tokens WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))
     }
 
     /// Delete expired or consumed tokens older than 24h. Housekeeping; safe to ignore errors.
@@ -1985,6 +2130,18 @@ impl LicenseDb {
     }
 }
 
+fn row_to_api_token_info(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApiTokenInfo> {
+    Ok(ApiTokenInfo {
+        id: r.get(0)?,
+        username: r.get(1)?,
+        name: r.get(2)?,
+        token_prefix: r.get(3)?,
+        created_at: r.get(4)?,
+        last_used_at: r.get(5)?,
+        revoked_at: r.get(6)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2066,6 +2223,52 @@ mod tests {
         // Insert with -1 TTL → already expired.
         db.insert_login_token("hash2", "admin", "fp1", "", -1).unwrap();
         assert!(db.consume_login_token("hash2").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_api_token_lifecycle() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+
+        let id = db.insert_api_token("admin", "ci-bot", "h-abcdef", "susi_pat_ab").unwrap();
+        let row = db.find_api_token_by_hash("h-abcdef").unwrap().expect("present");
+        assert_eq!(row.id, id);
+        assert_eq!(row.username, "admin");
+        assert!(!row.revoked);
+
+        let listed = db.list_api_tokens_for_user("admin").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "ci-bot");
+        assert_eq!(listed[0].token_prefix, "susi_pat_ab");
+        assert!(listed[0].last_used_at.is_none());
+
+        db.touch_api_token_used(id).unwrap();
+        let after = db.list_api_tokens_for_user("admin").unwrap();
+        assert!(after[0].last_used_at.is_some());
+
+        // Revoke flips once, returns false on second attempt.
+        assert!(db.revoke_api_token(id).unwrap());
+        assert!(!db.revoke_api_token(id).unwrap());
+
+        // Lookup still finds it but reports revoked=true so the auth path can reject.
+        let row = db.find_api_token_by_hash("h-abcdef").unwrap().expect("present");
+        assert!(row.revoked);
+    }
+
+    #[test]
+    fn test_api_token_unknown_hash_returns_none() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+        assert!(db.find_api_token_by_hash("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_api_token_get_owner() {
+        let db = test_db();
+        db.seed_admin("hash").unwrap();
+        let id = db.insert_api_token("admin", "x", "h-x", "p-x").unwrap();
+        assert_eq!(db.get_api_token_owner(id).unwrap().as_deref(), Some("admin"));
+        assert_eq!(db.get_api_token_owner(999).unwrap(), None);
     }
 
     #[test]
