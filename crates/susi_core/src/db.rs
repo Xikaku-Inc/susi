@@ -1657,10 +1657,11 @@ impl LicenseDb {
         prerelease: bool,
         workspace_id: Option<&str>,
     ) -> Result<(), LicenseError> {
+        let now = Utc::now().to_rfc3339();
         self.conn
             .execute(
-                "UPDATE releases SET name = ?1, body = ?2, prerelease = ?3, workspace_id = ?4 WHERE id = ?5",
-                params![name, body, prerelease as i32, workspace_id, release_id],
+                "UPDATE releases SET name = ?1, body = ?2, prerelease = ?3, workspace_id = ?4, created_at = ?5 WHERE id = ?6",
+                params![name, body, prerelease as i32, workspace_id, now, release_id],
             )
             .map_err(|e| LicenseError::Other(format!("DB update release: {}", e)))?;
         Ok(())
