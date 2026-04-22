@@ -521,6 +521,32 @@ mod tests {
         }
     }
 
+    // Real fingerprint lookup fails on some CI runners (e.g. GitHub's
+    // ubuntu-latest where /sys/block/<disk>/serial is empty), which would
+    // cause every verify_signed call to fall through to LicenseStatus::Error
+    // regardless of actual signature validity. The tests do not care about
+    // machine-binding — inject a stable synthetic code via the cache.
+    const TEST_MACHINE_CODE: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn test_machine_code_cache() -> PathBuf {
+        let path = std::env::temp_dir().join("susi_client_test_machine_code");
+        let _ = std::fs::write(&path, TEST_MACHINE_CODE);
+        path
+    }
+
+    fn new_test_client(pub_pem: &str) -> LicenseClient {
+        LicenseClient::new(pub_pem)
+            .unwrap()
+            .with_machine_code_cache(test_machine_code_cache())
+    }
+
+    fn new_test_client_with_server(pub_pem: &str, server_url: String) -> LicenseClient {
+        let mut client = LicenseClient::with_server(pub_pem, server_url).unwrap();
+        client.set_machine_code_cache(test_machine_code_cache());
+        client
+    }
+
     #[test]
     fn test_client_creation() {
         let (_, pub_pem, _) = make_keypair_pems();
@@ -531,7 +557,7 @@ mod tests {
     #[test]
     fn test_verify_valid_license() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let payload = make_valid_payload(None);
         let signed = sign_license(&private, &payload).unwrap();
 
@@ -545,7 +571,7 @@ mod tests {
     #[test]
     fn test_verify_expired_license() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let payload = LicensePayload {
             id: "test".to_string(),
             product: "FusionHub".to_string(),
@@ -568,7 +594,7 @@ mod tests {
     fn test_verify_wrong_key_fails() {
         let (_, _, private) = make_keypair_pems();
         let (_, wrong_pub_pem, _) = make_keypair_pems();
-        let client = LicenseClient::new(&wrong_pub_pem).unwrap();
+        let client = new_test_client(&wrong_pub_pem);
         let payload = make_valid_payload(None);
         let signed = sign_license(&private, &payload).unwrap();
 
@@ -579,11 +605,11 @@ mod tests {
     #[test]
     fn test_verify_machine_locked_license() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
-        let local_code = LicenseClient::get_machine_code().unwrap();
+        let client = new_test_client(&pub_pem);
 
-        // License locked to this machine
-        let payload = make_valid_payload(Some(local_code.clone()));
+        // License locked to this machine (use the synthetic test code so the
+        // client's cached fingerprint matches).
+        let payload = make_valid_payload(Some(TEST_MACHINE_CODE.to_string()));
         let signed = sign_license(&private, &payload).unwrap();
         let status = client.verify_signed(&signed);
         assert!(status.is_valid());
@@ -598,7 +624,7 @@ mod tests {
     #[test]
     fn test_verify_file_not_found() {
         let (_, pub_pem, _) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let status = client.verify_file(Path::new("/nonexistent/license.json"));
         assert!(matches!(status, LicenseStatus::FileNotFound(_)));
     }
@@ -606,7 +632,7 @@ mod tests {
     #[test]
     fn test_verify_file_roundtrip() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let payload = make_valid_payload(None);
         let signed = sign_license(&private, &payload).unwrap();
 
@@ -624,7 +650,7 @@ mod tests {
     #[test]
     fn test_verify_perpetual_license() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let payload = LicensePayload {
             id: "perpetual".to_string(),
             product: "FusionHub".to_string(),
@@ -647,7 +673,7 @@ mod tests {
     #[test]
     fn test_verify_valid_lease() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let mut payload = make_valid_payload(None);
         payload.lease_expires = Some(Utc::now() + Duration::days(7));
         let signed = sign_license(&private, &payload).unwrap();
@@ -661,7 +687,7 @@ mod tests {
     #[test]
     fn test_verify_expired_lease_in_grace() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let mut client = LicenseClient::new(&pub_pem).unwrap();
+        let mut client = new_test_client(&pub_pem);
         client.set_grace_hours(24);
 
         let mut payload = make_valid_payload(None);
@@ -677,7 +703,7 @@ mod tests {
     #[test]
     fn test_verify_expired_lease_past_grace() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let mut client = LicenseClient::new(&pub_pem).unwrap();
+        let mut client = new_test_client(&pub_pem);
         client.set_grace_hours(24);
 
         let mut payload = make_valid_payload(None);
@@ -692,7 +718,7 @@ mod tests {
     #[test]
     fn test_verify_no_lease_enforcement() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let mut payload = make_valid_payload(None);
         payload.lease_expires = None;
         let signed = sign_license(&private, &payload).unwrap();
@@ -718,7 +744,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_file_async_roundtrip() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let payload = make_valid_payload(None);
         let signed = sign_license(&private, &payload).unwrap();
 
@@ -736,7 +762,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_file_async_not_found() {
         let (_, pub_pem, _) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let status = client.verify_file_async(Path::new("/nonexistent/license.json")).await;
         assert!(matches!(status, LicenseStatus::FileNotFound(_)));
     }
@@ -744,7 +770,8 @@ mod tests {
     #[tokio::test]
     async fn test_verify_and_refresh_async_no_server_falls_back_to_file() {
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap(); // no server_url set
+        let client = new_test_client(&pub_pem);
+        // no server_url set
         let payload = make_valid_payload(None);
         let signed = sign_license(&private, &payload).unwrap();
 
@@ -761,7 +788,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_online_activate_async_network_error() {
         let (_, pub_pem, _) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         // 127.0.0.1:1 is reserved, TCP connect fails fast.
         let result = client
             .try_online_activate_async("http://127.0.0.1:1", "AAAA-BBBB-CCCC-DDDD", None)
@@ -809,7 +836,7 @@ mod tests {
         ).await;
 
         let (_, pub_pem, _) = make_keypair_pems();
-        let client = LicenseClient::new(&pub_pem).unwrap();
+        let client = new_test_client(&pub_pem);
         let result = client
             .try_online_activate_async(&url, "ANY-KEY", None)
             .await;
@@ -828,7 +855,7 @@ mod tests {
         ).await;
 
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::with_server(&pub_pem, url).unwrap();
+        let client = new_test_client_with_server(&pub_pem, url);
 
         // Seed a cached (still-valid-looking) license on disk.
         let payload = make_valid_payload(None);
@@ -853,7 +880,7 @@ mod tests {
         let (_, pub_pem, _) = make_keypair_pems();
         // Point at a URL that would noisily fail if it were ever called —
         // no cache file means the method must short-circuit before the server.
-        let client = LicenseClient::with_server(&pub_pem, "http://127.0.0.1:1".into()).unwrap();
+        let client = new_test_client_with_server(&pub_pem, "http://127.0.0.1:1".into());
 
         let nonexistent = std::env::temp_dir().join("definitely_not_there_license.json");
         let _ = tokio::fs::remove_file(&nonexistent).await;
@@ -894,7 +921,7 @@ mod tests {
         let leaked: &'static str = Box::leak(body.into_boxed_str());
         let url = spawn_canned_http_response(200, leaked).await;
 
-        let client = LicenseClient::with_server(&pub_pem, url).unwrap();
+        let client = new_test_client_with_server(&pub_pem, url);
         let tmp = std::env::temp_dir().join("test_activate_writes_cache.json");
         let _ = tokio::fs::remove_file(&tmp).await;
 
@@ -916,7 +943,7 @@ mod tests {
         ).await;
 
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = LicenseClient::with_server(&pub_pem, url).unwrap();
+        let client = new_test_client_with_server(&pub_pem, url);
 
         let payload = make_valid_payload(None);
         let signed = sign_license(&private, &payload).unwrap();
@@ -940,7 +967,7 @@ mod tests {
         // callers migrate to the _async variants, but existing sync callers
         // wrapped in spawn_blocking must still work.
         let (_, pub_pem, private) = make_keypair_pems();
-        let client = std::sync::Arc::new(LicenseClient::new(&pub_pem).unwrap());
+        let client = std::sync::Arc::new(new_test_client(&pub_pem));
         let payload = make_valid_payload(None);
         let signed = sign_license(&private, &payload).unwrap();
 
