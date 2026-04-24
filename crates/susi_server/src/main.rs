@@ -2941,6 +2941,28 @@ async fn main() -> Result<()> {
             "/api/v1/website/assets/{file}",
             axum::routing::delete(website::handle_delete_asset),
         )
+        // Website admin — page revisions (history)
+        .route(
+            "/api/v1/website/pages/{slug}/revisions",
+            get(website::handle_list_page_revisions),
+        )
+        .route(
+            "/api/v1/website/pages/{slug}/revisions/{id}",
+            get(website::handle_get_page_revision),
+        )
+        .route(
+            "/api/v1/website/pages/{slug}/revisions/{id}/restore",
+            post(website::handle_restore_page_revision),
+        )
+        // Website admin — asset admin (usage, rename)
+        .route(
+            "/api/v1/website/admin/assets",
+            get(website::handle_list_assets_with_usage),
+        )
+        .route(
+            "/api/v1/website/assets/{file}/rename",
+            post(website::handle_rename_asset),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cli.listen)

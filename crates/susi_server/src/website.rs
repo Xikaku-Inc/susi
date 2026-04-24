@@ -150,17 +150,172 @@ pub async fn handle_upsert_page(
     safe_slug(&slug)?;
 
     let id = {
-        let db = state.db.lock().unwrap();
+        let mut db = state.db.lock().unwrap();
         db.upsert_website_page(
             &slug,
             &req.title,
             &req.body_md,
             req.parent_slug.as_deref(),
             req.ord,
+            Some(&principal.username),
         )
         .map_err(db_err)?
     };
     Ok(Json(json!({ "id": id, "slug": slug })))
+}
+
+// ---------------------------------------------------------------------------
+// Page revisions (history)
+// ---------------------------------------------------------------------------
+
+pub async fn handle_list_page_revisions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+    safe_slug(&slug)?;
+    let db = state.db.lock().unwrap();
+    let rows = db.list_page_revisions(&slug).map_err(db_err)?;
+    let revisions: Vec<_> = rows
+        .into_iter()
+        .map(|(id, captured_at, author, title, body_len)| json!({
+            "id": id,
+            "captured_at": captured_at,
+            "author": author,
+            "title": title,
+            "body_length": body_len,
+        }))
+        .collect();
+    Ok(Json(json!({ "slug": slug, "revisions": revisions })))
+}
+
+pub async fn handle_get_page_revision(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((slug, id)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+    safe_slug(&slug)?;
+    let db = state.db.lock().unwrap();
+    let row = db
+        .get_page_revision(&slug, id)
+        .map_err(db_err)?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Revision not found"))?;
+    let (title, body_md, parent_slug, ord, captured_at, author) = row;
+    Ok(Json(json!({
+        "slug": slug, "id": id,
+        "title": title, "body_md": body_md,
+        "parent_slug": parent_slug, "ord": ord,
+        "captured_at": captured_at, "author": author,
+    })))
+}
+
+pub async fn handle_restore_page_revision(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((slug, id)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+    safe_slug(&slug)?;
+    let mut db = state.db.lock().unwrap();
+    let rev = db
+        .get_page_revision(&slug, id)
+        .map_err(db_err)?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Revision not found"))?;
+    let (title, body_md, parent_slug, ord, _captured_at, _author) = rev;
+    let new_id = db.upsert_website_page(
+        &slug, &title, &body_md, parent_slug.as_deref(), ord,
+        Some(&principal.username),
+    ).map_err(db_err)?;
+    Ok(Json(json!({ "id": new_id, "slug": slug, "restored_from": id })))
+}
+
+// ---------------------------------------------------------------------------
+// Asset admin
+// ---------------------------------------------------------------------------
+
+pub async fn handle_list_assets_with_usage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+    let db = state.db.lock().unwrap();
+    let rows = db.list_website_assets_with_usage().map_err(db_err)?;
+    let assets: Vec<_> = rows
+        .into_iter()
+        .map(|(name, size, usage_count, pages_csv)| {
+            let pages: Vec<&str> = if pages_csv.is_empty() {
+                Vec::new()
+            } else {
+                pages_csv.split(',').collect()
+            };
+            json!({
+                "name": name, "size": size,
+                "usage_count": usage_count,
+                "pages": pages,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "assets": assets })))
+}
+
+#[derive(Deserialize)]
+pub struct RenameAssetRequest {
+    pub new_name: String,
+}
+
+pub async fn handle_rename_asset(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(file_name): Path<String>,
+    Json(req): Json<RenameAssetRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+    safe_filename(&file_name)?;
+    let new_name = req.new_name.trim();
+    safe_filename(new_name)?;
+
+    let (ok, n_pages) = {
+        let mut db = state.db.lock().unwrap();
+        db.rename_website_asset(&file_name, new_name).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+                error_response(StatusCode::CONFLICT, &msg)
+            } else {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
+            }
+        })?
+    };
+    if !ok {
+        return Err(error_response(StatusCode::NOT_FOUND, "Asset not found"));
+    }
+    // Move file on disk.
+    let dir = assets_dir(&state);
+    let old_path = dir.join(&file_name);
+    let new_path = dir.join(new_name);
+    if old_path.exists() {
+        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("fs rename: {}", e),
+            ));
+        }
+    }
+    Ok(Json(json!({
+        "name": new_name,
+        "pages_updated": n_pages,
+    })))
 }
 
 #[derive(Deserialize)]

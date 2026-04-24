@@ -214,6 +214,19 @@ impl LicenseDb {
                 file_size INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS website_page_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body_md TEXT NOT NULL DEFAULT '',
+                parent_slug TEXT,
+                ord INTEGER NOT NULL DEFAULT 0,
+                captured_at TEXT NOT NULL,
+                author TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_website_page_revisions_slug
+                ON website_page_revisions(slug, captured_at DESC);
+
             CREATE TABLE IF NOT EXISTS known_devices (
                 username TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,
@@ -2247,36 +2260,205 @@ impl LicenseDb {
     // Website pages / assets (single-site public page store, no releases)
     // -----------------------------------------------------------------------
 
+    /// Upsert a website page. When the row already exists and its content
+    /// actually differs from the incoming state, the prior state is captured
+    /// into `website_page_revisions` so edits are recoverable.
     pub fn upsert_website_page(
-        &self,
+        &mut self,
         slug: &str,
         title: &str,
         body_md: &str,
         parent_slug: Option<&str>,
         ord: i64,
+        author: Option<&str>,
     ) -> Result<i64, LicenseError> {
         let now = Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO website_pages (slug, title, body_md, parent_slug, ord, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(slug) DO UPDATE SET
-                   title = excluded.title,
-                   body_md = excluded.body_md,
-                   parent_slug = excluded.parent_slug,
-                   ord = excluded.ord,
-                   updated_at = excluded.updated_at",
-                params![slug, title, body_md, parent_slug, ord, now],
+        let tx = self.conn.transaction()
+            .map_err(|e| LicenseError::Other(format!("DB tx: {}", e)))?;
+
+        // Capture prior state as a revision if this is an update-with-change.
+        let prior: Option<(String, String, Option<String>, i64)> = tx
+            .query_row(
+                "SELECT title, body_md, parent_slug, ord FROM website_pages WHERE slug = ?1",
+                params![slug],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                )),
             )
-            .map_err(|e| LicenseError::Other(format!("DB upsert website page: {}", e)))?;
-        let id = self.conn
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB read prior: {}", e)))?;
+        if let Some((p_title, p_body, p_parent, p_ord)) = &prior {
+            let unchanged = p_title == title
+                && p_body == body_md
+                && p_parent.as_deref() == parent_slug
+                && *p_ord == ord;
+            if !unchanged {
+                tx.execute(
+                    "INSERT INTO website_page_revisions
+                       (slug, title, body_md, parent_slug, ord, captured_at, author)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![slug, p_title, p_body, p_parent, p_ord, now, author],
+                ).map_err(|e| LicenseError::Other(format!("DB snapshot: {}", e)))?;
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO website_pages (slug, title, body_md, parent_slug, ord, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(slug) DO UPDATE SET
+               title = excluded.title,
+               body_md = excluded.body_md,
+               parent_slug = excluded.parent_slug,
+               ord = excluded.ord,
+               updated_at = excluded.updated_at",
+            params![slug, title, body_md, parent_slug, ord, now],
+        )
+        .map_err(|e| LicenseError::Other(format!("DB upsert website page: {}", e)))?;
+        let id = tx
             .query_row(
                 "SELECT id FROM website_pages WHERE slug = ?1",
                 params![slug],
                 |r| r.get::<_, i64>(0),
             )
             .map_err(|e| LicenseError::Other(format!("DB lookup website page: {}", e)))?;
+        tx.commit().map_err(|e| LicenseError::Other(format!("DB tx commit: {}", e)))?;
         Ok(id)
+    }
+
+    /// List revisions for a page, newest first. Body omitted for list brevity.
+    pub fn list_page_revisions(
+        &self,
+        slug: &str,
+    ) -> Result<Vec<(i64, String, Option<String>, String, i64)>, LicenseError> {
+        let mut stmt = self.conn
+            .prepare(
+                "SELECT id, captured_at, author, title, LENGTH(body_md)
+                 FROM website_page_revisions
+                 WHERE slug = ?1
+                 ORDER BY captured_at DESC, id DESC",
+            )
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map(params![slug], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Fetch full content of a specific revision by id.
+    pub fn get_page_revision(
+        &self,
+        slug: &str,
+        revision_id: i64,
+    ) -> Result<Option<(String, String, Option<String>, i64, String, Option<String>)>, LicenseError>
+    {
+        self.conn
+            .query_row(
+                "SELECT title, body_md, parent_slug, ord, captured_at, author
+                 FROM website_page_revisions
+                 WHERE slug = ?1 AND id = ?2",
+                params![slug, revision_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))
+    }
+
+    /// Assets with usage: (file_name, file_size, usage_count, pages_csv).
+    /// A page is counted if its body contains the literal filename substring.
+    pub fn list_website_assets_with_usage(
+        &self,
+    ) -> Result<Vec<(String, i64, i64, String)>, LicenseError> {
+        let mut stmt = self.conn
+            .prepare(
+                "SELECT a.file_name, a.file_size,
+                        (SELECT COUNT(*) FROM website_pages p
+                           WHERE p.body_md LIKE '%' || a.file_name || '%') AS usage_count,
+                        COALESCE(
+                          (SELECT GROUP_CONCAT(p.slug, ',') FROM website_pages p
+                             WHERE p.body_md LIKE '%' || a.file_name || '%'),
+                          ''
+                        ) AS pages_csv
+                 FROM website_assets a
+                 ORDER BY a.file_name",
+            )
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Rename an asset file_name and rewrite every markdown reference in page
+    /// bodies in the same transaction. Returns (renamed, pages_updated).
+    pub fn rename_website_asset(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(bool, usize), LicenseError> {
+        if old_name == new_name {
+            return Ok((true, 0));
+        }
+        let tx = self.conn.transaction()
+            .map_err(|e| LicenseError::Other(format!("DB tx: {}", e)))?;
+        // Reject if target already exists (would collide on UNIQUE).
+        let exists: bool = tx.query_row(
+            "SELECT 1 FROM website_assets WHERE file_name = ?1",
+            params![new_name], |_| Ok(true),
+        ).optional().map_err(|e| LicenseError::Other(format!("DB check: {}", e)))?.unwrap_or(false);
+        if exists {
+            return Err(LicenseError::Other("target filename already exists".into()));
+        }
+        let n_assets = tx.execute(
+            "UPDATE website_assets SET file_name = ?1 WHERE file_name = ?2",
+            params![new_name, old_name],
+        ).map_err(|e| LicenseError::Other(format!("DB rename asset: {}", e)))?;
+        if n_assets == 0 {
+            return Ok((false, 0));
+        }
+        // Rewrite markdown: match both `](old)` and `](old){...}` forms.
+        let paren_old = format!("]({})", old_name);
+        let paren_new = format!("]({})", new_name);
+        let brace_old = format!("]({}){{", old_name);
+        let brace_new = format!("]({}){{", new_name);
+        let n_pages = tx.execute(
+            "UPDATE website_pages
+             SET body_md = REPLACE(REPLACE(body_md, ?1, ?2), ?3, ?4)
+             WHERE body_md LIKE '%' || ?5 || '%'",
+            params![brace_old, brace_new, paren_old, paren_new, old_name],
+        ).map_err(|e| LicenseError::Other(format!("DB rewrite body_md: {}", e)))?;
+        tx.commit().map_err(|e| LicenseError::Other(format!("DB tx commit: {}", e)))?;
+        Ok((true, n_pages))
     }
 
     pub fn list_website_pages(
