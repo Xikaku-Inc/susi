@@ -528,6 +528,9 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
             <div class="detail-section-title">Config Revisions</div>
             <div id="wsDetailConfigs" class="machines-list"></div>
 
+            <div class="detail-section-title">Software Releases</div>
+            <div id="wsDetailReleases" class="machines-list"></div>
+
             <div id="wsDeleteRow" style="margin-top:16px;display:flex;justify-content:flex-end;">
                 <button class="small danger" onclick="deleteWorkspace()">Delete Workspace</button>
             </div>
@@ -754,6 +757,12 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
                 <input type="checkbox" id="releasePrerelease" style="accent-color:var(--accent);width:16px;height:16px;">
                 Pre-release
             </label>
+        </div>
+        <div class="form-row">
+            <label>Scope</label>
+            <select id="releaseWorkspace" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:var(--radius);font-size:13px;width:100%;">
+                <option value="">Global (all workspaces)</option>
+            </select>
         </div>
         <div class="form-row">
             <label>Asset File (zip)</label>
@@ -2320,6 +2329,10 @@ async function loadReleases() {
     const container = document.getElementById('releasesContainer');
     const endpoint = userRole === 'admin' ? '/releases' : '/updates/releases';
     try {
+        if (userRole === 'admin' && workspaces.length === 0) {
+            const wresp = await fetch(API + '/workspaces', { headers: authHeaders() });
+            if (wresp.ok) workspaces = (await wresp.json()).workspaces || [];
+        }
         const resp = await fetch(API + endpoint, {
             headers: authHeaders(),
         });
@@ -2399,6 +2412,12 @@ function renderReleases() {
             '<span style="color:var(--text2);font-size:11px;margin-left:8px;">' + formatSize(a.size) + '</span>'
         ).join('<br>');
         const pre = r.prerelease ? ' <span style="background:rgba(251,191,36,0.15);color:var(--yellow);font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;">Pre-release</span>' : '';
+        let scope = '';
+        if (r.workspace_id) {
+            const ws = workspaces.find(w => w.id === r.workspace_id);
+            const label = ws ? ws.name : r.workspace_id;
+            scope = ' <span style="background:rgba(96,165,250,0.15);color:var(--accent);font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;" title="Workspace-scoped release">' + esc(label) + '</span>';
+        }
         const dlBtns = (r.assets || []).filter(a => /\.(msi|zip)$/i.test(a.name)).map(a =>
             '<button class="small" onclick="event.stopPropagation();downloadAsset(event,\'' + esc(r.tag) + '\',\'' + esc(a.name) + '\')" title="' + esc(a.name) + ' (' + formatSize(a.size) + ')">' +
             a.name.match(/\.(msi|zip)$/i)[1].toUpperCase() + '</button>'
@@ -2415,7 +2434,7 @@ function renderReleases() {
         return '<div style="padding:10px 0;border-bottom:1px solid var(--border);" class="release-item">' +
             '<div onclick="toggleRelease(\'' + esc(r.tag) + '\')" style="display:flex;align-items:flex-start;justify-content:space-between;cursor:pointer;">' +
                 '<div>' +
-                    '<div style="font-weight:600;font-size:14px;font-family:monospace;">' + arrow + esc(r.tag) + pre + '</div>' +
+                    '<div style="font-weight:600;font-size:14px;font-family:monospace;">' + arrow + esc(r.tag) + pre + scope + '</div>' +
                     (r.name && r.name !== r.tag ? '<div style="font-size:13px;color:var(--text2);margin-left:18px;">' + esc(r.name) + '</div>' : '') +
                     '<div style="font-size:12px;color:var(--text2);margin-top:4px;margin-left:18px;">' + formatDateTime(r.published_at) + '</div>' +
                 '</div>' +
@@ -2424,6 +2443,22 @@ function renderReleases() {
             body +
         '</div>';
     }).join('');
+}
+
+async function populateReleaseWorkspaceDropdown() {
+    const sel = document.getElementById('releaseWorkspace');
+    sel.innerHTML = '<option value="">Global (all workspaces)</option>';
+    try {
+        const resp = await fetch(API + '/workspaces', { headers: authHeaders() });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        (data.workspaces || []).forEach(ws => {
+            const opt = document.createElement('option');
+            opt.value = ws.id;
+            opt.textContent = ws.name + (ws.product ? ' (' + ws.product + ')' : '');
+            sel.appendChild(opt);
+        });
+    } catch (e) {}
 }
 
 function showUploadReleaseModal() {
@@ -2435,6 +2470,7 @@ function showUploadReleaseModal() {
     document.getElementById('uploadProgress').style.display = 'none';
     document.getElementById('uploadBtn').disabled = false;
     document.getElementById('uploadReleaseModal').classList.add('visible');
+    populateReleaseWorkspaceDropdown();
     document.getElementById('releaseTag').focus();
 }
 
@@ -2447,6 +2483,7 @@ async function uploadRelease() {
     const name = document.getElementById('releaseName').value.trim();
     const body = document.getElementById('releaseBody').value;
     const prerelease = document.getElementById('releasePrerelease').checked;
+    const workspaceId = document.getElementById('releaseWorkspace').value;
     const fileInput = document.getElementById('releaseFile');
 
     if (!tag) { toast('Version tag is required', 'error'); return; }
@@ -2457,6 +2494,7 @@ async function uploadRelease() {
     formData.append('name', name);
     formData.append('body', body);
     formData.append('prerelease', prerelease ? 'true' : 'false');
+    if (workspaceId) formData.append('workspace_id', workspaceId);
     formData.append('file', fileInput.files[0]);
 
     document.getElementById('uploadBtn').disabled = true;
@@ -2611,10 +2649,40 @@ async function showWsDetail(id) {
             } catch (_) {}
         }
 
-        // Load configs
+        // Load configs and releases
         loadWsConfigs(id);
+        loadWsReleases(id);
     } catch (e) {
         toast('Error: ' + e.message, 'error');
+    }
+}
+
+async function loadWsReleases(wsId) {
+    const container = document.getElementById('wsDetailReleases');
+    try {
+        const resp = await fetch(API + '/workspaces/' + wsId + '/releases', { headers: authHeaders() });
+        if (!resp.ok) { container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load</div>'; return; }
+        const data = await resp.json();
+        const rels = data.releases || [];
+        if (rels.length === 0) {
+            container.innerHTML = '<div style="color:var(--text2);font-size:13px;">No releases available</div>';
+            return;
+        }
+        container.innerHTML = rels.map(r => {
+            const dlBtns = (r.assets || []).map(a =>
+                '<button class="small" onclick="downloadAsset(event,\'' + esc(r.tag) + '\',\'' + esc(a.name) + '\')" title="' + esc(a.name) + ' (' + formatSize(a.size) + ')">' +
+                esc(a.name) + '</button>'
+            ).join(' ');
+            const pre = r.prerelease ? ' <span style="background:rgba(251,191,36,0.15);color:var(--yellow);font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;">Pre</span>' : '';
+            return '<div class="machine-item">' +
+                '<span><strong style="font-family:monospace;">' + esc(r.tag) + '</strong>' + pre +
+                (r.name && r.name !== r.tag ? ' <span style="color:var(--text2);margin-left:6px;">' + esc(r.name) + '</span>' : '') +
+                ' <span style="color:var(--text2);margin-left:6px;font-size:11px;">' + formatDate(r.published_at) + '</span></span>' +
+                '<span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">' + (dlBtns || '<span style="color:var(--text2);font-size:12px;">no assets</span>') + '</span>' +
+            '</div>';
+        }).join('');
+    } catch (e) {
+        container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load releases</div>';
     }
 }
 

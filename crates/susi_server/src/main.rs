@@ -1974,7 +1974,8 @@ async fn handle_get_releases(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let mut releases = Vec::new();
-    for (id, tag, name, body, prerelease, created_at, _workspace_id) in &rows {
+    for (id, tag, name, body, prerelease, created_at, workspace_id) in &rows {
+        if workspace_id.is_some() { continue; }
         let assets = db.get_release_assets(*id).unwrap_or_default();
         releases.push(serde_json::json!({
             "tag": tag,
@@ -2000,9 +2001,33 @@ async fn handle_download_asset(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     // Allow either license key or bearer auth (JWT or API token)
     let license_ok = validate_license_key(&state, &headers).is_ok();
-    let bearer_ok = validate_principal(&headers, &state).is_ok();
-    if !license_ok && !bearer_ok {
+    let principal_opt = validate_principal(&headers, &state).ok();
+    if !license_ok && principal_opt.is_none() {
         return Err(error_response(StatusCode::UNAUTHORIZED, "Authentication required"));
+    }
+
+    // Workspace-scoped releases are only downloadable by site admins or members
+    // of that workspace. License-only and non-member bearer tokens are denied.
+    let scoped_ws = {
+        let db = state.db.lock().unwrap();
+        db.get_release_workspace_id(&tag)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .flatten()
+    };
+    if let Some(ws_id) = scoped_ws {
+        let principal = principal_opt.as_ref()
+            .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Workspace membership required"))?;
+        let db = state.db.lock().unwrap();
+        let is_admin = db.get_user_role(&principal.username)
+            .map(|r| r == "admin")
+            .unwrap_or(false);
+        if !is_admin {
+            let role = db.get_workspace_member_role(&ws_id, &principal.username)
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+            if role.is_none() {
+                return Err(error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"));
+            }
+        }
     }
 
     // Reject traversal / empty / nul before building the path, and confirm the

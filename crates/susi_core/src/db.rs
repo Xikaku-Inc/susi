@@ -1741,6 +1741,20 @@ impl LicenseDb {
         }
     }
 
+    /// Return `Some(workspace_id_or_none)` if the tag exists, else `None`.
+    /// Inner `Option` is `Some(ws_id)` for workspace-scoped, `None` for global.
+    pub fn get_release_workspace_id(&self, tag: &str) -> Result<Option<Option<String>>, LicenseError> {
+        match self.conn.query_row(
+            "SELECT workspace_id FROM releases WHERE tag = ?1",
+            params![tag],
+            |r| r.get::<_, Option<String>>(0),
+        ) {
+            Ok(ws) => Ok(Some(ws)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(LicenseError::Other(format!("DB query: {}", e))),
+        }
+    }
+
     pub fn delete_release(&self, tag: &str) -> Result<bool, LicenseError> {
         let rows = self.conn
             .execute("DELETE FROM releases WHERE tag = ?1", params![tag])
@@ -3322,5 +3336,17 @@ mod tests {
         let other = db.list_releases_for_workspace("ws-other").unwrap();
         assert_eq!(other.len(), 1);
         assert_eq!(other[0].1, "v1.0");
+    }
+
+    #[test]
+    fn test_get_release_workspace_id() {
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        db.insert_release("v1.0", "Global", "", false, None).unwrap();
+        db.insert_release("v1.1", "Scoped", "", false, Some("ws-1")).unwrap();
+
+        assert_eq!(db.get_release_workspace_id("v1.0").unwrap(), Some(None));
+        assert_eq!(db.get_release_workspace_id("v1.1").unwrap(), Some(Some("ws-1".to_string())));
+        assert_eq!(db.get_release_workspace_id("nonexistent").unwrap(), None);
     }
 }
