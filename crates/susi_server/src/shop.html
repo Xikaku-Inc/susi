@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shop — Xikaku</title>
+<meta name="description" content="Order Xikaku sensors directly — shipped from our Los Angeles office.">
+<script>
+(function () {
+    const t = localStorage.getItem('susi_theme') || 'system';
+    if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+    else if (t === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+        document.documentElement.setAttribute('data-theme', 'light');
+    }
+})();
+</script>
+<style>
+:root {
+    --bg: #0f1115;
+    --bg2: #161922;
+    --bg3: #1d212c;
+    --border: #262b38;
+    --text1: #e6e8ec;
+    --text2: #9aa0aa;
+    --accent: #6aa9ff;
+    --accent-soft: rgba(106,169,255,0.15);
+    --danger: #ff6b6b;
+    --ok: #4caf83;
+    --radius: 6px;
+}
+:root[data-theme="light"] {
+    --bg: #ffffff;
+    --bg2: #f5f6f8;
+    --bg3: #eceef2;
+    --border: #d8dbe1;
+    --text1: #1a1d23;
+    --text2: #5c6470;
+    --accent: #2d6fdc;
+    --accent-soft: rgba(45,111,220,0.12);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text1); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; line-height: 1.5; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+button { font-family: inherit; font-size: 13px; cursor: pointer; border: 1px solid var(--border); background: var(--bg2); color: var(--text1); padding: 8px 14px; border-radius: var(--radius); }
+button:hover { background: var(--bg3); }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.primary:hover { filter: brightness(1.1); }
+button.danger { color: var(--danger); border-color: var(--danger); background: transparent; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+input, select { font-family: inherit; font-size: 13px; background: var(--bg2); color: var(--text1); border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 10px; }
+
+.header { display: flex; justify-content: space-between; align-items: center; padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--bg2); }
+.brand { font-weight: 600; font-size: 15px; color: var(--text1); }
+.header nav a { color: var(--text2); margin-left: 20px; font-size: 13px; }
+.header nav a:hover { color: var(--text1); text-decoration: none; }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.cart-btn { position: relative; }
+.cart-badge { display: inline-block; min-width: 18px; height: 18px; line-height: 18px; text-align: center; background: var(--accent); color: #fff; border-radius: 9px; font-size: 11px; font-weight: 600; margin-left: 6px; padding: 0 6px; }
+
+.container { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 20px; }
+.card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
+.card-img { aspect-ratio: 4 / 3; background: var(--bg3); display: flex; align-items: center; justify-content: center; color: var(--text2); overflow: hidden; }
+.card-img img { width: 100%; height: 100%; object-fit: cover; }
+.card-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.card-title { font-weight: 600; font-size: 14px; color: var(--text1); }
+.card-price { color: var(--text2); font-size: 13px; }
+.card-actions { margin-top: auto; display: flex; gap: 8px; }
+.card-actions button { flex: 1; }
+
+.detail { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+@media (max-width: 800px) { .detail { grid-template-columns: 1fr; } }
+.detail-img { background: var(--bg3); border-radius: 8px; aspect-ratio: 4 / 3; overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--text2); }
+.detail-img img { width: 100%; height: 100%; object-fit: cover; }
+.detail-title { font-size: 22px; font-weight: 600; margin: 0 0 8px 0; }
+.detail-price { font-size: 18px; color: var(--text1); margin: 0 0 20px 0; }
+.detail-desc { color: var(--text1); white-space: pre-wrap; }
+.detail-buy { display: flex; align-items: center; gap: 10px; margin-top: 24px; }
+.detail-buy input { width: 70px; text-align: center; }
+
+.cart-drawer { position: fixed; top: 0; right: 0; height: 100vh; width: 380px; max-width: 100vw; background: var(--bg2); border-left: 1px solid var(--border); transform: translateX(100%); transition: transform 0.2s ease; display: flex; flex-direction: column; z-index: 100; }
+.cart-drawer.open { transform: translateX(0); }
+.cart-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.cart-head h3 { margin: 0; font-size: 15px; }
+.cart-body { flex: 1; overflow-y: auto; padding: 12px 18px; }
+.cart-item { display: grid; grid-template-columns: 48px 1fr auto; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); align-items: center; }
+.cart-item-img { width: 48px; height: 48px; background: var(--bg3); border-radius: 4px; overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--text2); font-size: 11px; }
+.cart-item-img img { width: 100%; height: 100%; object-fit: cover; }
+.cart-item-title { font-size: 13px; font-weight: 500; }
+.cart-item-meta { font-size: 12px; color: var(--text2); display: flex; gap: 8px; align-items: center; margin-top: 2px; }
+.cart-item-meta input { width: 54px; padding: 4px 8px; font-size: 12px; }
+.cart-item-price { font-size: 13px; color: var(--text1); }
+.cart-foot { padding: 14px 18px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
+.cart-total { display: flex; justify-content: space-between; font-weight: 600; }
+.cart-hint { font-size: 11px; color: var(--text2); }
+
+.cart-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.35); opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 99; }
+.cart-overlay.open { opacity: 1; pointer-events: auto; }
+
+.empty-state { text-align: center; padding: 60px 20px; color: var(--text2); }
+.toast { position: fixed; top: 16px; right: 16px; background: var(--bg3); border: 1px solid var(--border); padding: 10px 14px; border-radius: var(--radius); font-size: 13px; z-index: 200; box-shadow: 0 4px 12px rgba(0,0,0,0.25); }
+.toast.err { border-color: var(--danger); color: var(--danger); }
+.error-banner { background: rgba(255,107,107,0.1); border: 1px solid var(--danger); color: var(--danger); padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <div>
+        <a href="/site" class="brand">Xikaku</a>
+        <nav style="display:inline-block;">
+            <a href="/site">Home</a>
+            <a href="/shop" style="color:var(--text1);">Shop</a>
+            <a href="/docs">Docs</a>
+        </nav>
+    </div>
+    <div class="header-right">
+        <button onclick="openCart()" class="cart-btn">Cart<span id="cartBadge" class="cart-badge" style="display:none;">0</span></button>
+    </div>
+</div>
+
+<div class="container" id="main"></div>
+
+<div class="cart-overlay" id="cartOverlay" onclick="closeCart()"></div>
+<div class="cart-drawer" id="cartDrawer">
+    <div class="cart-head">
+        <h3>Your cart</h3>
+        <button onclick="closeCart()">&times;</button>
+    </div>
+    <div class="cart-body" id="cartBody"></div>
+    <div class="cart-foot">
+        <div id="cartShipRow" style="display:none;">
+            <label style="display:block;font-size:12px;color:var(--text2);margin-bottom:4px;">Ship to</label>
+            <select id="cartCountry" style="width:100%;" onchange="persistCountry()"></select>
+        </div>
+        <div class="cart-total"><span>Subtotal</span><span id="cartTotal">$0.00</span></div>
+        <div class="cart-hint">Tax + shipping calculated at checkout.</div>
+        <button class="primary" id="checkoutBtn" onclick="checkout()" disabled>Checkout</button>
+        <div id="cartError" class="error-banner" style="display:none;"></div>
+    </div>
+</div>
+
+<script>
+const API = '/api/v1/shop';
+let products = [];
+let productBySku = new Map();
+
+function escHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtMoney(cents, currency) {
+    const amount = (cents / 100).toFixed(2);
+    const cur = (currency || 'usd').toUpperCase();
+    const sym = { USD: '$', EUR: '€', GBP: '£', JPY: '¥' }[cur] || '';
+    return sym ? sym + amount : amount + ' ' + cur;
+}
+function toast(msg, kind) {
+    const el = document.createElement('div');
+    el.className = 'toast' + (kind === 'err' ? ' err' : '');
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 3000);
+}
+
+// ---------- Cart ----------
+function getCart() {
+    try { return JSON.parse(localStorage.getItem('susi_cart') || '[]'); } catch (e) { return []; }
+}
+function setCart(c) { localStorage.setItem('susi_cart', JSON.stringify(c)); renderCartBadge(); renderCart(); }
+function addToCart(sku, qty) {
+    qty = Math.max(1, parseInt(qty, 10) || 1);
+    const cart = getCart();
+    const row = cart.find(r => r.sku === sku);
+    if (row) row.qty += qty; else cart.push({ sku, qty });
+    setCart(cart);
+    toast('Added to cart');
+}
+function setQty(sku, qty) {
+    qty = parseInt(qty, 10);
+    let cart = getCart();
+    if (!isFinite(qty) || qty <= 0) cart = cart.filter(r => r.sku !== sku);
+    else cart = cart.map(r => r.sku === sku ? { ...r, qty } : r);
+    setCart(cart);
+}
+function removeFromCart(sku) { setCart(getCart().filter(r => r.sku !== sku)); }
+function renderCartBadge() {
+    const total = getCart().reduce((s, r) => s + r.qty, 0);
+    const b = document.getElementById('cartBadge');
+    if (total > 0) { b.style.display = ''; b.textContent = total; } else { b.style.display = 'none'; }
+}
+function renderCart() {
+    const cart = getCart();
+    const body = document.getElementById('cartBody');
+    const btn = document.getElementById('checkoutBtn');
+    if (!cart.length) {
+        body.innerHTML = '<div class="empty-state">Your cart is empty.</div>';
+        document.getElementById('cartTotal').textContent = fmtMoney(0, 'usd');
+        btn.disabled = true;
+        document.getElementById('cartShipRow').style.display = 'none';
+        return;
+    }
+    btn.disabled = false;
+    let subtotal = 0;
+    let currency = 'usd';
+    const html = cart.map(r => {
+        const p = productBySku.get(r.sku);
+        if (!p) return '<div class="cart-item"><div></div><div>Unknown SKU: ' + escHtml(r.sku) + ' <a href="#" onclick="removeFromCart(\'' + escHtml(r.sku) + '\');return false;">remove</a></div><div></div></div>';
+        subtotal += p.price_cents * r.qty;
+        currency = p.currency;
+        const img = p.image_url ? '<img src="' + escHtml(p.image_url) + '" alt="">' : '';
+        return '<div class="cart-item">'
+            + '<div class="cart-item-img">' + img + '</div>'
+            + '<div>'
+            +   '<div class="cart-item-title">' + escHtml(p.title) + '</div>'
+            +   '<div class="cart-item-meta">'
+            +     '<input type="number" min="1" value="' + r.qty + '" onchange="setQty(\'' + escHtml(r.sku) + '\', this.value)">'
+            +     '<button class="danger" onclick="removeFromCart(\'' + escHtml(r.sku) + '\')">remove</button>'
+            +   '</div>'
+            + '</div>'
+            + '<div class="cart-item-price">' + escHtml(fmtMoney(p.price_cents * r.qty, p.currency)) + '</div>'
+            + '</div>';
+    }).join('');
+    body.innerHTML = html;
+    document.getElementById('cartTotal').textContent = fmtMoney(subtotal, currency);
+    document.getElementById('cartShipRow').style.display = '';
+    ensureCountrySelect();
+}
+
+// Minimal ISO-3166-1 alpha-2 subset covering the common shipping destinations.
+// Keep in sync with COMMON_SHIPPING_COUNTRIES in shop.rs.
+const COUNTRIES = [
+    ['US','United States'],['CA','Canada'],['GB','United Kingdom'],['IE','Ireland'],
+    ['FR','France'],['DE','Germany'],['IT','Italy'],['ES','Spain'],['NL','Netherlands'],
+    ['BE','Belgium'],['LU','Luxembourg'],['AT','Austria'],['CH','Switzerland'],
+    ['DK','Denmark'],['SE','Sweden'],['NO','Norway'],['FI','Finland'],['IS','Iceland'],
+    ['PT','Portugal'],['PL','Poland'],['CZ','Czechia'],['HU','Hungary'],['GR','Greece'],
+    ['JP','Japan'],['KR','South Korea'],['CN','China'],['TW','Taiwan'],['HK','Hong Kong'],
+    ['SG','Singapore'],['MY','Malaysia'],['TH','Thailand'],['VN','Vietnam'],['ID','Indonesia'],
+    ['PH','Philippines'],['AU','Australia'],['NZ','New Zealand'],['IN','India'],
+    ['AE','UAE'],['SA','Saudi Arabia'],['IL','Israel'],['TR','Türkiye'],['ZA','South Africa'],
+    ['BR','Brazil'],['MX','Mexico'],['AR','Argentina'],['CL','Chile'],['CO','Colombia'],
+];
+function ensureCountrySelect() {
+    const sel = document.getElementById('cartCountry');
+    if (sel.options.length) return;
+    const saved = localStorage.getItem('susi_ship_country') || 'US';
+    sel.innerHTML = COUNTRIES.map(([c, n]) => '<option value="' + c + '"' + (c === saved ? ' selected' : '') + '>' + n + '</option>').join('');
+}
+function persistCountry() {
+    localStorage.setItem('susi_ship_country', document.getElementById('cartCountry').value);
+}
+function openCart() {
+    document.getElementById('cartDrawer').classList.add('open');
+    document.getElementById('cartOverlay').classList.add('open');
+    document.getElementById('cartError').style.display = 'none';
+}
+function closeCart() {
+    document.getElementById('cartDrawer').classList.remove('open');
+    document.getElementById('cartOverlay').classList.remove('open');
+}
+
+async function checkout() {
+    const cart = getCart();
+    if (!cart.length) return;
+    const country = document.getElementById('cartCountry').value;
+    const btn = document.getElementById('checkoutBtn');
+    const err = document.getElementById('cartError');
+    err.style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = 'Redirecting…';
+    try {
+        const resp = await fetch(API + '/checkout', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ items: cart, destination_country: country }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        if (!data.url) throw new Error('Missing redirect URL');
+        window.location = data.url;
+    } catch (e) {
+        err.textContent = e.message || 'Checkout failed';
+        err.style.display = '';
+        btn.disabled = false;
+        btn.textContent = 'Checkout';
+    }
+}
+
+// ---------- Data ----------
+async function loadProducts() {
+    try {
+        const resp = await fetch(API + '/products');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        products = data.products || [];
+        productBySku = new Map(products.map(p => [p.sku, p]));
+    } catch (e) {
+        products = [];
+        productBySku = new Map();
+        toast('Failed to load products: ' + e.message, 'err');
+    }
+}
+
+// ---------- Views ----------
+function renderGrid() {
+    const main = document.getElementById('main');
+    if (!products.length) {
+        main.innerHTML = '<div class="empty-state"><h2>Coming soon</h2><p>Products will be available here shortly.</p></div>';
+        return;
+    }
+    const cards = products.map(p => {
+        const img = p.image_url ? '<img src="' + escHtml(p.image_url) + '" alt="">' : '<div>no image</div>';
+        return '<div class="card">'
+            + '<a class="card-img" href="/shop/' + encodeURIComponent(p.sku) + '">' + img + '</a>'
+            + '<div class="card-body">'
+            +   '<div class="card-title"><a href="/shop/' + encodeURIComponent(p.sku) + '" style="color:var(--text1);">' + escHtml(p.title) + '</a></div>'
+            +   '<div class="card-price">' + escHtml(fmtMoney(p.price_cents, p.currency)) + '</div>'
+            +   '<div class="card-actions">'
+            +     '<button class="primary" onclick="addToCart(\'' + escHtml(p.sku) + '\', 1)">Add to cart</button>'
+            +   '</div>'
+            + '</div>'
+            + '</div>';
+    }).join('');
+    main.innerHTML = '<h1 style="font-size:22px;margin:0 0 24px 0;">Shop</h1><div class="grid">' + cards + '</div>';
+}
+
+function renderDetail(sku) {
+    const main = document.getElementById('main');
+    const p = productBySku.get(sku);
+    if (!p) {
+        main.innerHTML = '<div class="empty-state"><h2>Product not found</h2><p><a href="/shop">Back to shop</a></p></div>';
+        return;
+    }
+    const img = p.image_url ? '<img src="' + escHtml(p.image_url) + '" alt="">' : 'no image';
+    main.innerHTML =
+        '<p style="margin-top:0;"><a href="/shop">&larr; Back to shop</a></p>'
+        + '<div class="detail">'
+        +   '<div class="detail-img">' + img + '</div>'
+        +   '<div>'
+        +     '<h1 class="detail-title">' + escHtml(p.title) + '</h1>'
+        +     '<p class="detail-price">' + escHtml(fmtMoney(p.price_cents, p.currency)) + '</p>'
+        +     '<div class="detail-desc">' + escHtml(p.description_md || '') + '</div>'
+        +     '<div class="detail-buy">'
+        +       '<input id="detailQty" type="number" min="1" value="1">'
+        +       '<button class="primary" onclick="addToCart(\'' + escHtml(p.sku) + '\', document.getElementById(\'detailQty\').value)">Add to cart</button>'
+        +     '</div>'
+        +   '</div>'
+        + '</div>';
+}
+
+function renderSuccess() {
+    const params = new URLSearchParams(location.search);
+    const sid = params.get('session_id') || '';
+    localStorage.removeItem('susi_cart');
+    renderCartBadge();
+    document.getElementById('main').innerHTML =
+        '<div class="empty-state">'
+        +   '<h1>Thank you!</h1>'
+        +   '<p>Your order has been placed. A receipt will arrive in your inbox shortly.</p>'
+        +   (sid ? '<p style="color:var(--text2);font-size:12px;">Ref: ' + escHtml(sid) + '</p>' : '')
+        +   '<p><a href="/shop">Continue shopping</a> &middot; <a href="/site">Home</a></p>'
+        + '</div>';
+}
+
+function renderCancel() {
+    document.getElementById('main').innerHTML =
+        '<div class="empty-state">'
+        +   '<h1>Checkout cancelled</h1>'
+        +   '<p>Your cart is still saved. No charge was made.</p>'
+        +   '<p><button class="primary" onclick="openCart()">Review cart</button> &nbsp; <a href="/shop">Back to shop</a></p>'
+        + '</div>';
+}
+
+// ---------- Routing ----------
+async function route() {
+    const path = location.pathname.replace(/\/+$/, '');
+    if (path === '/shop/success') { renderSuccess(); return; }
+    if (path === '/shop/cancel') { renderCancel(); return; }
+    await loadProducts();
+    renderCartBadge();
+    renderCart();
+    const m = path.match(/^\/shop\/([^\/]+)$/);
+    if (m) renderDetail(decodeURIComponent(m[1]));
+    else renderGrid();
+}
+
+// Intercept intra-shop link clicks for SPA nav.
+document.addEventListener('click', (e) => {
+    const a = e.target.closest && e.target.closest('a[href^="/shop"]');
+    if (!a) return;
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    const href = a.getAttribute('href');
+    if (!href || href.startsWith('/shop#')) return;
+    e.preventDefault();
+    history.pushState({}, '', href);
+    route();
+});
+window.addEventListener('popstate', route);
+route();
+</script>
+</body>
+</html>

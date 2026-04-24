@@ -268,7 +268,36 @@ impl LicenseDb {
                 last_used_at TEXT,
                 revoked_at TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(username);",
+            CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(username);
+
+            CREATE TABLE IF NOT EXISTS shop_products (
+                sku             TEXT PRIMARY KEY,
+                title           TEXT NOT NULL,
+                description_md  TEXT NOT NULL DEFAULT '',
+                price_cents     INTEGER NOT NULL,
+                currency        TEXT NOT NULL DEFAULT 'usd',
+                image_asset     TEXT,
+                tax_code        TEXT NOT NULL DEFAULT 'txcd_99999999',
+                active          INTEGER NOT NULL DEFAULT 1,
+                ord             INTEGER NOT NULL DEFAULT 0,
+                updated_at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_shop_products_active_ord
+                ON shop_products(active, ord);
+
+            CREATE TABLE IF NOT EXISTS shop_shipping_rates (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                label             TEXT NOT NULL,
+                amount_cents      INTEGER NOT NULL,
+                currency          TEXT NOT NULL DEFAULT 'usd',
+                delivery_min_days INTEGER,
+                delivery_max_days INTEGER,
+                regions           TEXT NOT NULL DEFAULT '[\"*\"]',
+                active            INTEGER NOT NULL DEFAULT 1,
+                ord               INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_shop_shipping_rates_active_ord
+                ON shop_shipping_rates(active, ord);",
             )
             .map_err(|e| LicenseError::Other(format!("DB init: {}", e)))?;
         self.migrate()?;
@@ -2592,6 +2621,222 @@ impl LicenseDb {
                 params![file_name],
             )
             .map_err(|e| LicenseError::Other(format!("DB delete website asset: {}", e)))?;
+        Ok(n > 0)
+    }
+
+    // ---------------------------------------------------------------------
+    // Shop: products
+    //
+    // Tuple layout: (sku, title, description_md, price_cents, currency,
+    //                image_asset, tax_code, active, ord, updated_at)
+    // ---------------------------------------------------------------------
+
+    pub fn list_products(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<(String, String, String, i64, String, Option<String>, String, bool, i64, String)>, LicenseError> {
+        let sql = if active_only {
+            "SELECT sku, title, description_md, price_cents, currency, image_asset, tax_code, active, ord, updated_at
+             FROM shop_products WHERE active = 1 ORDER BY ord, title"
+        } else {
+            "SELECT sku, title, description_md, price_cents, currency, image_asset, tax_code, active, ord, updated_at
+             FROM shop_products ORDER BY ord, title"
+        };
+        let mut stmt = self.conn
+            .prepare(sql)
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7).map(|v| v != 0)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn get_product(
+        &self,
+        sku: &str,
+    ) -> Result<Option<(String, String, String, i64, String, Option<String>, String, bool, i64, String)>, LicenseError> {
+        match self.conn.query_row(
+            "SELECT sku, title, description_md, price_cents, currency, image_asset, tax_code, active, ord, updated_at
+             FROM shop_products WHERE sku = ?1",
+            params![sku],
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, i64>(7).map(|v| v != 0)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, String>(9)?,
+            )),
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(LicenseError::Other(format!("DB query: {}", e))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_product(
+        &self,
+        sku: &str,
+        title: &str,
+        description_md: &str,
+        price_cents: i64,
+        currency: &str,
+        image_asset: Option<&str>,
+        tax_code: &str,
+        active: bool,
+        ord: i64,
+    ) -> Result<(), LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO shop_products
+               (sku, title, description_md, price_cents, currency, image_asset, tax_code, active, ord, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(sku) DO UPDATE SET
+               title = excluded.title,
+               description_md = excluded.description_md,
+               price_cents = excluded.price_cents,
+               currency = excluded.currency,
+               image_asset = excluded.image_asset,
+               tax_code = excluded.tax_code,
+               active = excluded.active,
+               ord = excluded.ord,
+               updated_at = excluded.updated_at",
+            params![
+                sku, title, description_md, price_cents, currency,
+                image_asset, tax_code, active as i64, ord, now,
+            ],
+        )
+        .map_err(|e| LicenseError::Other(format!("DB upsert product: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn delete_product(&self, sku: &str) -> Result<bool, LicenseError> {
+        let n = self.conn
+            .execute("DELETE FROM shop_products WHERE sku = ?1", params![sku])
+            .map_err(|e| LicenseError::Other(format!("DB delete product: {}", e)))?;
+        Ok(n > 0)
+    }
+
+    // ---------------------------------------------------------------------
+    // Shop: shipping rates
+    //
+    // Tuple layout: (id, label, amount_cents, currency, delivery_min_days,
+    //                delivery_max_days, regions_json, active, ord)
+    // ---------------------------------------------------------------------
+
+    pub fn list_shipping_rates(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<(i64, String, i64, String, Option<i64>, Option<i64>, String, bool, i64)>, LicenseError> {
+        let sql = if active_only {
+            "SELECT id, label, amount_cents, currency, delivery_min_days, delivery_max_days, regions, active, ord
+             FROM shop_shipping_rates WHERE active = 1 ORDER BY ord, amount_cents"
+        } else {
+            "SELECT id, label, amount_cents, currency, delivery_min_days, delivery_max_days, regions, active, ord
+             FROM shop_shipping_rates ORDER BY ord, amount_cents"
+        };
+        let mut stmt = self.conn
+            .prepare(sql)
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7).map(|v| v != 0)?,
+                    r.get::<_, i64>(8)?,
+                ))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_shipping_rate(
+        &self,
+        label: &str,
+        amount_cents: i64,
+        currency: &str,
+        delivery_min_days: Option<i64>,
+        delivery_max_days: Option<i64>,
+        regions_json: &str,
+        active: bool,
+        ord: i64,
+    ) -> Result<i64, LicenseError> {
+        self.conn.execute(
+            "INSERT INTO shop_shipping_rates
+               (label, amount_cents, currency, delivery_min_days, delivery_max_days, regions, active, ord)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                label, amount_cents, currency,
+                delivery_min_days, delivery_max_days, regions_json,
+                active as i64, ord,
+            ],
+        )
+        .map_err(|e| LicenseError::Other(format!("DB insert shipping rate: {}", e)))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_shipping_rate(
+        &self,
+        id: i64,
+        label: &str,
+        amount_cents: i64,
+        currency: &str,
+        delivery_min_days: Option<i64>,
+        delivery_max_days: Option<i64>,
+        regions_json: &str,
+        active: bool,
+        ord: i64,
+    ) -> Result<bool, LicenseError> {
+        let n = self.conn.execute(
+            "UPDATE shop_shipping_rates
+               SET label = ?2, amount_cents = ?3, currency = ?4,
+                   delivery_min_days = ?5, delivery_max_days = ?6,
+                   regions = ?7, active = ?8, ord = ?9
+             WHERE id = ?1",
+            params![
+                id, label, amount_cents, currency,
+                delivery_min_days, delivery_max_days, regions_json,
+                active as i64, ord,
+            ],
+        )
+        .map_err(|e| LicenseError::Other(format!("DB update shipping rate: {}", e)))?;
+        Ok(n > 0)
+    }
+
+    pub fn delete_shipping_rate(&self, id: i64) -> Result<bool, LicenseError> {
+        let n = self.conn
+            .execute("DELETE FROM shop_shipping_rates WHERE id = ?1", params![id])
+            .map_err(|e| LicenseError::Other(format!("DB delete shipping rate: {}", e)))?;
         Ok(n > 0)
     }
 }

@@ -1,6 +1,7 @@
 mod docs;
 mod website;
 mod email;
+mod shop;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -84,6 +85,29 @@ struct Cli {
     /// links in outbound email. Must include scheme, e.g. `https://susi.lp-research.com`.
     #[arg(long, env = "SUSI_MAGIC_LINK_BASE_URL", default_value = "")]
     magic_link_base_url: String,
+
+    // -------- Shop / Stripe --------
+    //
+    // Both empty ⇒ shop checkout + webhook endpoints respond with 503.
+    // Product listing remains available so product pages still render.
+
+    /// Stripe secret key (sk_live_… or sk_test_…). Empty disables checkout.
+    #[arg(long, env = "STRIPE_SECRET_KEY", default_value = "")]
+    stripe_secret_key: String,
+
+    /// Stripe webhook endpoint signing secret (whsec_…). Empty disables webhook verification.
+    #[arg(long, env = "STRIPE_WEBHOOK_SECRET", default_value = "")]
+    stripe_webhook_secret: String,
+
+    /// Public URL prefix used for Stripe success_url / cancel_url. Defaults
+    /// to `magic_link_base_url` when empty. Must include scheme.
+    #[arg(long, env = "SUSI_SHOP_BASE_URL", default_value = "")]
+    shop_base_url: String,
+
+    /// Where "new order" email notifications are sent after a successful
+    /// checkout. Empty = don't send. Falls back to smtp_from_addr if blank.
+    #[arg(long, env = "SUSI_SHOP_NOTIFY_ADDR", default_value = "")]
+    shop_notify_addr: String,
 }
 
 struct AppState {
@@ -94,6 +118,11 @@ struct AppState {
     login_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     email: Option<EmailService>,
     magic_link_base_url: String,
+    stripe_secret_key: String,
+    stripe_webhook_secret: String,
+    shop_base_url: String,
+    shop_notify_addr: String,
+    http: reqwest::Client,
 }
 
 // Magic-link TTL: long enough for a user to switch to their mail client and
@@ -2803,6 +2832,29 @@ async fn main() -> Result<()> {
         log::warn!("SMTP is configured but --magic-link-base-url is empty; magic-link login will NOT be enforced");
     }
 
+    if cli.stripe_secret_key.is_empty() {
+        log::info!("Stripe not configured — /api/v1/shop/checkout will respond 503");
+    } else {
+        log::info!(
+            "Stripe configured (key prefix: {})",
+            &cli.stripe_secret_key[..cli.stripe_secret_key.len().min(8)],
+        );
+        if cli.stripe_webhook_secret.is_empty() {
+            log::warn!("STRIPE_SECRET_KEY is set but STRIPE_WEBHOOK_SECRET is not — webhook will reject all events");
+        }
+    }
+
+    let shop_notify_addr = if !cli.shop_notify_addr.is_empty() {
+        cli.shop_notify_addr.clone()
+    } else {
+        cli.smtp_from_addr.clone()
+    };
+
+    let http = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(15))
+        .build()
+        .context("Failed to build HTTP client")?;
+
     let state = Arc::new(AppState {
         db: Mutex::new(db),
         private_key,
@@ -2811,6 +2863,11 @@ async fn main() -> Result<()> {
         login_attempts: Mutex::new(HashMap::new()),
         email: email_service,
         magic_link_base_url: cli.magic_link_base_url.clone(),
+        stripe_secret_key: cli.stripe_secret_key,
+        stripe_webhook_secret: cli.stripe_webhook_secret,
+        shop_base_url: if cli.shop_base_url.is_empty() { cli.magic_link_base_url.clone() } else { cli.shop_base_url },
+        shop_notify_addr,
+        http,
     });
 
     let app = Router::new()
@@ -2966,6 +3023,37 @@ async fn main() -> Result<()> {
         .route(
             "/api/v1/website/assets/{file}/rename",
             post(website::handle_rename_asset),
+        )
+        // ---- Shop ----
+        // Public HTML shell — same shell serves /shop, /shop/{sku}, /shop/success, /shop/cancel.
+        .route("/shop", get(shop::handle_shop_page))
+        .route("/shop/success", get(shop::handle_shop_page))
+        .route("/shop/cancel", get(shop::handle_shop_page))
+        .route("/shop/{sku}", get(shop::handle_shop_page))
+        // Public JSON API
+        .route("/api/v1/shop/products", get(shop::handle_list_products))
+        .route("/api/v1/shop/products/{sku}", get(shop::handle_get_product))
+        .route("/api/v1/shop/checkout", post(shop::handle_create_checkout_session))
+        .route("/api/v1/shop/webhook", post(shop::handle_stripe_webhook))
+        // Admin (JWT)
+        .route(
+            "/api/v1/shop/admin/products",
+            get(shop::handle_admin_list_products),
+        )
+        .route(
+            "/api/v1/shop/admin/products/{sku}",
+            axum::routing::put(shop::handle_upsert_product)
+                .delete(shop::handle_delete_product),
+        )
+        .route(
+            "/api/v1/shop/admin/shipping_rates",
+            get(shop::handle_list_shipping_rates_admin)
+                .post(shop::handle_create_shipping_rate),
+        )
+        .route(
+            "/api/v1/shop/admin/shipping_rates/{id}",
+            axum::routing::put(shop::handle_update_shipping_rate)
+                .delete(shop::handle_delete_shipping_rate),
         )
         .with_state(state);
 

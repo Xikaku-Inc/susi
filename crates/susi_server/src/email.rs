@@ -114,6 +114,29 @@ impl EmailService {
             .context("SMTP send failed")?;
         Ok(())
     }
+
+    pub async fn send_order_notification(
+        &self,
+        to_addr: &str,
+        subject: &str,
+        text: &str,
+    ) -> Result<()> {
+        let to: Mailbox = to_addr
+            .parse()
+            .with_context(|| format!("Invalid recipient address: {}", to_addr))?;
+        let email = Message::builder()
+            .from(self.cfg.from.clone())
+            .to(to)
+            .subject(subject.to_string())
+            .singlepart(
+                lettre::message::SinglePart::builder()
+                    .header(ContentType::TEXT_PLAIN)
+                    .body(text.to_string()),
+            )
+            .context("Failed to build order-notification email")?;
+        self.transport.send(email).await.context("SMTP send failed")?;
+        Ok(())
+    }
 }
 
 fn html_escape(s: &str) -> String {

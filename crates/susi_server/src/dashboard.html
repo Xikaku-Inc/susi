@@ -670,6 +670,126 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
     </div>
 </div><!-- /page-licenses -->
 
+<!-- Shop page -->
+<div id="page-shop" class="dash-page">
+    <div style="margin-top:32px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;">
+        <h2 style="font-size:16px;font-weight:600;">Shop — Products</h2>
+        <button onclick="showProductModal()">+ New Product</button>
+    </div>
+    <div class="card" style="padding:0;">
+        <table style="width:100%;" id="shopProductsTable">
+            <thead>
+                <tr>
+                    <th style="width:56px;">Image</th>
+                    <th>SKU</th>
+                    <th>Title</th>
+                    <th style="width:120px;">Price</th>
+                    <th style="width:100px;">Active</th>
+                    <th style="width:80px;">Ord</th>
+                    <th style="width:160px;"></th>
+                </tr>
+            </thead>
+            <tbody id="shopProductsBody">
+                <tr><td colspan="7" class="empty-state"><p>Loading...</p></td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div style="margin-top:40px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;">
+        <h2 style="font-size:16px;font-weight:600;">Shipping Rates</h2>
+        <button onclick="showShippingRateModal()">+ New Rate</button>
+    </div>
+    <div class="card" style="padding:0;">
+        <table style="width:100%;" id="shopRatesTable">
+            <thead>
+                <tr>
+                    <th>Label</th>
+                    <th style="width:140px;">Amount</th>
+                    <th>Regions</th>
+                    <th style="width:140px;">Delivery (days)</th>
+                    <th style="width:100px;">Active</th>
+                    <th style="width:160px;"></th>
+                </tr>
+            </thead>
+            <tbody id="shopRatesBody">
+                <tr><td colspan="6" class="empty-state"><p>Loading...</p></td></tr>
+            </tbody>
+        </table>
+    </div>
+    <p style="margin-top:16px;font-size:12px;color:var(--text2);">
+        Tip: use <code>*</code> as a region for "worldwide". Admin fields map directly to Stripe's <code>shipping_options</code>.
+    </p>
+</div><!-- /page-shop -->
+
+<!-- Product Modal -->
+<div id="productModal" class="modal-overlay" onclick="if(event.target===this)closeProductModal()">
+    <div class="modal">
+        <h2 id="productModalTitle">New Product</h2>
+        <div class="form-row">
+            <label>SKU</label>
+            <input type="text" id="productSku" placeholder="imu-mini">
+        </div>
+        <div class="form-row">
+            <label>Title</label>
+            <input type="text" id="productTitle" placeholder="IMU Mini">
+        </div>
+        <div class="form-row">
+            <label>Description (Markdown)</label>
+            <textarea id="productDesc" rows="4" style="width:100%;"></textarea>
+        </div>
+        <div class="form-row" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div><label>Price (cents)</label><input type="number" id="productPrice" min="0" value="0"></div>
+            <div><label>Currency</label><input type="text" id="productCurrency" value="usd" maxlength="3"></div>
+        </div>
+        <div class="form-row">
+            <label>Image asset (website asset filename)</label>
+            <input type="text" id="productImage" placeholder="sensor.png — upload via Website assets first">
+        </div>
+        <div class="form-row" style="display:grid;grid-template-columns:1fr 120px 100px;gap:12px;">
+            <div><label>Tax code</label><input type="text" id="productTaxCode" value="txcd_99999999"></div>
+            <div><label>Ord</label><input type="number" id="productOrd" value="0"></div>
+            <div style="display:flex;align-items:flex-end;"><label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="productActive" checked> Active</label></div>
+        </div>
+        <div id="productError" style="background:rgba(248,113,113,0.15);border:1px solid var(--red);color:var(--red);padding:10px 14px;border-radius:var(--radius);margin-top:12px;font-size:12px;" style="display:none;"></div>
+        <div class="form-actions">
+            <button class="secondary" onclick="closeProductModal()">Cancel</button>
+            <button class="primary" onclick="saveProduct()">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- Shipping Rate Modal -->
+<div id="rateModal" class="modal-overlay" onclick="if(event.target===this)closeRateModal()">
+    <div class="modal">
+        <h2 id="rateModalTitle">New Shipping Rate</h2>
+        <div class="form-row">
+            <label>Label</label>
+            <input type="text" id="rateLabel" placeholder="US Standard">
+        </div>
+        <div class="form-row" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div><label>Amount (cents)</label><input type="number" id="rateAmount" min="0" value="0"></div>
+            <div><label>Currency</label><input type="text" id="rateCurrency" value="usd" maxlength="3"></div>
+        </div>
+        <div class="form-row">
+            <label>Regions (comma-separated ISO-2; * = worldwide)</label>
+            <input type="text" id="rateRegions" value="*" placeholder="US, CA">
+        </div>
+        <div class="form-row" style="display:grid;grid-template-columns:1fr 1fr 100px;gap:12px;">
+            <div><label>Delivery min (days)</label><input type="number" id="rateMinDays" min="0"></div>
+            <div><label>Delivery max (days)</label><input type="number" id="rateMaxDays" min="0"></div>
+            <div><label>Ord</label><input type="number" id="rateOrd" value="0"></div>
+        </div>
+        <div class="form-row">
+            <label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="rateActive" checked> Active</label>
+        </div>
+        <div id="rateError" style="background:rgba(248,113,113,0.15);border:1px solid var(--red);color:var(--red);padding:10px 14px;border-radius:var(--radius);margin-top:12px;font-size:12px;" style="display:none;"></div>
+        <div class="form-actions">
+            <button class="secondary" onclick="closeRateModal()">Cancel</button>
+            <button class="primary" onclick="saveRate()">Save</button>
+        </div>
+    </div>
+</div>
+
 </div><!-- /container -->
 
 <!-- Create License Modal -->
@@ -1140,6 +1260,7 @@ function renderNav() {
         { page: 'workspaces', label: 'Workspaces', href: '#/workspaces', show: !!authToken },
         { page: 'releases', label: 'Releases', href: '#/releases', show: !!authToken },
         { page: 'licenses', label: 'Licenses', href: '#/licenses', show: !!authToken && isAdmin },
+        { page: 'shop', label: 'Shop', href: '#/shop', show: !!authToken && isAdmin },
     ];
     nav.innerHTML = items.filter(i => i.show).map(i =>
         '<a href="' + i.href + '" data-page="' + i.page + '">' + i.label + '</a>'
@@ -1385,6 +1506,7 @@ function enterDashboard() {
     loadFeatures();
     if (isAdmin) {
         loadLicenses();
+        loadShop();
     }
     loadReleases();
     loadWorkspaces();
@@ -2827,8 +2949,260 @@ document.addEventListener('keydown', e => {
         closeUsersModal();
         closeUploadReleaseModal();
         closeCreateWorkspaceModal();
+        closeProductModal();
+        closeRateModal();
     }
 });
+
+// ---------------------------------------------------------------------------
+// Shop admin — products + shipping rates
+// ---------------------------------------------------------------------------
+let shopProducts = [];
+let shopRates = [];
+let editingProductSku = null;  // null = create mode
+let editingRateId = null;      // null = create mode
+
+async function loadShop() {
+    if (userRole !== 'admin') return;
+    await Promise.all([loadShopProducts(), loadShopRates()]);
+}
+
+async function loadShopProducts() {
+    const tbody = document.getElementById('shopProductsBody');
+    try {
+        const resp = await fetch(API + '/shop/admin/products', { headers: authHeaders() });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        shopProducts = (await resp.json()).products || [];
+        renderShopProducts();
+    } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><p>Failed to load: ' + escHtml(e.message) + '</p></td></tr>';
+    }
+}
+
+function renderShopProducts() {
+    const tbody = document.getElementById('shopProductsBody');
+    if (!shopProducts.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><p>No products yet.</p></td></tr>';
+        return;
+    }
+    tbody.innerHTML = shopProducts.map(p => {
+        const img = p.image_url
+            ? '<img src="' + escHtml(p.image_url) + '" style="width:40px;height:40px;object-fit:cover;border-radius:4px;">'
+            : '<span style="color:var(--text2);font-size:11px;">—</span>';
+        const price = shopFmtMoney(p.price_cents, p.currency);
+        return '<tr>'
+            + '<td>' + img + '</td>'
+            + '<td><code>' + escHtml(p.sku) + '</code></td>'
+            + '<td>' + escHtml(p.title) + '</td>'
+            + '<td>' + escHtml(price) + '</td>'
+            + '<td>' + (p.active ? 'yes' : '<span style="color:var(--text2);">no</span>') + '</td>'
+            + '<td>' + p.ord + '</td>'
+            + '<td style="text-align:right;">'
+            +   '<button class="small secondary" onclick="showProductModal(\'' + escHtml(p.sku) + '\')">Edit</button> '
+            +   '<button class="small danger" onclick="deleteShopProduct(\'' + escHtml(p.sku) + '\')">Delete</button>'
+            + '</td>'
+            + '</tr>';
+    }).join('');
+}
+
+function shopFmtMoney(cents, currency) {
+    return (cents / 100).toFixed(2) + ' ' + (currency || 'usd').toUpperCase();
+}
+
+function showProductModal(sku) {
+    editingProductSku = sku || null;
+    const title = sku ? 'Edit Product' : 'New Product';
+    document.getElementById('productModalTitle').textContent = title;
+    document.getElementById('productError').style.display = 'none';
+    if (sku) {
+        const p = shopProducts.find(x => x.sku === sku);
+        if (!p) return;
+        document.getElementById('productSku').value = p.sku;
+        document.getElementById('productSku').disabled = true;
+        document.getElementById('productTitle').value = p.title;
+        document.getElementById('productDesc').value = p.description_md || '';
+        document.getElementById('productPrice').value = p.price_cents;
+        document.getElementById('productCurrency').value = p.currency;
+        document.getElementById('productImage').value = p.image_asset || '';
+        document.getElementById('productTaxCode').value = p.tax_code;
+        document.getElementById('productOrd').value = p.ord;
+        document.getElementById('productActive').checked = p.active;
+    } else {
+        document.getElementById('productSku').value = '';
+        document.getElementById('productSku').disabled = false;
+        document.getElementById('productTitle').value = '';
+        document.getElementById('productDesc').value = '';
+        document.getElementById('productPrice').value = 0;
+        document.getElementById('productCurrency').value = 'usd';
+        document.getElementById('productImage').value = '';
+        document.getElementById('productTaxCode').value = 'txcd_99999999';
+        document.getElementById('productOrd').value = 0;
+        document.getElementById('productActive').checked = true;
+    }
+    document.getElementById('productModal').classList.add('visible');
+}
+
+function closeProductModal() { document.getElementById('productModal').classList.remove('visible'); }
+
+async function saveProduct() {
+    const errEl = document.getElementById('productError');
+    errEl.style.display = 'none';
+    const sku = (editingProductSku || document.getElementById('productSku').value).trim();
+    if (!sku) { errEl.textContent = 'SKU required'; errEl.style.display = ''; return; }
+    const body = {
+        title: document.getElementById('productTitle').value.trim(),
+        description_md: document.getElementById('productDesc').value,
+        price_cents: parseInt(document.getElementById('productPrice').value, 10) || 0,
+        currency: document.getElementById('productCurrency').value.trim() || 'usd',
+        image_asset: document.getElementById('productImage').value.trim() || null,
+        tax_code: document.getElementById('productTaxCode').value.trim() || 'txcd_99999999',
+        ord: parseInt(document.getElementById('productOrd').value, 10) || 0,
+        active: document.getElementById('productActive').checked,
+    };
+    try {
+        const resp = await fetch(API + '/shop/admin/products/' + encodeURIComponent(sku), {
+            method: 'PUT',
+            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); errEl.style.display = ''; return; }
+        closeProductModal();
+        toast(editingProductSku ? 'Product updated' : 'Product created', 'success');
+        await loadShopProducts();
+    } catch (e) { errEl.textContent = e.message; errEl.style.display = ''; }
+}
+
+async function deleteShopProduct(sku) {
+    if (!confirm('Delete product "' + sku + '"? This cannot be undone.')) return;
+    try {
+        const resp = await fetch(API + '/shop/admin/products/' + encodeURIComponent(sku), {
+            method: 'DELETE', headers: authHeaders(),
+        });
+        if (!resp.ok) { const d = await resp.json().catch(() => ({})); toast('Error: ' + (d.error || resp.status), 'error'); return; }
+        toast('Product deleted', 'success');
+        await loadShopProducts();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+// ----- Shipping rates -----
+
+async function loadShopRates() {
+    const tbody = document.getElementById('shopRatesBody');
+    try {
+        const resp = await fetch(API + '/shop/admin/shipping_rates', { headers: authHeaders() });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        shopRates = (await resp.json()).rates || [];
+        renderShopRates();
+    } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><p>Failed to load: ' + escHtml(e.message) + '</p></td></tr>';
+    }
+}
+
+function renderShopRates() {
+    const tbody = document.getElementById('shopRatesBody');
+    if (!shopRates.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><p>No shipping rates — orders cannot ship until you add at least one.</p></td></tr>';
+        return;
+    }
+    tbody.innerHTML = shopRates.map(r => {
+        const regions = (r.regions || []).join(', ');
+        const delivery = (r.delivery_min_days != null && r.delivery_max_days != null)
+            ? r.delivery_min_days + '–' + r.delivery_max_days
+            : (r.delivery_min_days != null ? '≥' + r.delivery_min_days : (r.delivery_max_days != null ? '≤' + r.delivery_max_days : '—'));
+        return '<tr>'
+            + '<td>' + escHtml(r.label) + '</td>'
+            + '<td>' + escHtml(shopFmtMoney(r.amount_cents, r.currency)) + '</td>'
+            + '<td><code>' + escHtml(regions) + '</code></td>'
+            + '<td>' + escHtml(delivery) + '</td>'
+            + '<td>' + (r.active ? 'yes' : '<span style="color:var(--text2);">no</span>') + '</td>'
+            + '<td style="text-align:right;">'
+            +   '<button class="small secondary" onclick="showShippingRateModal(' + r.id + ')">Edit</button> '
+            +   '<button class="small danger" onclick="deleteShopRate(' + r.id + ')">Delete</button>'
+            + '</td>'
+            + '</tr>';
+    }).join('');
+}
+
+function showShippingRateModal(id) {
+    editingRateId = id || null;
+    document.getElementById('rateModalTitle').textContent = id ? 'Edit Shipping Rate' : 'New Shipping Rate';
+    document.getElementById('rateError').style.display = 'none';
+    if (id) {
+        const r = shopRates.find(x => x.id === id);
+        if (!r) return;
+        document.getElementById('rateLabel').value = r.label;
+        document.getElementById('rateAmount').value = r.amount_cents;
+        document.getElementById('rateCurrency').value = r.currency;
+        document.getElementById('rateRegions').value = (r.regions || []).join(', ');
+        document.getElementById('rateMinDays').value = r.delivery_min_days ?? '';
+        document.getElementById('rateMaxDays').value = r.delivery_max_days ?? '';
+        document.getElementById('rateOrd').value = r.ord;
+        document.getElementById('rateActive').checked = r.active;
+    } else {
+        document.getElementById('rateLabel').value = '';
+        document.getElementById('rateAmount').value = 0;
+        document.getElementById('rateCurrency').value = 'usd';
+        document.getElementById('rateRegions').value = '*';
+        document.getElementById('rateMinDays').value = '';
+        document.getElementById('rateMaxDays').value = '';
+        document.getElementById('rateOrd').value = 0;
+        document.getElementById('rateActive').checked = true;
+    }
+    document.getElementById('rateModal').classList.add('visible');
+}
+
+function closeRateModal() { document.getElementById('rateModal').classList.remove('visible'); }
+
+async function saveRate() {
+    const errEl = document.getElementById('rateError');
+    errEl.style.display = 'none';
+    const regionsRaw = document.getElementById('rateRegions').value;
+    const regions = regionsRaw.split(',').map(s => s.trim()).filter(s => s.length > 0);
+    if (!regions.length) { errEl.textContent = 'At least one region required (use * for worldwide)'; errEl.style.display = ''; return; }
+    const minDays = document.getElementById('rateMinDays').value;
+    const maxDays = document.getElementById('rateMaxDays').value;
+    const body = {
+        label: document.getElementById('rateLabel').value.trim(),
+        amount_cents: parseInt(document.getElementById('rateAmount').value, 10) || 0,
+        currency: document.getElementById('rateCurrency').value.trim() || 'usd',
+        regions,
+        delivery_min_days: minDays === '' ? null : (parseInt(minDays, 10) || 0),
+        delivery_max_days: maxDays === '' ? null : (parseInt(maxDays, 10) || 0),
+        ord: parseInt(document.getElementById('rateOrd').value, 10) || 0,
+        active: document.getElementById('rateActive').checked,
+    };
+    try {
+        const url = editingRateId
+            ? API + '/shop/admin/shipping_rates/' + editingRateId
+            : API + '/shop/admin/shipping_rates';
+        const method = editingRateId ? 'PUT' : 'POST';
+        const resp = await fetch(url, {
+            method,
+            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); errEl.style.display = ''; return; }
+        closeRateModal();
+        toast(editingRateId ? 'Rate updated' : 'Rate created', 'success');
+        await loadShopRates();
+    } catch (e) { errEl.textContent = e.message; errEl.style.display = ''; }
+}
+
+async function deleteShopRate(id) {
+    if (!confirm('Delete this shipping rate?')) return;
+    try {
+        const resp = await fetch(API + '/shop/admin/shipping_rates/' + id, {
+            method: 'DELETE', headers: authHeaders(),
+        });
+        if (!resp.ok) { const d = await resp.json().catch(() => ({})); toast('Error: ' + (d.error || resp.status), 'error'); return; }
+        toast('Rate deleted', 'success');
+        await loadShopRates();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+const escHtml = esc;
 </script>
 </body>
 </html>
