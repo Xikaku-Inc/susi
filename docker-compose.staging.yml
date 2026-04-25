@@ -19,6 +19,11 @@ services:
       - SUSI_SMTP_FROM_ADDR=${SUSI_SMTP_FROM_ADDR:-}
       # Always staging — don't let the shared .env leak the production URL into magic-link emails
       - SUSI_MAGIC_LINK_BASE_URL=https://staging.susi.lp-research.com
+      # Shop / Stripe (test keys live in /opt/susi/.env on the host)
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      - SUSI_SHOP_BASE_URL=${SUSI_SHOP_BASE_URL:-https://staging.susi.lp-research.com}
+      - SUSI_SHOP_NOTIFY_ADDR=${SUSI_SHOP_NOTIFY_ADDR:-}
     volumes:
       - susi-data-staging:/data
     healthcheck:
