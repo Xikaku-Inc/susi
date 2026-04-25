@@ -695,10 +695,21 @@ pub async fn handle_delete_shipping_rate(
 
 // ---------------------------------------------------------------------------
 // Public shop HTML shell
+//
+// /shop URLs reuse the same single-page-app shell as the public website so
+// that header / sidebar / cart drawer stay consistent. The SPA's `route()`
+// detects a `/shop` path and renders product views into the content area.
 // ---------------------------------------------------------------------------
 
-pub async fn handle_shop_page() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("shop.html"))
+const WEBSITE_HTML: &str = include_str!("website.html");
+
+pub async fn handle_shop_page() -> axum::response::Html<String> {
+    let head = "<title>Shop — Xikaku</title>\n\
+                <meta name=\"description\" content=\"Order Xikaku IMU and inertial sensors directly. Shipped from our Los Angeles office.\">\n\
+                <meta property=\"og:title\" content=\"Shop — Xikaku\">\n\
+                <meta property=\"og:type\" content=\"website\">\n";
+    let html = WEBSITE_HTML.replacen("<!--SEO_HEAD-->", head, 1);
+    axum::response::Html(html)
 }
 
 #[cfg(test)]
