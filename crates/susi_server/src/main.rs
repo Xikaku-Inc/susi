@@ -3055,6 +3055,12 @@ async fn main() -> Result<()> {
             axum::routing::put(shop::handle_update_shipping_rate)
                 .delete(shop::handle_delete_shipping_rate),
         )
+        // Orders (JWT) — Stripe is the source of truth for payment, susi
+        // tracks fulfillment state on top of it.
+        .route("/api/v1/shop/admin/orders", get(shop::handle_admin_list_orders))
+        .route("/api/v1/shop/admin/orders/{id}", get(shop::handle_admin_get_order))
+        .route("/api/v1/shop/admin/orders/{id}/ship", post(shop::handle_admin_mark_shipped))
+        .route("/api/v1/shop/admin/orders/{id}/notes", axum::routing::put(shop::handle_admin_update_order_notes))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cli.listen)

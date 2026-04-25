@@ -297,7 +297,31 @@ impl LicenseDb {
                 ord               INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_shop_shipping_rates_active_ord
-                ON shop_shipping_rates(active, ord);",
+                ON shop_shipping_rates(active, ord);
+
+            -- Shadow of completed Stripe Checkout Sessions. Stripe remains the
+            -- source of truth for payment + customer details; we keep a local
+            -- row so the admin UI can list / drive fulfillment without a
+            -- round-trip per request, plus columns Stripe doesn't track for us
+            -- (shipped_at, tracking_number, ...).
+            CREATE TABLE IF NOT EXISTS shop_orders (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                stripe_session_id   TEXT NOT NULL UNIQUE,
+                created_at          TEXT NOT NULL,
+                customer_email      TEXT NOT NULL DEFAULT '',
+                customer_name       TEXT NOT NULL DEFAULT '',
+                amount_total_cents  INTEGER NOT NULL DEFAULT 0,
+                currency            TEXT NOT NULL DEFAULT 'usd',
+                status              TEXT NOT NULL DEFAULT 'paid',
+                ship_to_json        TEXT NOT NULL DEFAULT '{}',
+                line_items_json     TEXT NOT NULL DEFAULT '[]',
+                tracking_carrier    TEXT NOT NULL DEFAULT '',
+                tracking_number     TEXT NOT NULL DEFAULT '',
+                shipped_at          TEXT,
+                notes               TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_shop_orders_status_created
+                ON shop_orders(status, created_at DESC);",
             )
             .map_err(|e| LicenseError::Other(format!("DB init: {}", e)))?;
         self.migrate()?;
@@ -2837,6 +2861,170 @@ impl LicenseDb {
         let n = self.conn
             .execute("DELETE FROM shop_shipping_rates WHERE id = ?1", params![id])
             .map_err(|e| LicenseError::Other(format!("DB delete shipping rate: {}", e)))?;
+        Ok(n > 0)
+    }
+
+    // ---------------------------------------------------------------------
+    // Shop: orders
+    //
+    // Tuple layout: (id, stripe_session_id, created_at, customer_email,
+    //                customer_name, amount_total_cents, currency, status,
+    //                ship_to_json, line_items_json, tracking_carrier,
+    //                tracking_number, shipped_at, notes)
+    // ---------------------------------------------------------------------
+
+    pub fn insert_order_if_absent(
+        &self,
+        stripe_session_id: &str,
+        created_at: &str,
+        customer_email: &str,
+        customer_name: &str,
+        amount_total_cents: i64,
+        currency: &str,
+        ship_to_json: &str,
+        line_items_json: &str,
+    ) -> Result<i64, LicenseError> {
+        // INSERT OR IGNORE so retried webhook events don't duplicate.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO shop_orders
+               (stripe_session_id, created_at, customer_email, customer_name,
+                amount_total_cents, currency, status, ship_to_json, line_items_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'paid', ?7, ?8)",
+            params![
+                stripe_session_id, created_at, customer_email, customer_name,
+                amount_total_cents, currency, ship_to_json, line_items_json,
+            ],
+        )
+        .map_err(|e| LicenseError::Other(format!("DB insert order: {}", e)))?;
+        // Always look up the id (whether we inserted or it already existed).
+        let id = self.conn
+            .query_row(
+                "SELECT id FROM shop_orders WHERE stripe_session_id = ?1",
+                params![stripe_session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| LicenseError::Other(format!("DB lookup order: {}", e)))?;
+        Ok(id)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn list_orders(
+        &self,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<(i64, String, String, String, String, i64, String, String, String, String, String, String, Option<String>, String)>, LicenseError> {
+        let (sql, has_filter) = if status_filter.is_some() {
+            (
+                "SELECT id, stripe_session_id, created_at, customer_email, customer_name,
+                        amount_total_cents, currency, status, ship_to_json, line_items_json,
+                        tracking_carrier, tracking_number, shipped_at, notes
+                 FROM shop_orders WHERE status = ?1 ORDER BY created_at DESC, id DESC",
+                true,
+            )
+        } else {
+            (
+                "SELECT id, stripe_session_id, created_at, customer_email, customer_name,
+                        amount_total_cents, currency, status, ship_to_json, line_items_json,
+                        tracking_carrier, tracking_number, shipped_at, notes
+                 FROM shop_orders ORDER BY created_at DESC, id DESC",
+                false,
+            )
+        };
+        let mut stmt = self.conn.prepare(sql)
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let row_map = |r: &rusqlite::Row<'_>| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, String>(11)?,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, String>(13)?,
+            ))
+        };
+        let rows: Vec<_> = if has_filter {
+            stmt.query_map(params![status_filter.unwrap()], row_map)
+                .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+                .filter_map(|r| r.ok())
+                .collect()
+        } else {
+            stmt.query_map([], row_map)
+                .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        Ok(rows)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn get_order(
+        &self,
+        id: i64,
+    ) -> Result<Option<(i64, String, String, String, String, i64, String, String, String, String, String, String, Option<String>, String)>, LicenseError> {
+        match self.conn.query_row(
+            "SELECT id, stripe_session_id, created_at, customer_email, customer_name,
+                    amount_total_cents, currency, status, ship_to_json, line_items_json,
+                    tracking_carrier, tracking_number, shipped_at, notes
+             FROM shop_orders WHERE id = ?1",
+            params![id],
+            |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, String>(11)?,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, String>(13)?,
+            )),
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(LicenseError::Other(format!("DB query: {}", e))),
+        }
+    }
+
+    /// Mark an order as shipped, recording carrier + tracking number.
+    /// Sets shipped_at to the provided RFC3339 timestamp.
+    pub fn mark_order_shipped(
+        &self,
+        id: i64,
+        carrier: &str,
+        tracking_number: &str,
+        shipped_at: &str,
+    ) -> Result<bool, LicenseError> {
+        let n = self.conn.execute(
+            "UPDATE shop_orders
+               SET status = 'shipped',
+                   tracking_carrier = ?2,
+                   tracking_number  = ?3,
+                   shipped_at       = ?4
+             WHERE id = ?1",
+            params![id, carrier, tracking_number, shipped_at],
+        )
+        .map_err(|e| LicenseError::Other(format!("DB mark shipped: {}", e)))?;
+        Ok(n > 0)
+    }
+
+    pub fn update_order_notes(&self, id: i64, notes: &str) -> Result<bool, LicenseError> {
+        let n = self.conn.execute(
+            "UPDATE shop_orders SET notes = ?2 WHERE id = ?1",
+            params![id, notes],
+        )
+        .map_err(|e| LicenseError::Other(format!("DB update notes: {}", e)))?;
         Ok(n > 0)
     }
 }

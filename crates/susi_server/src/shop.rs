@@ -411,14 +411,28 @@ pub async fn handle_stripe_webhook(
     log::info!("Stripe webhook received: {}", event_type);
 
     if event_type == "checkout.session.completed" {
+        // Persist a shadow-row in shop_orders so we can drive fulfillment
+        // from the admin UI without a round-trip to Stripe for every list.
+        let order_id = persist_order_from_event(&state, &event).await;
+
+        // Fetch line items via Stripe API (not included in webhook payload).
+        let session_id = event
+            .pointer("/data/object/id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let line_items = if !session_id.is_empty() {
+            fetch_line_items(&state, session_id).await
+        } else {
+            Vec::new()
+        };
+
         if let Some(svc) = &state.email {
             if !state.shop_notify_addr.is_empty() {
-                let summary = format_order_summary(&event);
-                let subject = format!("[Susi shop] New order — {}", summary.0);
+                let summary = format_order_summary(&event, &line_items, order_id);
+                let subject = format!("[Xikaku] New order — {}", summary.0);
                 let to = state.shop_notify_addr.clone();
                 let svc = svc.clone();
                 let body = summary.1;
-                // Fire-and-log — don't fail the webhook on SMTP hiccup.
                 tokio::spawn(async move {
                     if let Err(e) = svc.send_order_notification(&to, &subject, &body).await {
                         log::error!("Failed to send order-notification email: {}", e);
@@ -431,28 +445,154 @@ pub async fn handle_stripe_webhook(
     Ok(Json(json!({ "received": true })))
 }
 
-/// Returns (short_summary, full_body). Pulls the useful bits out of the
-/// Checkout Session payload without assuming every field is present.
-fn format_order_summary(event: &Value) -> (String, String) {
+/// Pull line items from the Stripe API (the webhook payload doesn't include
+/// them — Stripe explicitly omits expandable fields on webhook events).
+async fn fetch_line_items(state: &AppState, session_id: &str) -> Vec<Value> {
+    if state.stripe_secret_key.is_empty() { return Vec::new(); }
+    let url = format!("{}/checkout/sessions/{}/line_items?limit=100", STRIPE_API_BASE, session_id);
+    match state.http.get(url).basic_auth(&state.stripe_secret_key, Some("")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.text().await {
+                Ok(body) => match serde_json::from_str::<Value>(&body) {
+                    Ok(v) => v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default(),
+                    Err(e) => { log::warn!("line_items: bad json: {}", e); Vec::new() }
+                },
+                Err(e) => { log::warn!("line_items: read body: {}", e); Vec::new() }
+            }
+        }
+        Ok(resp) => { log::warn!("line_items: HTTP {}", resp.status()); Vec::new() }
+        Err(e) => { log::warn!("line_items: {}", e); Vec::new() }
+    }
+}
+
+/// Persist a Stripe Checkout Session as a shop_orders row. Returns the local
+/// order id on success, None on any error (we still want the webhook to ack
+/// 200 so Stripe doesn't keep retrying).
+async fn persist_order_from_event(state: &AppState, event: &Value) -> Option<i64> {
+    let obj = event.pointer("/data/object")?;
+    let session_id = obj.get("id")?.as_str()?;
+
+    let email = obj.pointer("/customer_details/email").and_then(|v| v.as_str()).unwrap_or("");
+    let name = obj.pointer("/customer_details/name").and_then(|v| v.as_str()).unwrap_or("");
+    let amount = obj.get("amount_total").and_then(|v| v.as_i64()).unwrap_or(0);
+    let currency = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("usd");
+
+    // shipping_details is preferred (delivery address). Fall back to the
+    // billing address from customer_details when shipping wasn't collected.
+    let ship_to = obj.get("shipping_details")
+        .or_else(|| obj.get("customer_details"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let ship_to_json = serde_json::to_string(&ship_to).unwrap_or_else(|_| "{}".into());
+
+    let line_items = fetch_line_items(state, session_id).await;
+    let line_items_json = serde_json::to_string(&line_items).unwrap_or_else(|_| "[]".into());
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let res = {
+        let db = state.db.lock().unwrap();
+        db.insert_order_if_absent(session_id, &now, email, name, amount, currency, &ship_to_json, &line_items_json)
+    };
+    match res {
+        Ok(id) => Some(id),
+        Err(e) => { log::error!("persist order: {}", e); None }
+    }
+}
+
+/// Returns (short_summary, full_body). Now includes line items, shipping
+/// address, totals breakdown, and a link to the local order in the dashboard.
+fn format_order_summary(event: &Value, line_items: &[Value], order_id: Option<i64>) -> (String, String) {
     let obj = event.pointer("/data/object").cloned().unwrap_or(Value::Null);
     let session_id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let email = obj.get("customer_details").and_then(|d| d.get("email")).and_then(|v| v.as_str()).unwrap_or("");
-    let name = obj.get("customer_details").and_then(|d| d.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+    let email = obj.pointer("/customer_details/email").and_then(|v| v.as_str()).unwrap_or("");
+    let name = obj.pointer("/customer_details/name").and_then(|v| v.as_str()).unwrap_or("");
+    let phone = obj.pointer("/customer_details/phone").and_then(|v| v.as_str()).unwrap_or("");
+
     let amount_total = obj.get("amount_total").and_then(|v| v.as_i64()).unwrap_or(0);
+    let amount_subtotal = obj.get("amount_subtotal").and_then(|v| v.as_i64()).unwrap_or(0);
     let currency = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("");
-    let short = format!("{} {}", fmt_money(amount_total, currency), if !name.is_empty() { name } else { email });
+
+    let total_details = obj.get("total_details").cloned().unwrap_or(Value::Null);
+    let amount_shipping = total_details.get("amount_shipping").and_then(|v| v.as_i64()).unwrap_or(0);
+    let amount_tax      = total_details.get("amount_tax").and_then(|v| v.as_i64()).unwrap_or(0);
+    let amount_discount = total_details.get("amount_discount").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let display_name = if !name.is_empty() { name } else { email };
+    let short = format!("{} — {}", fmt_money(amount_total, currency), display_name);
 
     let mut out = String::new();
-    out.push_str(&format!("Session:   {}\n", session_id));
-    out.push_str(&format!("Customer:  {} <{}>\n", name, email));
-    out.push_str(&format!("Amount:    {}\n", fmt_money(amount_total, currency)));
-    if let Some(ship) = obj.pointer("/shipping_details") {
-        out.push_str(&format!("Ship to:   {}\n", ship));
+    out.push_str(&format!("New order #{} from {} <{}>\n",
+        order_id.map(|i| i.to_string()).unwrap_or_else(|| "—".into()),
+        if !name.is_empty() { name } else { "(no name)" },
+        email,
+    ));
+    if !phone.is_empty() {
+        out.push_str(&format!("Phone:     {}\n", phone));
     }
-    if let Some(items) = obj.pointer("/display_items") {
-        out.push_str(&format!("Items:     {}\n", items));
+
+    // Shipping address — most important for the operator. Use shipping_details
+    // when present, else fall back to billing.
+    out.push_str("\n--- Ship to ---\n");
+    let addr_src = obj.get("shipping_details").or_else(|| obj.get("customer_details"));
+    if let Some(s) = addr_src {
+        let ship_name = s.get("name").and_then(|v| v.as_str()).unwrap_or(name);
+        let a = s.get("address").cloned().unwrap_or(Value::Null);
+        out.push_str(&format!("{}\n", ship_name));
+        for k in &["line1", "line2"] {
+            if let Some(v) = a.get(*k).and_then(|v| v.as_str()) {
+                if !v.is_empty() { out.push_str(&format!("{}\n", v)); }
+            }
+        }
+        let city = a.get("city").and_then(|v| v.as_str()).unwrap_or("");
+        let state_ = a.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        let postal = a.get("postal_code").and_then(|v| v.as_str()).unwrap_or("");
+        let csz: Vec<&str> = [city, state_, postal].iter().copied().filter(|s| !s.is_empty()).collect();
+        if !csz.is_empty() { out.push_str(&format!("{}\n", csz.join(", "))); }
+        if let Some(c) = a.get("country").and_then(|v| v.as_str()) {
+            if !c.is_empty() { out.push_str(&format!("{}\n", c)); }
+        }
+    } else {
+        out.push_str("(no shipping address)\n");
     }
-    out.push_str("\nManage this order in the Stripe dashboard.\n");
+
+    out.push_str("\n--- Items ---\n");
+    if line_items.is_empty() {
+        out.push_str("(line items unavailable — see Stripe dashboard)\n");
+    } else {
+        for li in line_items {
+            let qty = li.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1);
+            let desc = li.get("description").and_then(|v| v.as_str()).unwrap_or("(item)");
+            let amt = li.get("amount_total").and_then(|v| v.as_i64()).unwrap_or(0);
+            let cur = li.get("currency").and_then(|v| v.as_str()).unwrap_or(currency);
+            // Pull SKU from product metadata when present (we set it during checkout).
+            let sku = li.pointer("/price/product").and_then(|p| {
+                if let Some(s) = p.as_str() { Some(s.to_string()) } else {
+                    p.pointer("/metadata/sku").and_then(|v| v.as_str()).map(String::from)
+                }
+            }).unwrap_or_default();
+            if sku.is_empty() {
+                out.push_str(&format!("  {} × {}  —  {}\n", qty, desc, fmt_money(amt, cur)));
+            } else {
+                out.push_str(&format!("  {} × {} ({})  —  {}\n", qty, desc, sku, fmt_money(amt, cur)));
+            }
+        }
+    }
+
+    out.push_str("\n--- Totals ---\n");
+    out.push_str(&format!("Subtotal:  {}\n", fmt_money(amount_subtotal, currency)));
+    if amount_discount != 0 { out.push_str(&format!("Discount:  -{}\n", fmt_money(amount_discount, currency))); }
+    out.push_str(&format!("Shipping:  {}\n", fmt_money(amount_shipping, currency)));
+    out.push_str(&format!("Tax:       {}\n", fmt_money(amount_tax, currency)));
+    out.push_str(&format!("TOTAL:     {}\n", fmt_money(amount_total, currency)));
+
+    out.push_str("\n--- Refs ---\n");
+    out.push_str(&format!("Stripe session: {}\n", session_id));
+    out.push_str(&format!("Stripe link:    https://dashboard.stripe.com/payments/{}\n", session_id));
+    if let Some(i) = order_id {
+        out.push_str(&format!("Susi order:     #{}  (mark shipped via the Shop → Orders tab)\n", i));
+    }
+    out.push_str("\n--- Action ---\nPack the items, ship them, then visit the Orders tab to record the tracking number.\n");
+    out.push_str("The customer will get an automatic email with carrier + tracking when you do.\n");
     (short, out)
 }
 
@@ -691,6 +831,268 @@ pub async fn handle_delete_shipping_rate(
         return Err(error_response(StatusCode::NOT_FOUND, "Shipping rate not found"));
     }
     Ok(Json(json!({ "status": "OK" })))
+}
+
+// ---------------------------------------------------------------------------
+// Orders admin (JWT)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::type_complexity)]
+fn order_to_json(
+    row: (i64, String, String, String, String, i64, String, String, String, String, String, String, Option<String>, String),
+) -> Value {
+    let (id, sid, created_at, email, name, amount, currency, status, ship_to, line_items, carrier, tracking, shipped_at, notes) = row;
+    let ship_to_v: Value = serde_json::from_str(&ship_to).unwrap_or(Value::Null);
+    let line_items_v: Value = serde_json::from_str(&line_items).unwrap_or_else(|_| Value::Array(Vec::new()));
+    json!({
+        "id": id,
+        "stripe_session_id": sid,
+        "stripe_link": format!("https://dashboard.stripe.com/payments/{}", sid),
+        "created_at": created_at,
+        "customer_email": email,
+        "customer_name": name,
+        "amount_total_cents": amount,
+        "currency": currency,
+        "status": status,
+        "ship_to": ship_to_v,
+        "line_items": line_items_v,
+        "tracking_carrier": carrier,
+        "tracking_number": tracking,
+        "tracking_url": tracking_url(&carrier, &tracking),
+        "shipped_at": shipped_at,
+        "notes": notes,
+    })
+}
+
+/// Build a customer-facing tracking URL from carrier name + tracking number.
+/// Returns None for unknown carriers — the email then shows just the number.
+fn tracking_url(carrier: &str, tracking: &str) -> Option<String> {
+    if tracking.is_empty() { return None; }
+    let n = urlencoding_encode(tracking);
+    let key = carrier.to_ascii_lowercase();
+    let url = match key.as_str() {
+        "usps" => format!("https://tools.usps.com/go/TrackConfirmAction?tLabels={}", n),
+        "fedex" => format!("https://www.fedex.com/fedextrack/?trknbr={}", n),
+        "ups" => format!("https://www.ups.com/track?tracknum={}", n),
+        "dhl" => format!("https://www.dhl.com/global-en/home/tracking/tracking-express.html?tracking-id={}", n),
+        "ems" | "japan post" | "japanpost" =>
+            format!("https://trackings.post.japanpost.jp/services/srv/search/direct?reqCodeNo1={}&searchKind=S004", n),
+        _ => return None,
+    };
+    Some(url)
+}
+
+/// Lightweight URL encoder — only escapes the ASCII chars that need escaping
+/// in a query value. Avoids pulling in a separate dep just for this one use.
+fn urlencoding_encode(s: &str) -> String {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+pub async fn handle_admin_list_orders(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let p = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &p)?;
+    require_admin(&state, &p)?;
+    let status = q.get("status").map(|s| s.as_str());
+    let rows = {
+        let db = state.db.lock().unwrap();
+        db.list_orders(status).map_err(db_err)?
+    };
+    let orders: Vec<Value> = rows.into_iter().map(order_to_json).collect();
+    Ok(Json(json!({ "orders": orders })))
+}
+
+pub async fn handle_admin_get_order(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let p = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &p)?;
+    require_admin(&state, &p)?;
+    let row = {
+        let db = state.db.lock().unwrap();
+        db.get_order(id).map_err(db_err)?
+    }.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Order not found"))?;
+    Ok(Json(order_to_json(row)))
+}
+
+#[derive(Deserialize)]
+pub struct ShipOrderRequest {
+    pub carrier: String,
+    pub tracking_number: String,
+    #[serde(default = "default_true")]
+    pub notify_customer: bool,
+}
+fn default_true() -> bool { true }
+
+pub async fn handle_admin_mark_shipped(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<ShipOrderRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let p = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &p)?;
+    require_admin(&state, &p)?;
+    let carrier = req.carrier.trim();
+    let tracking = req.tracking_number.trim();
+    if carrier.is_empty() || tracking.is_empty() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "carrier and tracking_number required"));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let order = {
+        let db = state.db.lock().unwrap();
+        let ok = db.mark_order_shipped(id, carrier, tracking, &now).map_err(db_err)?;
+        if !ok { return Err(error_response(StatusCode::NOT_FOUND, "Order not found")); }
+        db.get_order(id).map_err(db_err)?
+    };
+    let order = order.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Order vanished"))?;
+
+    if req.notify_customer {
+        let email = order.3.clone();
+        if !email.is_empty() {
+            if let Some(svc) = state.email.clone() {
+                let body = build_shipped_email(&order);
+                let subject = format!("Your Xikaku order #{} has shipped", order.0);
+                tokio::spawn(async move {
+                    if let Err(e) = svc.send_html(&email, &subject, &body.0, &body.1).await {
+                        log::error!("Failed to send shipped email to {}: {}", email, e);
+                    }
+                });
+            }
+        }
+    }
+
+    Ok(Json(order_to_json(order)))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateOrderNotesRequest {
+    pub notes: String,
+}
+
+pub async fn handle_admin_update_order_notes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateOrderNotesRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let p = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &p)?;
+    require_admin(&state, &p)?;
+    let ok = {
+        let db = state.db.lock().unwrap();
+        db.update_order_notes(id, &req.notes).map_err(db_err)?
+    };
+    if !ok { return Err(error_response(StatusCode::NOT_FOUND, "Order not found")); }
+    Ok(Json(json!({ "id": id })))
+}
+
+#[allow(clippy::type_complexity)]
+fn build_shipped_email(
+    order: &(i64, String, String, String, String, i64, String, String, String, String, String, String, Option<String>, String),
+) -> (String, String) {
+    let (id, _sid, _created, _email, name, amount, currency, _status, _ship, line_items_json, carrier, tracking, _shipped, _notes) = order;
+    let line_items: Value = serde_json::from_str(line_items_json).unwrap_or(Value::Array(Vec::new()));
+    let url = tracking_url(carrier, tracking);
+
+    let mut text = String::new();
+    text.push_str(&format!("Hi {},\n\n", if name.is_empty() { "there" } else { name.as_str() }));
+    text.push_str(&format!("Your Xikaku order #{} has shipped.\n\n", id));
+    text.push_str(&format!("Carrier:  {}\n", carrier));
+    text.push_str(&format!("Tracking: {}\n", tracking));
+    if let Some(u) = &url { text.push_str(&format!("Track:    {}\n", u)); }
+    text.push_str(&format!("\nOrder total: {}\n", fmt_money(*amount, currency)));
+    if let Some(items) = line_items.as_array() {
+        if !items.is_empty() {
+            text.push_str("\nItems shipped:\n");
+            for li in items {
+                let qty = li.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1);
+                let desc = li.get("description").and_then(|v| v.as_str()).unwrap_or("(item)");
+                text.push_str(&format!("  {} × {}\n", qty, desc));
+            }
+        }
+    }
+    text.push_str("\nThanks for buying from Xikaku!\n— The Xikaku team (LP-Research Inc.)\n");
+
+    let track_btn = match &url {
+        Some(u) => format!(
+            "<p style=\"margin:18px 0;\"><a href=\"{}\" style=\"display:inline-block;padding:10px 20px;background:#2d6fdc;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;\">Track shipment</a></p>",
+            html_escape_local(u),
+        ),
+        None => String::new(),
+    };
+    let mut item_rows = String::new();
+    if let Some(items) = line_items.as_array() {
+        for li in items {
+            let qty = li.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1);
+            let desc = li.get("description").and_then(|v| v.as_str()).unwrap_or("(item)");
+            item_rows.push_str(&format!(
+                "<tr><td style=\"padding:6px 0;color:#5c6470;\">{} ×</td><td style=\"padding:6px 0;\">{}</td></tr>",
+                qty, html_escape_local(desc),
+            ));
+        }
+    }
+
+    let html = format!(
+        "<!doctype html><html><body style=\"margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f6f8;color:#1a1d23;\">\
+         <div style=\"max-width:560px;margin:0 auto;padding:32px 24px;\">\
+           <h1 style=\"font-size:22px;margin:0 0 8px;\">Your order has shipped</h1>\
+           <p style=\"color:#5c6470;margin:0 0 20px;\">Order #{id}</p>\
+           <table style=\"width:100%;border-collapse:collapse;background:#fff;border:1px solid #d8dbe1;border-radius:8px;padding:18px;\">\
+             <tr><td style=\"padding:6px 0;color:#5c6470;width:120px;\">Carrier:</td><td style=\"padding:6px 0;font-weight:600;\">{carrier_html}</td></tr>\
+             <tr><td style=\"padding:6px 0;color:#5c6470;\">Tracking:</td><td style=\"padding:6px 0;font-family:monospace;\">{tracking_html}</td></tr>\
+           </table>\
+           {track_btn}\
+           {items_block}\
+           <p style=\"color:#5c6470;font-size:13px;margin-top:32px;\">Thanks for buying from Xikaku!<br>— The Xikaku team (LP-Research Inc.)</p>\
+         </div></body></html>",
+        id = id,
+        carrier_html = html_escape_local(carrier),
+        tracking_html = html_escape_local(tracking),
+        track_btn = track_btn,
+        items_block = if item_rows.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<h3 style=\"font-size:14px;margin:24px 0 8px;\">Items shipped</h3>\
+                 <table style=\"width:100%;border-collapse:collapse;background:#fff;border:1px solid #d8dbe1;border-radius:8px;padding:18px;\">{}</table>",
+                item_rows,
+            )
+        },
+    );
+    (text, html)
+}
+
+fn html_escape_local(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

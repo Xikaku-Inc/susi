@@ -137,6 +137,41 @@ impl EmailService {
         self.transport.send(email).await.context("SMTP send failed")?;
         Ok(())
     }
+
+    /// Send a multipart/alternative email with both plain-text and HTML
+    /// bodies. Use for customer-facing transactional mails (shipped
+    /// notifications, etc.) where HTML formatting is expected.
+    pub async fn send_html(
+        &self,
+        to_addr: &str,
+        subject: &str,
+        text: &str,
+        html: &str,
+    ) -> Result<()> {
+        let to: Mailbox = to_addr
+            .parse()
+            .with_context(|| format!("Invalid recipient address: {}", to_addr))?;
+        let email = Message::builder()
+            .from(self.cfg.from.clone())
+            .to(to)
+            .subject(subject.to_string())
+            .multipart(
+                lettre::message::MultiPart::alternative()
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_PLAIN)
+                            .body(text.to_string()),
+                    )
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_HTML)
+                            .body(html.to_string()),
+                    ),
+            )
+            .context("Failed to build HTML email")?;
+        self.transport.send(email).await.context("SMTP send failed")?;
+        Ok(())
+    }
 }
 
 fn html_escape(s: &str) -> String {

@@ -719,7 +719,73 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
     <p style="margin-top:16px;font-size:12px;color:var(--text2);">
         Tip: use <code>*</code> as a region for "worldwide". Admin fields map directly to Stripe's <code>shipping_options</code>.
     </p>
+
+    <div style="margin-top:40px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <h2 style="font-size:16px;font-weight:600;">Orders</h2>
+        <div style="display:flex;gap:8px;">
+            <select id="ordersStatusFilter" onchange="loadShopOrders()" style="padding:6px 10px;">
+                <option value="">All statuses</option>
+                <option value="paid">Paid (awaiting fulfillment)</option>
+                <option value="shipped">Shipped</option>
+            </select>
+            <button class="secondary" onclick="loadShopOrders()">Refresh</button>
+        </div>
+    </div>
+    <div class="card" style="padding:0;">
+        <table style="width:100%;" id="shopOrdersTable">
+            <thead>
+                <tr>
+                    <th style="width:60px;">#</th>
+                    <th style="width:160px;">Created</th>
+                    <th>Customer</th>
+                    <th style="width:120px;">Total</th>
+                    <th style="width:110px;">Status</th>
+                    <th>Tracking</th>
+                    <th style="width:160px;"></th>
+                </tr>
+            </thead>
+            <tbody id="shopOrdersBody">
+                <tr><td colspan="7" class="empty-state"><p>Loading...</p></td></tr>
+            </tbody>
+        </table>
+    </div>
 </div><!-- /page-shop -->
+
+<!-- Order detail modal -->
+<div id="orderModal" class="modal-overlay" onclick="if(event.target===this)closeOrderModal()">
+    <div class="modal" style="max-width:700px;">
+        <h2 id="orderModalTitle">Order</h2>
+        <div id="orderModalBody" style="font-size:13px;"></div>
+        <div id="orderModalShipForm" style="display:none;margin-top:18px;border-top:1px solid var(--border);padding-top:14px;">
+            <h3 style="margin:0 0 12px;font-size:14px;">Mark as shipped</h3>
+            <div class="form-row" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                <div><label>Carrier</label>
+                    <select id="orderShipCarrier">
+                        <option value="USPS">USPS</option>
+                        <option value="UPS">UPS</option>
+                        <option value="FedEx">FedEx</option>
+                        <option value="DHL">DHL</option>
+                        <option value="EMS">EMS / Japan Post</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+                <div><label>Tracking number</label>
+                    <input type="text" id="orderShipTracking" placeholder="9400 1112 0000 …">
+                </div>
+            </div>
+            <div class="form-row">
+                <label style="display:flex;align-items:center;gap:6px;">
+                    <input type="checkbox" id="orderShipNotify" checked> Send tracking email to customer
+                </label>
+            </div>
+            <div id="orderShipError" style="background:rgba(248,113,113,0.15);border:1px solid var(--red);color:var(--red);padding:8px 12px;border-radius:var(--radius);font-size:12px;display:none;margin-top:8px;"></div>
+        </div>
+        <div class="form-actions">
+            <button class="secondary" onclick="closeOrderModal()">Close</button>
+            <button class="primary" id="orderShipBtn" onclick="submitMarkShipped()" style="display:none;">Mark shipped + email customer</button>
+        </div>
+    </div>
+</div>
 
 <!-- Product Modal -->
 <div id="productModal" class="modal-overlay" onclick="if(event.target===this)closeProductModal()">
@@ -2964,7 +3030,7 @@ let editingRateId = null;      // null = create mode
 
 async function loadShop() {
     if (userRole !== 'admin') return;
-    await Promise.all([loadShopProducts(), loadShopRates()]);
+    await Promise.all([loadShopProducts(), loadShopRates(), loadShopOrders()]);
 }
 
 async function loadShopProducts() {
@@ -3203,6 +3269,157 @@ async function deleteShopRate(id) {
 }
 
 const escHtml = esc;
+
+// ---------------------------------------------------------------------------
+// Shop admin — orders
+// ---------------------------------------------------------------------------
+let shopOrders = [];
+let viewingOrderId = null;
+
+async function loadShopOrders() {
+    const tbody = document.getElementById('shopOrdersBody');
+    if (!tbody) return;
+    const filter = (document.getElementById('ordersStatusFilter') || {}).value || '';
+    const url = API + '/shop/admin/orders' + (filter ? '?status=' + encodeURIComponent(filter) : '');
+    try {
+        const resp = await fetch(url, { headers: authHeaders() });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        shopOrders = (await resp.json()).orders || [];
+        renderShopOrders();
+    } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><p>Failed to load: ' + escHtml(e.message) + '</p></td></tr>';
+    }
+}
+
+function renderShopOrders() {
+    const tbody = document.getElementById('shopOrdersBody');
+    if (!shopOrders.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><p>No orders yet.</p></td></tr>';
+        return;
+    }
+    tbody.innerHTML = shopOrders.map(o => {
+        const total = (o.amount_total_cents / 100).toFixed(2) + ' ' + (o.currency || 'usd').toUpperCase();
+        const customer = o.customer_name || o.customer_email || '—';
+        const created = o.created_at ? new Date(o.created_at).toLocaleString() : '';
+        const statusColor = o.status === 'shipped' ? 'var(--green)' : 'var(--text2)';
+        const tracking = o.tracking_number
+            ? (o.tracking_url
+                ? '<a href="' + escHtml(o.tracking_url) + '" target="_blank" rel="noopener">' + escHtml(o.tracking_carrier) + ' ' + escHtml(o.tracking_number) + '</a>'
+                : escHtml(o.tracking_carrier) + ' ' + escHtml(o.tracking_number))
+            : '<span style="color:var(--text2);">—</span>';
+        return '<tr>'
+            + '<td>#' + o.id + '</td>'
+            + '<td style="font-size:12px;color:var(--text2);">' + escHtml(created) + '</td>'
+            + '<td>' + escHtml(customer) + '<div style="font-size:11px;color:var(--text2);">' + escHtml(o.customer_email) + '</div></td>'
+            + '<td>' + escHtml(total) + '</td>'
+            + '<td style="color:' + statusColor + ';font-weight:500;">' + escHtml(o.status) + '</td>'
+            + '<td style="font-size:12px;">' + tracking + '</td>'
+            + '<td style="text-align:right;">'
+            +   '<button class="small secondary" onclick="openOrderModal(' + o.id + ')">View</button>'
+            + '</td>'
+            + '</tr>';
+    }).join('');
+}
+
+function openOrderModal(id) {
+    const o = shopOrders.find(x => x.id === id);
+    if (!o) return;
+    viewingOrderId = id;
+    document.getElementById('orderModalTitle').textContent = 'Order #' + id;
+    document.getElementById('orderShipError').style.display = 'none';
+
+    const total = (o.amount_total_cents / 100).toFixed(2) + ' ' + (o.currency || 'usd').toUpperCase();
+    const created = o.created_at ? new Date(o.created_at).toLocaleString() : '';
+    const ship = o.ship_to || {};
+    const addr = ship.address || {};
+    const addrLines = [
+        ship.name || o.customer_name,
+        addr.line1, addr.line2,
+        [addr.city, addr.state, addr.postal_code].filter(Boolean).join(', '),
+        addr.country,
+    ].filter(Boolean).map(l => escHtml(l)).join('<br>');
+
+    let itemsHtml = '<div style="color:var(--text2);font-size:12px;">No item data.</div>';
+    if (Array.isArray(o.line_items) && o.line_items.length) {
+        itemsHtml = '<table style="width:100%;font-size:12px;"><tr><th style="text-align:left;">Item</th><th style="text-align:right;">Qty</th><th style="text-align:right;">Total</th></tr>'
+            + o.line_items.map(li => {
+                const liTotal = ((li.amount_total || 0) / 100).toFixed(2) + ' ' + ((li.currency || o.currency || 'usd').toUpperCase());
+                return '<tr><td>' + escHtml(li.description || '(item)') + '</td><td style="text-align:right;">' + (li.quantity || 1) + '</td><td style="text-align:right;">' + escHtml(liTotal) + '</td></tr>';
+            }).join('')
+            + '</table>';
+    }
+
+    const trackingBlock = o.tracking_number
+        ? '<div style="margin-top:14px;background:rgba(74,222,128,0.10);border:1px solid var(--green);padding:10px 12px;border-radius:var(--radius);">'
+            + '<strong>Shipped via ' + escHtml(o.tracking_carrier) + '</strong> on ' + escHtml(o.shipped_at ? new Date(o.shipped_at).toLocaleString() : '')
+            + '<br>Tracking: <code>' + escHtml(o.tracking_number) + '</code>'
+            + (o.tracking_url ? ' · <a href="' + escHtml(o.tracking_url) + '" target="_blank">track</a>' : '')
+            + '</div>'
+        : '';
+
+    document.getElementById('orderModalBody').innerHTML =
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">'
+        +   '<div>'
+        +     '<div style="color:var(--text2);font-size:11px;text-transform:uppercase;">Customer</div>'
+        +     '<div>' + escHtml(o.customer_name || '—') + '</div>'
+        +     '<div style="color:var(--text2);font-size:12px;">' + escHtml(o.customer_email) + '</div>'
+        +     '<div style="color:var(--text2);font-size:11px;text-transform:uppercase;margin-top:14px;">Created</div>'
+        +     '<div>' + escHtml(created) + '</div>'
+        +     '<div style="color:var(--text2);font-size:11px;text-transform:uppercase;margin-top:14px;">Stripe</div>'
+        +     '<div><a href="' + escHtml(o.stripe_link) + '" target="_blank" rel="noopener">' + escHtml(o.stripe_session_id) + '</a></div>'
+        +   '</div>'
+        +   '<div>'
+        +     '<div style="color:var(--text2);font-size:11px;text-transform:uppercase;">Ship to</div>'
+        +     '<div>' + (addrLines || '<span style="color:var(--text2);">No address</span>') + '</div>'
+        +     '<div style="color:var(--text2);font-size:11px;text-transform:uppercase;margin-top:14px;">Total</div>'
+        +     '<div style="font-weight:600;font-size:15px;">' + escHtml(total) + '</div>'
+        +   '</div>'
+        + '</div>'
+        + '<div style="margin-top:18px;color:var(--text2);font-size:11px;text-transform:uppercase;">Items</div>'
+        + '<div>' + itemsHtml + '</div>'
+        + trackingBlock;
+
+    // Show ship form only when not yet shipped.
+    const shipForm = document.getElementById('orderModalShipForm');
+    const shipBtn = document.getElementById('orderShipBtn');
+    if (o.status === 'shipped') {
+        shipForm.style.display = 'none';
+        shipBtn.style.display = 'none';
+    } else {
+        shipForm.style.display = '';
+        shipBtn.style.display = '';
+        document.getElementById('orderShipTracking').value = '';
+        document.getElementById('orderShipNotify').checked = true;
+    }
+    document.getElementById('orderModal').classList.add('visible');
+}
+
+function closeOrderModal() {
+    document.getElementById('orderModal').classList.remove('visible');
+    viewingOrderId = null;
+}
+
+async function submitMarkShipped() {
+    if (!viewingOrderId) return;
+    const carrier = document.getElementById('orderShipCarrier').value;
+    const tracking = document.getElementById('orderShipTracking').value.trim();
+    const notify = document.getElementById('orderShipNotify').checked;
+    const errEl = document.getElementById('orderShipError');
+    errEl.style.display = 'none';
+    if (!tracking) { errEl.textContent = 'Tracking number required'; errEl.style.display = ''; return; }
+    try {
+        const resp = await fetch(API + '/shop/admin/orders/' + viewingOrderId + '/ship', {
+            method: 'POST',
+            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ carrier, tracking_number: tracking, notify_customer: notify }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); errEl.style.display = ''; return; }
+        toast('Order marked as shipped' + (notify ? ' (customer emailed)' : ''), 'success');
+        closeOrderModal();
+        await loadShopOrders();
+    } catch (e) { errEl.textContent = e.message; errEl.style.display = ''; }
+}
 </script>
 </body>
 </html>
