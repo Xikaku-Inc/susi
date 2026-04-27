@@ -437,6 +437,18 @@ The server uses JWT-based authentication with multi-user support. Each team memb
 - Sessions use **HS256 JWT tokens** with 24-hour expiry
 - 2FA uses **TOTP** (compatible with Google Authenticator, Authy, etc.)
 - New users and password resets force a password change on next login
+- Login is rate-limited (10 attempts/minute/IP); shop checkout is rate-limited (10 requests/minute/IP)
+
+#### API tokens (`susi_pat_…`) and 2FA
+
+API tokens are long-lived bearers for headless clients (CI, scripts) and **bypass interactive 2FA**. The trade-off is deliberate: requiring a TOTP seed alongside an API token in CI raises attack surface without raising the bar — anyone with access to the bearer would also have access to the seed.
+
+Operational consequences:
+
+- Treat each API token as equivalent to a password + 2FA. Store it in a secret manager, never check it into git.
+- Tokens are SHA-256-hashed at rest and revocable from the dashboard. Rotate them on any suspected compromise and on every team-member departure.
+- For day-to-day admin work in the browser, use a JWT login — TOTP is enforced on every admin write that uses a JWT principal.
+- Limit API tokens to the smallest set of users that need them, and audit `/api/v1/auth/api-tokens/all` periodically (admin-only).
 
 ### Activate a license
 
