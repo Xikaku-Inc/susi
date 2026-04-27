@@ -3,6 +3,7 @@ mod website;
 mod email;
 mod shop;
 mod invoice_pdf;
+mod contact;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -109,6 +110,25 @@ struct Cli {
     /// checkout. Empty = don't send. Falls back to smtp_from_addr if blank.
     #[arg(long, env = "SUSI_SHOP_NOTIFY_ADDR", default_value = "")]
     shop_notify_addr: String,
+
+    // -------- Contact form --------
+    //
+    // All three may be empty. If `contact_to_addr` is empty (or SMTP isn't
+    // configured) the form endpoint returns 503 and the frontend hides the
+    // form. If `turnstile_secret`+`turnstile_site_key` are empty the form is
+    // still served but with no captcha (honeypot + rate-limit only).
+
+    /// Recipient address for contact-form submissions.
+    #[arg(long, env = "SUSI_CONTACT_TO_ADDR", default_value = "")]
+    contact_to_addr: String,
+
+    /// Cloudflare Turnstile secret key (server-side siteverify).
+    #[arg(long, env = "SUSI_TURNSTILE_SECRET", default_value = "")]
+    turnstile_secret: String,
+
+    /// Cloudflare Turnstile site key (public, embedded in the form).
+    #[arg(long, env = "SUSI_TURNSTILE_SITE_KEY", default_value = "")]
+    turnstile_site_key: String,
 }
 
 struct AppState {
@@ -119,12 +139,16 @@ struct AppState {
     login_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     checkout_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     webhook_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    contact_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     email: Option<EmailService>,
     magic_link_base_url: String,
     stripe_secret_key: String,
     stripe_webhook_secret: String,
     shop_base_url: String,
     shop_notify_addr: String,
+    contact_to_addr: String,
+    turnstile_secret: String,
+    turnstile_site_key: String,
     http: reqwest::Client,
 }
 
@@ -2937,6 +2961,16 @@ async fn main() -> Result<()> {
         .build()
         .context("Failed to build HTTP client")?;
 
+    if cli.contact_to_addr.is_empty() {
+        log::info!("Contact form disabled (SUSI_CONTACT_TO_ADDR empty)");
+    } else if email_service.is_none() {
+        log::warn!("Contact form: SUSI_CONTACT_TO_ADDR is set but SMTP isn't configured — endpoint will respond 503");
+    } else if cli.turnstile_secret.is_empty() || cli.turnstile_site_key.is_empty() {
+        log::warn!("Contact form enabled with NO captcha (turnstile keys empty) — relying on honeypot + rate-limit only");
+    } else {
+        log::info!("Contact form enabled, recipient = {}, Turnstile active", cli.contact_to_addr);
+    }
+
     let state = Arc::new(AppState {
         db: Mutex::new(db),
         private_key,
@@ -2945,12 +2979,16 @@ async fn main() -> Result<()> {
         login_attempts: Mutex::new(HashMap::new()),
         checkout_attempts: Mutex::new(HashMap::new()),
         webhook_attempts: Mutex::new(HashMap::new()),
+        contact_attempts: Mutex::new(HashMap::new()),
         email: email_service,
         magic_link_base_url: cli.magic_link_base_url.clone(),
         stripe_secret_key: cli.stripe_secret_key,
         stripe_webhook_secret: cli.stripe_webhook_secret,
         shop_base_url: if cli.shop_base_url.is_empty() { cli.magic_link_base_url.clone() } else { cli.shop_base_url },
         shop_notify_addr,
+        contact_to_addr: cli.contact_to_addr,
+        turnstile_secret: cli.turnstile_secret,
+        turnstile_site_key: cli.turnstile_site_key,
         http,
     });
 
@@ -3104,6 +3142,9 @@ async fn main() -> Result<()> {
             "/api/v1/website/admin/assets",
             get(website::handle_list_assets_with_usage),
         )
+        // Public contact form
+        .route("/api/v1/contact/config", get(contact::handle_get_config))
+        .route("/api/v1/contact", post(contact::handle_submit))
         .route(
             "/api/v1/website/assets/{file}/rename",
             post(website::handle_rename_asset),

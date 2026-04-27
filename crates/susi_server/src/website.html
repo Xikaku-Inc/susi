@@ -537,6 +537,20 @@ body {
 .buy-card-body { flex: 1; min-width: 0; }
 .buy-card-title { font-weight: 500; font-size: 13px; line-height: 1.3; }
 .buy-card-price { font-size: 12px; color: var(--text2); margin-top: 2px; }
+
+/* Contact form */
+.contact-form { margin: 24px 0; max-width: 560px; display: flex; flex-direction: column; gap: 12px; }
+.contact-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text2); }
+.contact-form input, .contact-form textarea { padding: 8px 10px; background: var(--bg); color: var(--text1); border: 1px solid var(--border); border-radius: var(--radius); font: inherit; font-size: 14px; }
+.contact-form input:focus, .contact-form textarea:focus { outline: none; border-color: var(--accent); }
+.contact-form textarea { min-height: 140px; resize: vertical; }
+.contact-form .hp-field { position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; }
+.contact-form .row-actions { display: flex; gap: 10px; align-items: center; }
+.contact-form .status { font-size: 13px; }
+.contact-form .status.ok { color: #4caf75; }
+.contact-form .status.err { color: #e2615e; }
+.contact-form .turnstile-slot { min-height: 65px; }
+.email-obf { cursor: pointer; color: var(--accent); text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -683,6 +697,13 @@ function videoEmbedSrc(url) {
 function renderInline(s) {
     let out = escHtml(s);
     out = out.replace(/`([^`]+)`/g, (_, c) => '<code>' + c + '</code>');
+    out = out.replace(/\{\{email:([^\s}]+)\}\}/g, (_, addr) => {
+        const at = addr.indexOf('@');
+        if (at <= 0 || at === addr.length - 1) return escHtml(addr);
+        const u = addr.slice(0, at);
+        const d = addr.slice(at + 1);
+        return '<span class="email-obf" data-u="' + btoa(u) + '" data-d="' + btoa(d) + '" tabindex="0" role="button">show email</span>';
+    });
     out = out.replace(/!\[([^\]]*)\]\(([^)]+)\)(\{[^}]*\})?/g, (_, alt, url, attrs) => {
         const vsrc = videoEmbedSrc(url);
         if (vsrc) {
@@ -724,6 +745,11 @@ function renderMarkdown(src) {
     let i = 0;
     while (i < lines.length) {
         const line = lines[i];
+        if (line.trim() === '{{contact-form}}') {
+            out.push('<div data-contact-form></div>');
+            i++;
+            continue;
+        }
         const fence = line.match(/^```(.*)$/);
         if (fence) {
             const lang = fence[1].trim();
@@ -957,6 +983,8 @@ function renderPage() {
     const { html: withIds, headings } = injectHeadingIds(html);
     c.innerHTML = withIds;
     renderToc(headings);
+    revealEmailObfs(c);
+    mountContactForms(c);
     // Append a "buy" callout for sensor pages whose slug maps to live SKUs.
     if (currentSlug && SLUG_TO_SKU_PREFIXES[currentSlug]) {
         loadShopProducts().then(() => injectBuyCallout(currentSlug));
@@ -1953,6 +1981,165 @@ function injectBuyCallout(slug) {
         + '<div class="buy-grid">' + cards + '</div>'
         + '</div>'
     );
+}
+
+// ---- Email obfuscation + contact form ----
+function revealEmailObfs(root) {
+    const els = root.querySelectorAll('span.email-obf[data-u][data-d]');
+    els.forEach(el => {
+        let revealed = false;
+        const reveal = () => {
+            if (revealed) return;
+            revealed = true;
+            try {
+                const u = atob(el.getAttribute('data-u'));
+                const d = atob(el.getAttribute('data-d'));
+                const addr = u + '@' + d;
+                const a = document.createElement('a');
+                a.href = 'mailto:' + addr;
+                a.textContent = addr;
+                a.className = 'email-obf';
+                el.replaceWith(a);
+            } catch (e) {}
+        };
+        el.addEventListener('click', reveal);
+        el.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); reveal(); } });
+        el.addEventListener('mouseenter', reveal, { once: true });
+    });
+}
+
+let contactConfigPromise = null;
+function loadContactConfig() {
+    if (!contactConfigPromise) {
+        contactConfigPromise = fetch(API + '/contact/config')
+            .then(r => r.ok ? r.json() : { enabled: false, turnstile_site_key: '' })
+            .catch(() => ({ enabled: false, turnstile_site_key: '' }));
+    }
+    return contactConfigPromise;
+}
+
+let turnstileScriptPromise = null;
+function loadTurnstileScript() {
+    if (!turnstileScriptPromise) {
+        turnstileScriptPromise = new Promise((resolve, reject) => {
+            if (window.turnstile) { resolve(); return; }
+            const s = document.createElement('script');
+            s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+            s.async = true; s.defer = true;
+            s.onload = () => resolve();
+            s.onerror = () => reject(new Error('Turnstile script failed to load'));
+            document.head.appendChild(s);
+        });
+    }
+    return turnstileScriptPromise;
+}
+
+function mountContactForms(root) {
+    const slots = root.querySelectorAll('div[data-contact-form]');
+    if (!slots.length) return;
+    loadContactConfig().then(cfg => {
+        slots.forEach(slot => buildContactForm(slot, cfg));
+    });
+}
+
+function buildContactForm(slot, cfg) {
+    if (!cfg.enabled) {
+        slot.innerHTML = '<div class="empty-state" style="padding:14px;font-size:13px;">Contact form is currently unavailable. Please email us directly.</div>';
+        return;
+    }
+    slot.innerHTML =
+        '<form class="contact-form" novalidate>'
+        + '<label>Your name<input type="text" name="name" required maxlength="200" autocomplete="name"></label>'
+        + '<label>Email address<input type="email" name="email" required maxlength="320" autocomplete="email"></label>'
+        + '<label>Subject<input type="text" name="subject" maxlength="200"></label>'
+        + '<label>Message<textarea name="message" required minlength="10" maxlength="8000"></textarea></label>'
+        + '<label class="hp-field" aria-hidden="true"><input type="text" name="website" tabindex="-1" autocomplete="off"></label>'
+        + '<div class="turnstile-slot"></div>'
+        + '<div class="row-actions">'
+        +   '<button type="submit" class="btn primary">Send message</button>'
+        +   '<span class="status"></span>'
+        + '</div>'
+        + '</form>';
+    const form = slot.querySelector('form');
+    const status = form.querySelector('.status');
+    const tsSlot = form.querySelector('.turnstile-slot');
+    let tsWidgetId = null;
+    let tsToken = '';
+
+    if (cfg.turnstile_site_key) {
+        loadTurnstileScript().then(() => {
+            const renderWidget = () => {
+                if (!window.turnstile) return;
+                const tsTheme = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+                tsWidgetId = window.turnstile.render(tsSlot, {
+                    sitekey: cfg.turnstile_site_key,
+                    theme: tsTheme,
+                    callback: t => { tsToken = t || ''; },
+                    'error-callback': () => { tsToken = ''; },
+                    'expired-callback': () => { tsToken = ''; },
+                });
+            };
+            // Turnstile attaches a global ready hook when the script finishes.
+            if (window.turnstile && window.turnstile.render) renderWidget();
+            else if (window.turnstile && window.turnstile.ready) window.turnstile.ready(renderWidget);
+            else setTimeout(renderWidget, 200);
+        }).catch(() => {
+            tsSlot.innerHTML = '<span class="status err">Captcha failed to load — try refreshing.</span>';
+        });
+    } else {
+        tsSlot.style.display = 'none';
+    }
+
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        status.className = 'status';
+        status.textContent = '';
+        const fd = new FormData(form);
+        const payload = {
+            name: (fd.get('name') || '').toString(),
+            email: (fd.get('email') || '').toString(),
+            subject: (fd.get('subject') || '').toString(),
+            message: (fd.get('message') || '').toString(),
+            website: (fd.get('website') || '').toString(),
+            turnstile_token: tsToken,
+        };
+        if (cfg.turnstile_site_key && !tsToken) {
+            status.className = 'status err';
+            status.textContent = 'Please complete the captcha first.';
+            return;
+        }
+        const submitBtn = form.querySelector('button[type=submit]');
+        submitBtn.disabled = true;
+        try {
+            const resp = await fetch(API + '/contact', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            if (resp.ok) {
+                form.reset();
+                if (tsWidgetId !== null && window.turnstile) {
+                    try { window.turnstile.reset(tsWidgetId); } catch (e) {}
+                }
+                tsToken = '';
+                status.className = 'status ok';
+                status.textContent = 'Thanks — your message is on its way.';
+            } else {
+                const d = await resp.json().catch(() => ({}));
+                status.className = 'status err';
+                status.textContent = d.error || ('Could not send (HTTP ' + resp.status + ')');
+                if (tsWidgetId !== null && window.turnstile) {
+                    try { window.turnstile.reset(tsWidgetId); } catch (e) {}
+                }
+                tsToken = '';
+            }
+        } catch (err) {
+            status.className = 'status err';
+            status.textContent = 'Network error — please try again.';
+        } finally {
+            submitBtn.disabled = false;
+        }
+    });
 }
 
 // ---- Routing for shop ----
