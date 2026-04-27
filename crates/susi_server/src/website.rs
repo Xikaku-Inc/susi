@@ -465,7 +465,7 @@ pub async fn handle_delete_asset(
 
 const WEBSITE_HTML: &str = include_str!("website.html");
 const SITE_NAME: &str = "Xikaku";
-const SITE_TAGLINE: &str = "Complete Perception for autonomous systems.";
+const SITE_TAGLINE: &str = "Sight beyond Sight";
 const ORG_LEGAL_NAME: &str = "LP-Research Inc.";
 const ORG_ADDR_LOCALITY: &str = "Tokyo";
 const ORG_ADDR_COUNTRY: &str = "JP";
