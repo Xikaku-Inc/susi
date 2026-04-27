@@ -2896,6 +2896,9 @@ impl LicenseDb {
     //                tracking_number, shipped_at, notes)
     // ---------------------------------------------------------------------
 
+    /// Insert a shop order keyed on `stripe_session_id`. Returns `(id, inserted)`;
+    /// `inserted == false` means the row already existed (Stripe webhook retry).
+    /// Callers use that flag to skip side effects (emails) on retries.
     pub fn insert_order_if_absent(
         &self,
         stripe_session_id: &str,
@@ -2906,9 +2909,8 @@ impl LicenseDb {
         currency: &str,
         ship_to_json: &str,
         line_items_json: &str,
-    ) -> Result<i64, LicenseError> {
-        // INSERT OR IGNORE so retried webhook events don't duplicate.
-        self.conn.execute(
+    ) -> Result<(i64, bool), LicenseError> {
+        let n = self.conn.execute(
             "INSERT OR IGNORE INTO shop_orders
                (stripe_session_id, created_at, customer_email, customer_name,
                 amount_total_cents, currency, status, ship_to_json, line_items_json)
@@ -2919,7 +2921,6 @@ impl LicenseDb {
             ],
         )
         .map_err(|e| LicenseError::Other(format!("DB insert order: {}", e)))?;
-        // Always look up the id (whether we inserted or it already existed).
         let id = self.conn
             .query_row(
                 "SELECT id FROM shop_orders WHERE stripe_session_id = ?1",
@@ -2927,7 +2928,7 @@ impl LicenseDb {
                 |r| r.get::<_, i64>(0),
             )
             .map_err(|e| LicenseError::Other(format!("DB lookup order: {}", e)))?;
-        Ok(id)
+        Ok((id, n > 0))
     }
 
     #[allow(clippy::type_complexity)]

@@ -474,7 +474,16 @@ pub async fn handle_stripe_webhook(
     if event_type == "checkout.session.completed" {
         // Persist a shadow-row in shop_orders so we can drive fulfillment
         // from the admin UI without a round-trip to Stripe for every list.
-        let order_id = persist_order_from_event(&state, &event).await;
+        // `inserted == false` means a previous delivery already created the
+        // order — Stripe is retrying. Skip emails so the customer doesn't
+        // get a duplicate confirmation.
+        let persisted = persist_order_from_event(&state, &event).await;
+        let order_id = persisted.map(|(id, _)| id);
+        let is_new_order = persisted.map(|(_, ins)| ins).unwrap_or(false);
+        if !is_new_order {
+            log::info!("Stripe webhook retry for already-recorded session — skipping emails");
+            return Ok(Json(json!({ "received": true, "duplicate": true })));
+        }
 
         // Fetch line items + invoice PDF in parallel — both via Stripe API,
         // both best-effort (we still send emails even if one is unavailable).
@@ -941,10 +950,12 @@ async fn fetch_line_items(state: &AppState, session_id: &str) -> Vec<Value> {
     }
 }
 
-/// Persist a Stripe Checkout Session as a shop_orders row. Returns the local
-/// order id on success, None on any error (we still want the webhook to ack
-/// 200 so Stripe doesn't keep retrying).
-async fn persist_order_from_event(state: &AppState, event: &Value) -> Option<i64> {
+/// Persist a Stripe Checkout Session as a shop_orders row. Returns
+/// `(local_order_id, inserted)` on success — `inserted == false` means the
+/// row already existed (Stripe retry) and side effects (emails) should be
+/// skipped. Returns `None` on any error (still ack 200 so Stripe stops
+/// retrying after the first DB success).
+async fn persist_order_from_event(state: &AppState, event: &Value) -> Option<(i64, bool)> {
     let obj = event.pointer("/data/object")?;
     let session_id = obj.get("id")?.as_str()?;
 
@@ -970,7 +981,7 @@ async fn persist_order_from_event(state: &AppState, event: &Value) -> Option<i64
         db.insert_order_if_absent(session_id, &now, email, name, amount, currency, &ship_to_json, &line_items_json)
     };
     match res {
-        Ok(id) => Some(id),
+        Ok((id, inserted)) => Some((id, inserted)),
         Err(e) => { log::error!("persist order: {}", e); None }
     }
 }
