@@ -129,13 +129,14 @@ body {
 .layout.no-sidebar.no-toc { grid-template-columns: 1fr; }
 .sidebar {
     border-right: 1px solid var(--border);
-    background: var(--bg2);
+    background: #000000;
     padding: 16px 0;
     overflow-y: auto;
     max-height: calc(100vh - 56px);
     position: sticky;
     top: 56px;
 }
+:root[data-theme="light"] .sidebar { background: #ffffff; }
 .sidebar h3 {
     font-size: 11px;
     font-weight: 600;
@@ -163,6 +164,16 @@ body {
     padding-left: 16px;
     font-weight: 500;
 }
+.sidebar a .chev {
+    display: inline-block;
+    width: 12px;
+    margin-right: 6px;
+    font-size: 11px;
+    line-height: 1;
+    color: var(--text2);
+    vertical-align: 1px;
+}
+.sidebar .sidebar-children.collapsed { display: none; }
 .sidebar .empty { padding: 16px; color: var(--text2); font-size: 13px; }
 
 .content {
@@ -997,10 +1008,16 @@ function renderSidebar() {
     topLevel.sort((a, b) => a.ord - b.ord || a.title.localeCompare(b.title));
     let html = '';
     topLevel.forEach(p => {
-        html += renderSidebarItem(p, true);
         const children = byParent.get(p.slug) || [];
         children.sort((a, b) => a.ord - b.ord || a.title.localeCompare(b.title));
-        children.forEach(c => html += renderSidebarItem(c, false));
+        const hasChildren = children.length > 0;
+        const expanded = hasChildren && (p.slug === currentSlug || children.some(c => c.slug === currentSlug));
+        html += renderSidebarItem(p, true, hasChildren, expanded);
+        if (hasChildren) {
+            html += '<div class="sidebar-children' + (expanded ? '' : ' collapsed') + '">';
+            children.forEach(c => html += renderSidebarItem(c, false, false, false));
+            html += '</div>';
+        }
     });
     const orphans = pages.filter(p => p.parent_slug && !slugSet.has(p.parent_slug));
     if (orphans.length) {
@@ -1012,7 +1029,7 @@ function renderSidebar() {
         for (const [g, items] of groups) {
             html += '<h3>' + escHtml(g) + '</h3>';
             items.sort((a, b) => a.ord - b.ord || a.title.localeCompare(b.title));
-            items.forEach(it => html += renderSidebarItem(it, false));
+            items.forEach(it => html += renderSidebarItem(it, false, false, false));
         }
     }
     const shopActive = currentSlug === '__shop__' ? ' active' : '';
@@ -1020,10 +1037,11 @@ function renderSidebar() {
     sb.innerHTML = html;
 }
 
-function renderSidebarItem(p, isHead) {
+function renderSidebarItem(p, isHead, hasChildren, expanded) {
     const cls = (p.slug === currentSlug ? 'active' : '') + (isHead ? ' section-head' : '');
+    const chev = hasChildren ? '<span class="chev">' + (expanded ? '▼' : '▶') + '</span>' : '';
     return '<a class="' + cls + '" href="/site/' + encodeURIComponent(p.slug) + '">'
-        + escHtml(p.title) + '</a>';
+        + chev + escHtml(p.title) + '</a>';
 }
 
 function renderEmptyState(msg) {
