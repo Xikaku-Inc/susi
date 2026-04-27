@@ -204,6 +204,20 @@ pub async fn handle_create_checkout_session(
     if req.items.len() > 100 {
         return Err(error_response(StatusCode::BAD_REQUEST, "Too many items"));
     }
+    // ISO-3166-1 alpha-2 country codes are 2 letters; allow empty (initial
+    // page load before the country selector is rendered). Shop only serves
+    // the US and Canada — reject all other destinations.
+    if !req.destination_country.is_empty() {
+        if req.destination_country.len() != 2
+            || !req.destination_country.chars().all(|c| c.is_ascii_alphabetic())
+        {
+            return Err(error_response(StatusCode::BAD_REQUEST, "Invalid destination country"));
+        }
+        let up = req.destination_country.to_uppercase();
+        if !SUPPORTED_SHIPPING_COUNTRIES.contains(&up.as_str()) {
+            return Err(error_response(StatusCode::BAD_REQUEST, "We only ship to the US and Canada"));
+        }
+    }
 
     // Look up each SKU, never trust client-supplied price.
     let mut resolved: Vec<(String, String, i64, String, String, i64)> = Vec::with_capacity(req.items.len()); // sku, title, price_cents, currency, tax_code, qty
@@ -213,6 +227,14 @@ pub async fn handle_create_checkout_session(
         for item in &req.items {
             if item.qty <= 0 || item.qty > 1000 {
                 return Err(error_response(StatusCode::BAD_REQUEST, "Invalid quantity"));
+            }
+            // Mirror admin validate_sku — bound length and character set so a
+            // pathological client can't waste a DB lookup with megabyte SKUs.
+            if item.sku.is_empty()
+                || item.sku.len() > 64
+                || !item.sku.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(error_response(StatusCode::BAD_REQUEST, "Invalid SKU"));
             }
             let row = db
                 .get_product(&item.sku)
