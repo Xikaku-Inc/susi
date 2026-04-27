@@ -441,6 +441,23 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
     .detail-grid { grid-template-columns: 1fr; }
     table { font-size: 12px; }
     th, td { padding: 8px 10px; }
+    .header { padding: 0 12px; flex-wrap: wrap; gap: 8px; height: auto; min-height: 56px; }
+    .header-left { gap: 8px; flex-wrap: wrap; }
+    .header-left .brand { font-size: 14px; }
+    .top-nav { display: none; }
+    .header-actions { gap: 6px; flex-wrap: wrap; }
+    .header-actions button { min-width: 0 !important; padding: 8px 10px; min-height: 36px; }
+    button { min-width: 0; padding: 10px 14px; min-height: 40px; }
+    button.small { padding: 6px 10px; min-height: 32px; }
+    .badge { min-width: 0; padding: 3px 10px; }
+    #searchInput { min-width: 0; width: 100%; }
+    .modal { max-width: 95vw !important; width: 95vw !important; padding: 16px !important; }
+    .modal-overlay { padding: 12px !important; }
+    .table-scroll, .scroll-x { overflow-x: auto; max-width: 100%; }
+    .card { overflow-x: auto; }
+}
+@media (max-width: 480px) {
+    .header-actions span#currentUser { display: none !important; }
 }
 </style>
 </head>

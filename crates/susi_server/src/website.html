@@ -88,8 +88,31 @@ body {
     font-size: 13px;
     cursor: pointer;
     font-family: inherit;
+    min-height: 32px;
 }
 .btn:hover { background: var(--bg3); }
+.nav-toggle {
+    display: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text1);
+    width: 40px; height: 36px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    padding: 0;
+    align-items: center;
+    justify-content: center;
+}
+.nav-toggle:hover { background: var(--bg3); }
+.nav-toggle svg { width: 20px; height: 20px; display: block; stroke: currentColor; }
+.nav-overlay {
+    position: fixed; inset: 56px 0 0 0;
+    background: rgba(0,0,0,0.4);
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.2s;
+    z-index: 140;
+}
+.nav-overlay.open { opacity: 1; pointer-events: auto; }
 .btn.primary { background: var(--accent); color: white; border-color: var(--accent); }
 .btn.primary:hover { filter: brightness(1.1); }
 .btn.danger { color: #e2615e; }
@@ -181,6 +204,8 @@ body {
     border-radius: 0 var(--radius) var(--radius) 0;
 }
 .content table { border-collapse: collapse; margin: 14px 0; font-size: 13px; width: 100%; }
+.content .table-scroll { overflow-x: auto; max-width: 100%; margin: 14px 0; -webkit-overflow-scrolling: touch; }
+.content .table-scroll table { margin: 0; }
 .content th, .content td {
     border: 1px solid var(--border);
     padding: 7px 11px; text-align: left; vertical-align: top;
@@ -473,13 +498,46 @@ body {
 .toc-rail a.lvl-4 { padding-left: 34px; font-size: 11.5px; color: var(--text2); }
 
 @media (max-width: 1100px) {
-    .layout { grid-template-columns: var(--sidebar-width) 1fr; }
+    .layout,
+    .layout.no-sidebar,
+    .layout.no-toc { grid-template-columns: var(--sidebar-width) 1fr; }
+    .layout.no-sidebar { grid-template-columns: 1fr; }
     .toc-rail { display: none; }
 }
+@media (max-width: 900px) {
+    :root { --sidebar-width: 200px; }
+    .content { padding: 32px 32px; }
+}
 @media (max-width: 720px) {
-    .layout { grid-template-columns: 1fr; }
-    .sidebar { position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--border); }
-    .content { padding: 24px; }
+    .layout,
+    .layout.no-sidebar,
+    .layout.no-toc,
+    .layout.no-sidebar.no-toc { grid-template-columns: 1fr; }
+    .sidebar {
+        position: fixed;
+        top: 56px;
+        left: 0;
+        width: 280px;
+        max-width: 80vw;
+        height: calc(100vh - 56px);
+        max-height: none;
+        border-right: 1px solid var(--border);
+        border-bottom: none;
+        z-index: 150;
+        transform: translateX(-100%);
+        transition: transform 0.2s ease;
+    }
+    .sidebar.open { transform: translateX(0); }
+    .layout.no-sidebar .sidebar { display: none; }
+    .nav-toggle { display: inline-flex; }
+    .content { padding: 20px 16px; max-width: 100%; }
+    .content h1 { font-size: 26px; }
+    .content h2 { font-size: 19px; }
+    .header { padding: 0 12px; }
+    .header .brand { font-size: 15px; }
+    .header-right { gap: 4px; }
+    .header-right .btn { padding: 8px 10px; font-size: 13px; min-height: 36px; }
+    .cart-badge { margin-left: 4px; padding: 0 5px; }
 }
 
 /* ---- Shop ---- */
@@ -556,6 +614,13 @@ body {
 <body>
 
 <div class="header">
+    <button class="nav-toggle" id="navToggle" onclick="toggleSidebar()" aria-label="Open menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+        </svg>
+    </button>
     <a href="/site" class="brand">Xikaku</a>
     <div class="header-right">
         <button id="editBtn" class="btn" onclick="enterEditMode()" style="display:none;">Edit</button>
@@ -573,6 +638,8 @@ body {
     </main>
     <aside class="toc-rail" id="tocRail" aria-label="On this page"></aside>
 </div>
+
+<div id="navOverlay" class="nav-overlay" onclick="closeSidebar()"></div>
 
 <div id="toast" class="toast"></div>
 
@@ -612,6 +679,26 @@ function applyTheme(t) {
         btn.title = 'Theme: ' + t + ' (click to cycle)';
     }
 }
+function toggleSidebar() {
+    const sb = document.getElementById('sidebar');
+    const ov = document.getElementById('navOverlay');
+    if (!sb) return;
+    const open = sb.classList.toggle('open');
+    if (ov) ov.classList.toggle('open', open);
+}
+function closeSidebar() {
+    const sb = document.getElementById('sidebar');
+    const ov = document.getElementById('navOverlay');
+    if (sb) sb.classList.remove('open');
+    if (ov) ov.classList.remove('open');
+}
+document.addEventListener('click', (e) => {
+    const sb = document.getElementById('sidebar');
+    if (!sb || !sb.classList.contains('open')) return;
+    const a = e.target.closest('a');
+    if (a && sb.contains(a)) closeSidebar();
+});
+
 function cycleTheme() {
     const cur = localStorage.getItem('susi_theme') || 'system';
     const next = cur === 'dark' ? 'light' : cur === 'light' ? 'system' : 'dark';
@@ -787,7 +874,7 @@ function renderMarkdown(src) {
                 rows.push(splitTableRow(lines[i])); i++;
             }
             const isGrid = headers.every(h => h.trim() === '');
-            let html = isGrid ? '<table class="grid"><tbody>' : '<table><thead><tr>';
+            let html = isGrid ? '<table class="grid"><tbody>' : '<div class="table-scroll"><table><thead><tr>';
             if (!isGrid) {
                 headers.forEach(hh => html += '<th>' + renderInline(hh) + '</th>');
                 html += '</tr></thead><tbody>';
@@ -797,7 +884,7 @@ function renderMarkdown(src) {
                 r.forEach(c => html += '<td>' + renderInline(c) + '</td>');
                 html += '</tr>';
             });
-            html += '</tbody></table>';
+            html += '</tbody></table>' + (isGrid ? '' : '</div>');
             out.push(html);
             continue;
         }
