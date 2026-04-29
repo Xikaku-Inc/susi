@@ -540,6 +540,7 @@ body {
         <nav class="top-nav" id="topNav"></nav>
     </div>
     <div class="header-right">
+        <span id="wsBanner" style="display:none;font-size:13px;color:var(--text2);margin-right:12px;">Workspace: <strong id="wsBannerName" style="color:var(--accent);"></strong></span>
         <select id="releasePicker" class="release-picker" onchange="onReleaseChanged()"></select>
         <button id="editBtn" class="btn" onclick="enterEditMode()" style="display:none;">Edit</button>
         <button id="newPageBtn" class="btn" onclick="newPage()" style="display:none;">+ Page</button>
@@ -621,10 +622,30 @@ let currentSlug = null;
 let currentPage = null; // {title, body_md, parent_slug, ord, updated_at}
 let editMode = false;
 
-// Admin detection: a JWT token in localStorage means we MAY have edit permission.
-// The server enforces the actual permission; we just hide the buttons by default.
+// Workspace mode: when ?workspace=<id> is present in the URL, the editor
+// scopes itself to that workspace. The release listing comes from a
+// workspace-only endpoint and all read fetches send auth (workspace doc reads
+// require membership). Initial tag may also be pinned via ?tag=<tag>.
+const workspaceParams = new URLSearchParams(location.search);
+const currentWorkspaceId = workspaceParams.get('workspace') || null;
+const initialTagParam = workspaceParams.get('tag') || null;
+let currentWorkspaceName = null;
+
+// Admin detection. We confirm against the server in renderTopNav() and update
+// `isAdminUser` so edit/new-page buttons only show for actual admins; a JWT
+// alone (e.g. a workspace member's session) is not enough.
 function authToken() { return localStorage.getItem('auth_token') || ''; }
-function isPotentialAdmin() { return !!authToken(); }
+let isAdminUser = false;
+function isPotentialAdmin() { return isAdminUser; }
+
+// Build fetch options that automatically include Authorization when we have a
+// token. Workspace doc reads require auth on the backend, so we send it for
+// every doc-related fetch when a token exists. Safe for global docs too.
+function docHeaders(extra) {
+    const h = Object.assign({}, extra || {});
+    if (authToken()) h['Authorization'] = 'Bearer ' + authToken();
+    return h;
+}
 
 // Render the same top nav that dashboard.html uses, so users can jump
 // back to Releases/Workspaces/Licenses without losing the susi shell.
@@ -643,6 +664,13 @@ async function renderTopNav() {
             }
         } catch (e) {}
     }
+    isAdminUser = isAdmin;
+    // The buttons may have already been laid out by route() before the role
+    // check resolved. Re-apply visibility now that we know the answer.
+    const editBtn = document.getElementById('editBtn');
+    const newBtn = document.getElementById('newPageBtn');
+    if (editBtn && currentPage) editBtn.style.display = isAdmin ? '' : 'none';
+    if (newBtn) newBtn.style.display = isAdmin ? '' : 'none';
     const items = [
         { label: 'Documentation', href: '/docs', active: true,           show: true },
         { label: 'Workspaces',    href: '/#/workspaces', active: false,  show: !!authToken() },
@@ -665,6 +693,24 @@ function logoutFromDocs() {
 
 // Build the nav once on load.
 renderTopNav();
+
+// In workspace mode, show the workspace name in the header.
+if (currentWorkspaceId) {
+    (async () => {
+        try {
+            const r = await fetch(API + '/workspaces/' + encodeURIComponent(currentWorkspaceId), {
+                headers: docHeaders(),
+            });
+            if (r.ok) {
+                const d = await r.json();
+                currentWorkspaceName = d.name || currentWorkspaceId;
+                const el = document.getElementById('wsBanner');
+                document.getElementById('wsBannerName').textContent = currentWorkspaceName;
+                el.style.display = '';
+            }
+        } catch (e) {}
+    })();
+}
 
 function toast(msg, kind) {
     const el = document.getElementById('toast');
@@ -845,9 +891,14 @@ function splitTableRow(line) {
 // ---------------------------------------------------------------------------
 
 async function loadReleases() {
-    const resp = await fetch(API + '/docs/releases');
+    const url = currentWorkspaceId
+        ? API + '/workspaces/' + encodeURIComponent(currentWorkspaceId) + '/docs/releases'
+        : API + '/docs/releases';
+    const resp = await fetch(url, { headers: docHeaders() });
     if (!resp.ok) {
-        renderEmptyState('Could not load documentation index.');
+        renderEmptyState(currentWorkspaceId
+            ? 'Could not load workspace documentation. Are you signed in as a workspace member?'
+            : 'Could not load documentation index.');
         return false;
     }
     const data = await resp.json();
@@ -862,7 +913,7 @@ async function loadReleases() {
 async function loadRelease(tag) {
     currentTag = tag;
     document.getElementById('releasePicker').value = tag;
-    const resp = await fetch(API + '/docs/' + encodeURIComponent(tag) + '/pages');
+    const resp = await fetch(API + '/docs/' + encodeURIComponent(tag) + '/pages', { headers: docHeaders() });
     if (!resp.ok) {
         renderEmptyState('Release "' + tag + '" not found.');
         return;
@@ -876,7 +927,7 @@ async function loadRelease(tag) {
 async function loadPage(slug) {
     if (!currentTag) return;
     currentSlug = slug;
-    const resp = await fetch(API + '/docs/' + encodeURIComponent(currentTag) + '/pages/' + encodeURIComponent(slug));
+    const resp = await fetch(API + '/docs/' + encodeURIComponent(currentTag) + '/pages/' + encodeURIComponent(slug), { headers: docHeaders() });
     if (!resp.ok) {
         currentPage = null;
         renderEmptyState('Page "' + slug + '" not found in this release.');
@@ -1343,7 +1394,14 @@ async function newPage() {
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken() },
         body: JSON.stringify({ title, body_md: '# ' + title + '\n\n', parent_slug: null, ord: 999 }),
     });
-    if (!resp.ok) { toast('Create failed', 'error'); return; }
+    if (!resp.ok) {
+        let msg = 'Create failed (HTTP ' + resp.status + ')';
+        try { const d = await resp.json(); if (d && d.error) msg = d.error; } catch (_) {}
+        toast(msg, 'error');
+        return;
+    }
+    // Reload the release so the new page shows up in the sidebar before navigating.
+    await loadRelease(currentTag);
     location.hash = '#/' + currentTag + '/' + cleanSlug;
 }
 
@@ -1361,12 +1419,24 @@ async function route() {
     const parts = hash.split('/').filter(Boolean).map(decodeURIComponent);
     if (releases.length === 0) {
         const ok = await loadReleases();
-        if (!ok) { renderEmptyState('No documentation has been published yet.'); return; }
+        if (!ok) {
+            renderEmptyState(currentWorkspaceId
+                ? 'No documentation releases in this workspace yet. Create one from the Workspaces page.'
+                : 'No documentation has been published yet.');
+            return;
+        }
     }
-    const tag = parts[0] || releases[0].tag;
+    // Hash takes precedence; otherwise use ?tag= (one-shot, only on first load)
+    // and fall back to the first release in the listing.
+    const tag = parts[0] || (initialTagParam && releases.some(r => r.tag === initialTagParam) ? initialTagParam : releases[0].tag);
     if (tag !== currentTag) await loadRelease(tag);
     if (pages.length === 0) {
-        document.getElementById('content').innerHTML = '<div class="empty-state"><h2>No pages in this release</h2></div>';
+        // Empty release: still surface the "+ Page" button for logged-in users
+        // so they can create the first page. Otherwise newly-created workspace
+        // releases would have no entry point.
+        document.getElementById('content').innerHTML = '<div class="empty-state"><h2>No pages in this release</h2><p style="color:var(--text2);margin-top:8px;">Click <strong>+ Page</strong> to create the first one.</p></div>';
+        document.getElementById('newPageBtn').style.display = isPotentialAdmin() ? '' : 'none';
+        document.getElementById('editBtn').style.display = 'none';
         return;
     }
     const slug = parts[1];

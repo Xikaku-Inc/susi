@@ -17,7 +17,10 @@ use serde::Deserialize;
 use serde_json::json;
 use susi_core::error::LicenseError;
 
-use crate::{error_response, require_admin, require_password_changed, validate_principal, AppState, ErrorResponse};
+use crate::{
+    error_response, release_reader_check, release_writer_check, validate_principal, AppState,
+    ErrorResponse, Principal,
+};
 
 // ---------------------------------------------------------------------------
 // Disk layout
@@ -76,19 +79,23 @@ fn db_err(e: LicenseError) -> (StatusCode, Json<ErrorResponse>) {
 }
 
 /// Seed a release that was just created with `origin='user'` doc pages +
-/// assets from the most recent prior release. Physical asset files are copied
-/// on disk alongside the DB rows. Idempotent: `INSERT OR IGNORE` makes a
-/// second call a no-op. Call from any code path that creates a release row
-/// (binary-asset upload, docs editor, docs bulk import) so user docs always
-/// carry forward.
+/// assets from the most recent prior release in the same scope (workspace or
+/// global). Physical asset files are copied on disk alongside the DB rows.
+/// Idempotent: `INSERT OR IGNORE` makes a second call a no-op. Call from any
+/// code path that creates a release row (binary-asset upload, docs editor,
+/// docs bulk import) so user docs always carry forward — but never across
+/// workspaces.
 pub(crate) fn seed_user_docs_into_release(
     state: &AppState,
     dst_id: i64,
     dst_tag: &str,
+    workspace_id: Option<&str>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let (src_tag, asset_names) = {
         let mut db = state.db.lock().unwrap();
-        let prior = db.latest_prior_release_with_user_docs(dst_id).map_err(db_err)?;
+        let prior = db
+            .latest_prior_release_with_user_docs(dst_id, workspace_id)
+            .map_err(db_err)?;
         let Some((src_id, src_tag)) = prior else {
             return Ok(());
         };
@@ -122,20 +129,41 @@ pub(crate) fn seed_user_docs_into_release(
     Ok(())
 }
 
+/// Permission gate for doc write endpoints that may auto-create a release.
+/// Admin-only. Returns the existing release's workspace id (if any) so seeding
+/// stays scope-correct; returns `None` if the release does not yet exist (the
+/// caller will create it as a global release).
+fn release_writer_check_or_admin_create(
+    state: &AppState,
+    principal: &Principal,
+    tag: &str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    crate::require_password_changed(state, principal)?;
+    crate::require_admin(state, principal)?;
+    let db = state.db.lock().unwrap();
+    let scoped_ws = db
+        .get_release_workspace_id(tag)
+        .map_err(db_err)?
+        .flatten();
+    Ok(scoped_ws)
+}
+
 /// Ensure the release row for `tag` exists and, if it was just created, seed
-/// it with hand-authored content from the most recent prior release. Returns
-/// the release id. Safe to call from any doc-write entry point.
+/// it with hand-authored content from the most recent prior release in the
+/// same scope. Returns the release id.
 fn ensure_release_with_seed(
     state: &AppState,
     tag: &str,
     name: &str,
+    workspace_id: Option<&str>,
 ) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
     let (dst_id, newly_created) = {
         let db = state.db.lock().unwrap();
-        db.ensure_release_created(tag, name).map_err(db_err)?
+        db.ensure_release_created_scoped(tag, name, workspace_id)
+            .map_err(db_err)?
     };
     if newly_created {
-        seed_user_docs_into_release(state, dst_id, tag)?;
+        seed_user_docs_into_release(state, dst_id, tag, workspace_id)?;
     }
     Ok(dst_id)
 }
@@ -182,9 +210,12 @@ pub async fn handle_latest_doc_release(
 
 pub async fn handle_list_doc_pages(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(tag): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     safe_tag(&tag)?;
+    let principal_opt = validate_principal(&headers, &state).ok();
+    release_reader_check(&state, principal_opt.as_ref(), &tag)?;
     let db = state.db.lock().unwrap();
     let release_id = db
         .get_release_by_tag(&tag)
@@ -217,9 +248,12 @@ pub async fn handle_list_doc_pages(
 
 pub async fn handle_get_doc_page(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((tag, slug)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     safe_tag(&tag)?;
+    let principal_opt = validate_principal(&headers, &state).ok();
+    release_reader_check(&state, principal_opt.as_ref(), &tag)?;
     let db = state.db.lock().unwrap();
     let release_id = db
         .get_release_by_tag(&tag)
@@ -243,10 +277,13 @@ pub async fn handle_get_doc_page(
 
 pub async fn handle_get_doc_asset(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((tag, file_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     safe_tag(&tag)?;
     safe_filename(&file_name)?;
+    let principal_opt = validate_principal(&headers, &state).ok();
+    release_reader_check(&state, principal_opt.as_ref(), &tag)?;
 
     let path = assets_dir(&state, &tag).join(&file_name);
     if !path.exists() {
@@ -287,14 +324,14 @@ pub async fn handle_upsert_doc_page(
     Json(req): Json<UpsertPageRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
+    let workspace_id = release_writer_check_or_admin_create(&state, &principal, &tag)?;
 
     let release_id = ensure_release_with_seed(
         &state,
         &tag,
         req.release_name.as_deref().unwrap_or(""),
+        workspace_id.as_deref(),
     )?;
     let id = {
         let db = state.db.lock().unwrap();
@@ -323,9 +360,8 @@ pub async fn handle_rename_doc_page(
     Json(req): Json<RenamePageRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
+    release_writer_check(&state, &principal, &tag)?;
     let new_slug = req.new_slug.trim();
     if new_slug.is_empty() || new_slug.contains('/') || new_slug.contains('\\') || new_slug.contains('\0') {
         return Err(error_response(StatusCode::BAD_REQUEST, "Invalid slug"));
@@ -356,9 +392,8 @@ pub async fn handle_delete_doc_page(
     Path((tag, slug)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
+    release_writer_check(&state, &principal, &tag)?;
 
     let db = state.db.lock().unwrap();
     let release_id = db
@@ -393,9 +428,8 @@ pub async fn handle_bulk_import_docs(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
+    let workspace_id = release_writer_check_or_admin_create(&state, &principal, &tag)?;
 
     let mut release_name = String::new();
     let mut manifest: HashMap<String, PageManifestEntry> = HashMap::new();
@@ -471,7 +505,7 @@ pub async fn handle_bulk_import_docs(
         })
         .collect();
 
-    let release_id = ensure_release_with_seed(&state, &tag, &release_name)?;
+    let release_id = ensure_release_with_seed(&state, &tag, &release_name, workspace_id.as_deref())?;
     let (written_pages, skipped_user_slugs) = {
         let mut db = state.db.lock().unwrap();
         db.upsert_doc_pages(release_id, &row_data).map_err(db_err)?
@@ -532,9 +566,8 @@ pub async fn handle_upload_doc_asset(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
+    let workspace_id = release_writer_check_or_admin_create(&state, &principal, &tag)?;
 
     // Pull the first "file" field from the multipart body.
     let mut file_name = String::new();
@@ -560,7 +593,7 @@ pub async fn handle_upload_doc_asset(
     safe_filename(&file_name)?;
 
     // Ensure the release exists so the asset has a valid parent row.
-    let release_id = ensure_release_with_seed(&state, &tag, "")?;
+    let release_id = ensure_release_with_seed(&state, &tag, "", workspace_id.as_deref())?;
 
     let dir = assets_dir(&state, &tag);
     std::fs::create_dir_all(&dir).map_err(|e| {
@@ -588,10 +621,9 @@ pub async fn handle_delete_doc_asset(
     Path((tag, file_name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
     safe_tag(&tag)?;
     safe_filename(&file_name)?;
+    release_writer_check(&state, &principal, &tag)?;
 
     let release_id = {
         let db = state.db.lock().unwrap();

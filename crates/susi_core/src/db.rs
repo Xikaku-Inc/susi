@@ -895,6 +895,25 @@ impl LicenseDb {
             .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))
     }
 
+    /// Find a username by email (case-insensitive). Returns None if zero or
+    /// multiple matches — ambiguous addresses shouldn't grant a password reset.
+    pub fn find_unique_username_by_email(&self, email: &str) -> Result<Option<String>, LicenseError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT username FROM users WHERE LOWER(email) = LOWER(?1) LIMIT 2")
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows: Vec<String> = stmt
+            .query_map(params![email], |r| r.get::<_, String>(0))
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if rows.len() == 1 {
+            Ok(Some(rows.into_iter().next().unwrap()))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn set_user_email(&self, username: &str, email: Option<&str>) -> Result<(), LicenseError> {
         let now = Utc::now().to_rfc3339();
         self.conn
@@ -2261,12 +2280,45 @@ impl LicenseDb {
                 "SELECT r.id, r.tag, r.name, r.created_at, COUNT(p.id)
                  FROM releases r
                  INNER JOIN doc_pages p ON p.release_id = r.id
+                 WHERE r.workspace_id IS NULL
                  GROUP BY r.id
                  ORDER BY r.id DESC",
             )
             .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
         let rows = stmt
             .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// List releases that belong to a specific workspace, regardless of whether
+    /// they have any doc pages yet. Used by the workspace docs editor to show
+    /// all workspace-scoped releases the user can author docs into.
+    pub fn list_doc_releases_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<(i64, String, String, String, i64)>, LicenseError> {
+        let mut stmt = self.conn
+            .prepare(
+                "SELECT r.id, r.tag, r.name, r.created_at,
+                        (SELECT COUNT(*) FROM doc_pages p WHERE p.release_id = r.id)
+                 FROM releases r
+                 WHERE r.workspace_id = ?1
+                 ORDER BY r.id DESC",
+            )
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map(params![workspace_id], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -2299,24 +2351,53 @@ impl LicenseDb {
         tag: &str,
         name: &str,
     ) -> Result<(i64, bool), LicenseError> {
+        self.ensure_release_created_scoped(tag, name, None)
+    }
+
+    /// Workspace-aware variant. When `workspace_id` is `Some`, the release is
+    /// created with that scope. If the tag already exists with a *different*
+    /// scope (or none), returns the existing id without modifying it — a
+    /// caller that cares should reject that case before calling.
+    pub fn ensure_release_created_scoped(
+        &self,
+        tag: &str,
+        name: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<(i64, bool), LicenseError> {
         if let Some(id) = self.get_release_by_tag(tag)? {
             return Ok((id, false));
         }
-        let id = self.insert_release(tag, name, "", false, None)?;
+        let id = self.insert_release(tag, name, "", false, workspace_id)?;
         Ok((id, true))
     }
 
     /// Return (id, tag) of the most recent release that has at least one
-    /// `origin='user'` doc page, excluding a given release id. Used to seed a
-    /// brand-new release tag with hand-authored content from the prior one.
+    /// `origin='user'` doc page, excluding a given release id. Restricted to
+    /// the same workspace scope (`Some(ws)` for a workspace release; `None`
+    /// for a global release) so that user docs from one workspace never seed
+    /// another workspace or vice versa.
     pub fn latest_prior_release_with_user_docs(
         &self,
         exclude_id: i64,
+        workspace_id: Option<&str>,
     ) -> Result<Option<(i64, String)>, LicenseError> {
-        self.conn
-            .query_row(
+        let res = match workspace_id {
+            Some(ws) => self.conn.query_row(
                 "SELECT r.id, r.tag FROM releases r
                  WHERE r.id != ?1
+                   AND r.workspace_id = ?2
+                   AND EXISTS (
+                       SELECT 1 FROM doc_pages p
+                       WHERE p.release_id = r.id AND p.origin = 'user'
+                   )
+                 ORDER BY r.id DESC LIMIT 1",
+                params![exclude_id, ws],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            ),
+            None => self.conn.query_row(
+                "SELECT r.id, r.tag FROM releases r
+                 WHERE r.id != ?1
+                   AND r.workspace_id IS NULL
                    AND EXISTS (
                        SELECT 1 FROM doc_pages p
                        WHERE p.release_id = r.id AND p.origin = 'user'
@@ -2324,8 +2405,9 @@ impl LicenseDb {
                  ORDER BY r.id DESC LIMIT 1",
                 params![exclude_id],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()
+            ),
+        };
+        res.optional()
             .map_err(|e| LicenseError::Other(format!("DB prior release: {}", e)))
     }
 
@@ -4018,7 +4100,7 @@ mod tests {
         let (new_id, created) = db.ensure_release_created("v1.1", "FusionHub 1.1").unwrap();
         assert!(created);
 
-        let prior = db.latest_prior_release_with_user_docs(new_id).unwrap();
+        let prior = db.latest_prior_release_with_user_docs(new_id, None).unwrap();
         assert_eq!(prior.as_ref().map(|p| p.1.as_str()), Some("v1.0"));
         let (src_id, _src_tag) = prior.unwrap();
 
@@ -4057,6 +4139,64 @@ mod tests {
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].1, "v1.0");
         assert_eq!(releases[0].4, 1); // page count
+    }
+
+    #[test]
+    fn test_doc_release_listings_are_scope_separated() {
+        let mut db = test_db();
+        db.create_workspace("ws-a", "A", "", "", "admin").unwrap();
+        db.create_workspace("ws-b", "B", "", "", "admin").unwrap();
+
+        let g1 = db.insert_release("g1.0", "global", "", false, None).unwrap();
+        let a1 = db.insert_release("a1.0", "a-rel", "", false, Some("ws-a")).unwrap();
+        let b1 = db.insert_release("b1.0", "b-rel", "", false, Some("ws-b")).unwrap();
+        for rid in [g1, a1, b1] {
+            db.upsert_doc_page(rid, "intro", "Intro", "body", None, 0).unwrap();
+        }
+
+        // Global list excludes workspace-scoped releases entirely.
+        let global = db.list_doc_releases().unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].1, "g1.0");
+
+        // Each workspace listing returns only its own releases (no cross-pollination).
+        let a = db.list_doc_releases_for_workspace("ws-a").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].1, "a1.0");
+
+        let b = db.list_doc_releases_for_workspace("ws-b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].1, "b1.0");
+    }
+
+    #[test]
+    fn test_seed_lookup_does_not_cross_workspace_boundaries() {
+        let mut db = test_db();
+        db.create_workspace("ws-a", "A", "", "", "admin").unwrap();
+        db.create_workspace("ws-b", "B", "", "", "admin").unwrap();
+
+        // Set up: a global release with user docs, plus ws-a release with its own user docs.
+        let g_old = db.insert_release("g0.9", "g old", "", false, None).unwrap();
+        db.upsert_doc_page(g_old, "guide", "Guide", "global hand-authored", None, 0).unwrap();
+
+        let a_old = db.insert_release("a0.9", "a old", "", false, Some("ws-a")).unwrap();
+        db.upsert_doc_page(a_old, "guide", "Guide", "ws-a hand-authored", None, 0).unwrap();
+
+        // New global release: prior must come from the global pool.
+        let (g_new, _) = db.ensure_release_created_scoped("g1.0", "g new", None).unwrap();
+        let prior = db.latest_prior_release_with_user_docs(g_new, None).unwrap();
+        assert_eq!(prior.map(|p| p.1), Some("g0.9".to_string()));
+
+        // New ws-a release: prior must come from ws-a's pool, not global, not ws-b.
+        let (a_new, _) = db.ensure_release_created_scoped("a1.0", "a new", Some("ws-a")).unwrap();
+        let prior = db.latest_prior_release_with_user_docs(a_new, Some("ws-a")).unwrap();
+        assert_eq!(prior.map(|p| p.1), Some("a0.9".to_string()));
+
+        // New ws-b release: no prior in ws-b's scope, so seeding finds nothing
+        // (it must NOT pull from ws-a or global).
+        let (b_new, _) = db.ensure_release_created_scoped("b1.0", "b new", Some("ws-b")).unwrap();
+        let prior = db.latest_prior_release_with_user_docs(b_new, Some("ws-b")).unwrap();
+        assert!(prior.is_none(), "ws-b must not see prior docs from ws-a or global");
     }
 
     #[test]

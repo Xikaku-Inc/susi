@@ -496,8 +496,8 @@ enum AuthSource {
 }
 
 #[derive(Debug)]
-struct Principal {
-    username: String,
+pub(crate) struct Principal {
+    pub(crate) username: String,
     source: AuthSource,
 }
 
@@ -506,7 +506,7 @@ const API_TOKEN_PREFIX: &str = "susi_pat_";
 /// Verify the Authorization header and resolve to a Principal. Accepts either:
 ///   - Bearer <JWT>      → AuthSource::Jwt
 ///   - Bearer susi_pat_… → AuthSource::ApiToken
-fn validate_principal(
+pub(crate) fn validate_principal(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<Principal, (StatusCode, Json<ErrorResponse>)> {
@@ -544,7 +544,7 @@ fn validate_principal(
     Ok(Principal { username: claims.sub, source: AuthSource::Jwt })
 }
 
-fn require_password_changed(
+pub(crate) fn require_password_changed(
     state: &AppState,
     principal: &Principal,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -564,7 +564,7 @@ fn require_password_changed(
     Ok(())
 }
 
-fn require_admin(
+pub(crate) fn require_admin(
     state: &AppState,
     principal: &Principal,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -587,6 +587,65 @@ fn require_admin(
         }
     }
     Ok(())
+}
+
+/// Check if a principal is a site admin (without enforcing TOTP).
+fn is_site_admin(state: &AppState, principal: &Principal) -> bool {
+    let db = state.db.lock().unwrap();
+    db.get_user_role(&principal.username)
+        .map(|r| r == "admin")
+        .unwrap_or(false)
+}
+
+/// Permission gate for editing a doc release. Admin-only (TOTP enforced),
+/// regardless of whether the release is workspace-scoped or global. Returns
+/// the release's workspace id (if any) so callers can keep doc seeding scope-
+/// correct.
+pub(crate) fn release_writer_check(
+    state: &AppState,
+    principal: &Principal,
+    tag: &str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    require_password_changed(state, principal)?;
+    require_admin(state, principal)?;
+    let scoped_ws = {
+        let db = state.db.lock().unwrap();
+        db.get_release_workspace_id(tag)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .flatten()
+    };
+    Ok(scoped_ws)
+}
+
+/// Permission gate for reading a doc release. Workspace releases require
+/// admin or any-role membership; global releases are public.
+pub(crate) fn release_reader_check(
+    state: &AppState,
+    principal_opt: Option<&Principal>,
+    tag: &str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    let scoped_ws = {
+        let db = state.db.lock().unwrap();
+        db.get_release_workspace_id(tag)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .flatten()
+    };
+    let Some(ws_id) = scoped_ws else { return Ok(None); };
+
+    let principal = principal_opt
+        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Authentication required"))?;
+    if is_site_admin(state, principal) {
+        return Ok(Some(ws_id));
+    }
+    let role = {
+        let db = state.db.lock().unwrap();
+        db.get_workspace_member_role(&ws_id, &principal.username)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+    if role.is_none() {
+        return Err(error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"));
+    }
+    Ok(Some(ws_id))
 }
 
 fn hash_password(password: &str) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
@@ -1039,9 +1098,10 @@ async fn handle_change_password(
 // Password reset (forgot-password) flow
 // ---------------------------------------------------------------------------
 //
-// 1. POST /auth/forgot-password { username } — always responds 200 (no
-//    enumeration). If the user exists and has an email and SMTP is configured,
-//    a one-time reset link is sent.
+// 1. POST /auth/forgot-password { identifier } — identifier is either a
+//    username or an email address. Always responds 200 (no enumeration).
+//    If the account is found and has an email and SMTP is configured, a
+//    one-time reset link is sent to the on-file address.
 // 2. User clicks the link, lands at /#/reset/<token>. Frontend prompts for a
 //    new password and POSTs it to /auth/reset-password.
 // 3. POST /auth/reset-password { token, new_password } — consumes the token,
@@ -1055,7 +1115,8 @@ const PASSWORD_RESET_TTL_MINUTES: i64 = 30;
 
 #[derive(Deserialize)]
 struct ForgotPasswordRequest {
-    username: String,
+    /// Username OR email — users may not remember their login name.
+    identifier: String,
 }
 
 async fn handle_forgot_password(
@@ -1067,23 +1128,31 @@ async fn handle_forgot_password(
     let ip = client_ip(peer, &headers);
     check_login_rate_limit(&state, ip)?;
 
-    // Generic OK response — never leak whether username/email/SMTP are set up.
+    // Generic OK response — never leak whether identifier/email/SMTP are set up.
     let ok = || Json(serde_json::json!({ "status": "OK" }));
 
-    let username = req.username.trim().to_string();
-    if username.is_empty() {
+    let identifier = req.identifier.trim().to_string();
+    if identifier.is_empty() {
         return Ok(ok());
     }
     if magic_link_disabled(&state) {
         return Ok(ok());
     }
 
-    let email_addr = {
+    // Resolve identifier → (username, email). Anything containing '@' is
+    // treated as an email; otherwise as a username.
+    let (username, email_addr) = {
         let db = state.db.lock().unwrap();
-        if !db.user_exists(&username).unwrap_or(false) {
-            return Ok(ok());
-        }
-        db.get_user_email(&username).ok().flatten()
+        let resolved = if identifier.contains('@') {
+            db.find_unique_username_by_email(&identifier).ok().flatten()
+        } else if db.user_exists(&identifier).unwrap_or(false) {
+            Some(identifier.clone())
+        } else {
+            None
+        };
+        let Some(uname) = resolved else { return Ok(ok()); };
+        let email = db.get_user_email(&uname).ok().flatten();
+        (uname, email)
     };
     let Some(email_addr) = email_addr else {
         return Ok(ok());
@@ -2434,7 +2503,7 @@ async fn handle_upload_release(
     // (binaries) before /api/v1/docs/.../import, so the docs handler's own
     // seed step would otherwise see an existing release row and skip seeding.
     if newly_created {
-        docs::seed_user_docs_into_release(&state, release_id, &tag)?;
+        docs::seed_user_docs_into_release(&state, release_id, &tag, workspace_id.as_deref())?;
     }
 
     // Save files to disk
@@ -2922,6 +2991,97 @@ async fn handle_workspace_releases(
     Ok(Json(serde_json::json!({ "releases": releases })))
 }
 
+/// List doc-bearing releases scoped to a single workspace. Workspace members
+/// (any role) and site admins may call this; non-members get 403. Mirrors
+/// `handle_list_doc_releases` but filtered to one workspace.
+async fn handle_list_workspace_doc_releases(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    if !is_site_admin(&state, &principal) {
+        let db = state.db.lock().unwrap();
+        db.get_workspace_member_role(&workspace_id, &principal.username)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    }
+
+    let db = state.db.lock().unwrap();
+    let rows = db.list_doc_releases_for_workspace(&workspace_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let releases: Vec<_> = rows
+        .into_iter()
+        .map(|(_id, tag, name, created_at, page_count)| {
+            serde_json::json!({
+                "tag": tag,
+                "name": name,
+                "published_at": created_at,
+                "page_count": page_count,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "releases": releases })))
+}
+
+#[derive(serde::Deserialize)]
+struct CreateWorkspaceDocReleaseRequest {
+    tag: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// Create a workspace-scoped doc release. Admin-only. Re-using a tag that
+/// belongs to a different workspace (or to global) is rejected.
+async fn handle_create_workspace_doc_release(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<CreateWorkspaceDocReleaseRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+
+    let tag = req.tag.trim().to_string();
+    docs::safe_tag(&tag)?;
+    if tag.is_empty() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Missing 'tag'"));
+    }
+
+    // Reject tag collisions across scopes.
+    let existing_ws = {
+        let db = state.db.lock().unwrap();
+        db.get_release_workspace_id(&tag)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+    if let Some(existing) = existing_ws {
+        match existing {
+            Some(ref ws) if ws == &workspace_id => {
+                return Err(error_response(StatusCode::CONFLICT, "Release tag already exists in this workspace"));
+            }
+            _ => {
+                return Err(error_response(StatusCode::CONFLICT, "Release tag already exists in another scope"));
+            }
+        }
+    }
+
+    let release_id = {
+        let db = state.db.lock().unwrap();
+        db.insert_release(&tag, &req.name, "", false, Some(&workspace_id))
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+    docs::seed_user_docs_into_release(&state, release_id, &tag, Some(&workspace_id))?;
+
+    Ok(Json(serde_json::json!({
+        "tag": tag,
+        "name": req.name,
+        "workspace_id": workspace_id,
+        "id": release_id,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard (embedded HTML)
 // ---------------------------------------------------------------------------
@@ -3211,6 +3371,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/workspaces/{id}/configs/latest", get(handle_get_latest_config))
         .route("/api/v1/workspaces/{id}/configs/{config_id}", get(handle_get_config).put(handle_update_config).delete(handle_delete_config))
         .route("/api/v1/workspaces/{id}/releases", get(handle_workspace_releases))
+        .route(
+            "/api/v1/workspaces/{id}/docs/releases",
+            get(handle_list_workspace_doc_releases).post(handle_create_workspace_doc_release),
+        )
         // Docs — public read endpoints
         .route("/api/v1/docs/releases", get(docs::handle_list_doc_releases))
         .route("/api/v1/docs/releases/latest", get(docs::handle_latest_doc_release))

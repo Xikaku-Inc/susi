@@ -595,7 +595,16 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
             <div class="detail-section-title">Config Revisions</div>
             <div id="wsDetailConfigs" class="machines-list"></div>
 
-            <div class="detail-section-title">Software Releases</div>
+            <div class="detail-section-title" style="display:flex;align-items:center;justify-content:space-between;">
+                <span>Documentation</span>
+                <button id="wsCreateDocReleaseBtn" class="small" style="display:none;" onclick="createWsDocRelease()">+ New doc release</button>
+            </div>
+            <div id="wsDetailDocReleases" class="machines-list"></div>
+
+            <div class="detail-section-title" style="display:flex;align-items:center;justify-content:space-between;">
+                <span>Software Releases</span>
+                <button id="wsUploadSoftwareBtn" class="small" style="display:none;" onclick="showUploadReleaseModal(selectedWsId)">+ Upload software</button>
+            </div>
             <div id="wsDetailReleases" class="machines-list"></div>
 
             <div id="wsDeleteRow" style="margin-top:16px;display:flex;justify-content:flex-end;">
@@ -1171,11 +1180,11 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
 <div id="forgotPasswordOverlay" class="auth-overlay">
     <div class="auth-card">
         <h2>Reset your password</h2>
-        <div class="subtitle">Enter your username — we'll email a reset link if an address is on file.</div>
+        <div class="subtitle">Enter your username or email — we'll send a reset link if an address is on file.</div>
         <div id="forgotPasswordError" class="auth-error"></div>
         <div class="form-row">
-            <label>Username</label>
-            <input type="text" id="forgotUsername" placeholder="Username" autocomplete="username" onkeydown="if(event.key==='Enter')submitForgotPassword()">
+            <label>Username or email</label>
+            <input type="text" id="forgotIdentifier" placeholder="Username or email" autocomplete="username" onkeydown="if(event.key==='Enter')submitForgotPassword()">
         </div>
         <button onclick="submitForgotPassword()">Send reset link</button>
         <div style="text-align:center;margin-top:12px;font-size:12px;">
@@ -1755,23 +1764,23 @@ function showForgotPassword() {
     document.getElementById('loginOverlay').classList.remove('visible');
     document.getElementById('forgotPasswordOverlay').classList.add('visible');
     document.getElementById('forgotPasswordError').classList.remove('visible');
-    document.getElementById('forgotUsername').value =
+    document.getElementById('forgotIdentifier').value =
         document.getElementById('loginUsername').value || '';
-    setTimeout(() => document.getElementById('forgotUsername').focus(), 50);
+    setTimeout(() => document.getElementById('forgotIdentifier').focus(), 50);
 }
 
 async function submitForgotPassword() {
     const errEl = document.getElementById('forgotPasswordError');
     errEl.classList.remove('visible');
-    const username = document.getElementById('forgotUsername').value.trim();
-    if (!username) { errEl.textContent = 'Enter your username'; errEl.classList.add('visible'); return; }
+    const identifier = document.getElementById('forgotIdentifier').value.trim();
+    if (!identifier) { errEl.textContent = 'Enter your username or email'; errEl.classList.add('visible'); return; }
     try {
-        // Server always responds 200 to avoid leaking which usernames exist.
+        // Server always responds 200 to avoid leaking which accounts exist.
         // We mirror that by always advancing to the "check your inbox" view.
         await fetch(API + '/auth/forgot-password', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username }),
+            body: JSON.stringify({ identifier }),
         });
         document.getElementById('forgotPasswordOverlay').classList.remove('visible');
         document.getElementById('magicLinkHint').textContent =
@@ -2936,9 +2945,13 @@ function renderReleases() {
     }).join('');
 }
 
-async function populateReleaseWorkspaceDropdown() {
+async function populateReleaseWorkspaceDropdown(presetWorkspaceId) {
     const sel = document.getElementById('releaseWorkspace');
-    sel.innerHTML = '<option value="">Global (all workspaces)</option>';
+    // Non-admins can only target a workspace they're already in, so hide the
+    // "Global" option for them. The preset path is also non-admin-friendly.
+    const isAdmin = userRole === 'admin';
+    sel.innerHTML = isAdmin && !presetWorkspaceId
+        ? '<option value="">Global (all workspaces)</option>' : '';
     try {
         const resp = await fetch(API + '/workspaces', { headers: authHeaders() });
         if (!resp.ok) return;
@@ -2949,10 +2962,16 @@ async function populateReleaseWorkspaceDropdown() {
             opt.textContent = ws.name + (ws.product ? ' (' + ws.product + ')' : '');
             sel.appendChild(opt);
         });
+        if (presetWorkspaceId) {
+            sel.value = presetWorkspaceId;
+            sel.disabled = true;
+        } else {
+            sel.disabled = false;
+        }
     } catch (e) {}
 }
 
-function showUploadReleaseModal() {
+function showUploadReleaseModal(presetWorkspaceId) {
     document.getElementById('releaseTag').value = '';
     document.getElementById('releaseName').value = '';
     document.getElementById('releaseBody').value = '';
@@ -2961,7 +2980,7 @@ function showUploadReleaseModal() {
     document.getElementById('uploadProgress').style.display = 'none';
     document.getElementById('uploadBtn').disabled = false;
     document.getElementById('uploadReleaseModal').classList.add('visible');
-    populateReleaseWorkspaceDropdown();
+    populateReleaseWorkspaceDropdown(presetWorkspaceId);
     document.getElementById('releaseTag').focus();
 }
 
@@ -3009,7 +3028,11 @@ async function uploadRelease() {
             if (xhr.status >= 200 && xhr.status < 300) {
                 toast('Release ' + tag + ' uploaded', 'success');
                 closeUploadReleaseModal();
-                loadReleases();
+                if (workspaceId && selectedWsId === workspaceId) {
+                    loadWsReleases(workspaceId);
+                } else if (typeof loadReleases === 'function' && userRole === 'admin') {
+                    loadReleases();
+                }
             } else {
                 try {
                     const data = JSON.parse(xhr.responseText);
@@ -3140,11 +3163,68 @@ async function showWsDetail(id) {
             } catch (_) {}
         }
 
-        // Load configs and releases
+        // Only site admins create doc releases or upload software, even into
+        // a workspace they're a member of. Workspace members can read.
+        const canEdit = userRole === 'admin';
+        document.getElementById('wsCreateDocReleaseBtn').style.display = canEdit ? '' : 'none';
+        document.getElementById('wsUploadSoftwareBtn').style.display = canEdit ? '' : 'none';
+
+        // Load configs, software releases, and doc releases.
         loadWsConfigs(id);
         loadWsReleases(id);
+        loadWsDocReleases(id);
     } catch (e) {
         toast('Error: ' + e.message, 'error');
+    }
+}
+
+async function loadWsDocReleases(wsId) {
+    const container = document.getElementById('wsDetailDocReleases');
+    try {
+        const resp = await fetch(API + '/workspaces/' + wsId + '/docs/releases', { headers: authHeaders() });
+        if (!resp.ok) { container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load</div>'; return; }
+        const data = await resp.json();
+        const rels = data.releases || [];
+        if (rels.length === 0) {
+            container.innerHTML = '<div style="color:var(--text2);font-size:13px;">No documentation releases yet</div>';
+            return;
+        }
+        container.innerHTML = rels.map(r => {
+            const url = '/docs?workspace=' + encodeURIComponent(wsId) + '&tag=' + encodeURIComponent(r.tag);
+            return '<div class="machine-item">' +
+                '<span><strong style="font-family:monospace;">' + esc(r.tag) + '</strong>' +
+                (r.name && r.name !== r.tag ? ' <span style="color:var(--text2);margin-left:6px;">' + esc(r.name) + '</span>' : '') +
+                ' <span style="color:var(--text2);margin-left:6px;font-size:11px;">' + r.page_count + ' page' + (r.page_count === 1 ? '' : 's') + '</span></span>' +
+                '<a class="small" style="text-decoration:none;" href="' + url + '" target="_blank">Open &rarr;</a>' +
+            '</div>';
+        }).join('');
+    } catch (e) {
+        container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load doc releases</div>';
+    }
+}
+
+async function createWsDocRelease() {
+    if (!selectedWsId) return;
+    const tag = prompt('Release tag (e.g. v1.0):');
+    if (!tag) return;
+    const trimmed = tag.trim();
+    if (!trimmed) return;
+    const name = prompt('Release name (optional):', trimmed) || '';
+    try {
+        const resp = await fetch(API + '/workspaces/' + selectedWsId + '/docs/releases', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({ tag: trimmed, name }),
+        });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            toast('Error: ' + (data.error || 'Could not create release'), 'error');
+            return;
+        }
+        toast('Doc release ' + trimmed + ' created', 'success');
+        loadWsDocReleases(selectedWsId);
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
     }
 }
 
@@ -3154,9 +3234,13 @@ async function loadWsReleases(wsId) {
         const resp = await fetch(API + '/workspaces/' + wsId + '/releases', { headers: authHeaders() });
         if (!resp.ok) { container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load</div>'; return; }
         const data = await resp.json();
-        const rels = data.releases || [];
+        // The endpoint returns every workspace release row, including those
+        // that exist only as doc releases. Filter to releases that actually
+        // ship binaries — otherwise creating a doc release would also surface
+        // an empty entry under "Software Releases".
+        const rels = (data.releases || []).filter(r => (r.assets || []).length > 0);
         if (rels.length === 0) {
-            container.innerHTML = '<div style="color:var(--text2);font-size:13px;">No releases available</div>';
+            container.innerHTML = '<div style="color:var(--text2);font-size:13px;">No software uploaded yet</div>';
             return;
         }
         container.innerHTML = rels.map(r => {
