@@ -295,6 +295,8 @@ pub async fn handle_create_checkout_session(
     // Always collect a billing address so receipts / invoices have one,
     // and so we can show it separately from the shipping address.
     form.push(("billing_address_collection".into(), "required".into()));
+    // Require phone number — needed by carriers for shipping.
+    form.push(("phone_number_collection[enabled]".into(), "true".into()));
     // Tell Stripe to generate a hosted invoice + PDF for every paid session.
     // The webhook event then references the invoice id, which we fetch and
     // attach to the customer email.
