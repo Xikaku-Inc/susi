@@ -14,12 +14,14 @@
     }
 })();
 </script>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='46 46 420 420'%3E%3Cdefs%3E%3ClinearGradient id='core' x1='30%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' style='stop-color:%2364d8ff'/%3E%3Cstop offset='100%25' style='stop-color:%239b6dff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='256' cy='256' r='210' fill='url(%23core)' opacity='0.95'/%3E%3Ccircle cx='244' cy='244' r='85' fill='%23a0e8ff' opacity='0.55'/%3E%3C/svg%3E">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/favicon-180.png">
 <link rel="stylesheet" href="/docs/easymde.css">
 <script src="/docs/easymde.js" defer></script>
 <style>
 :root {
-    --bg: #0f1115;
+    --bg: #000000;
     --bg2: #161922;
     --bg3: #1d212c;
     --border: #262b38;
@@ -29,7 +31,7 @@
     --accent-soft: rgba(106,169,255,0.15);
     --code-bg: #11141b;
     --radius: 6px;
-    --sidebar-width: 240px;
+    --sidebar-width: 280px;
 }
 :root[data-theme="light"] {
     --bg: #ffffff;
@@ -57,15 +59,15 @@ html, body { margin: 0; padding: 0; }
 body {
     background: var(--bg);
     color: var(--text1);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Ubuntu, "Helvetica Neue", sans-serif;
     font-size: 14px;
-    line-height: 1.55;
+    line-height: 1.43;
     min-height: 100vh;
 }
 .header {
     height: 56px;
     border-bottom: 1px solid var(--border);
-    background: #000000;
+    background: var(--bg);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -74,11 +76,18 @@ body {
     top: 0;
     z-index: 10;
 }
-:root[data-theme="light"] .header { background: #ffffff; }
 .header .brand {
     color: inherit; text-decoration: none;
     font-size: 16px; font-weight: 600; letter-spacing: 0.02em;
+    display: flex; align-items: center;
 }
+.header .brand img { height: 28px; display: block; }
+.header .brand img.logo-light,
+.content img.logo-light { display: none; }
+:root[data-theme="light"] .header .brand img.logo-dark,
+:root[data-theme="light"] .content img.logo-dark { display: none; }
+:root[data-theme="light"] .header .brand img.logo-light { display: block; }
+:root[data-theme="light"] .content img.logo-light { display: block; }
 .header-right { display: flex; gap: 10px; align-items: center; }
 .btn {
     padding: 6px 12px;
@@ -120,62 +129,53 @@ body {
 
 .layout {
     display: grid;
-    grid-template-columns: var(--sidebar-width) 1fr 220px;
+    grid-template-columns: var(--sidebar-width) 1fr var(--sidebar-width);
     min-height: calc(100vh - 56px);
 }
-.layout.no-sidebar { grid-template-columns: 1fr 220px; }
+.layout.no-sidebar { grid-template-columns: 1fr var(--sidebar-width); }
 .layout.no-sidebar .sidebar { display: none; }
 .layout.no-toc { grid-template-columns: var(--sidebar-width) 1fr; }
 .layout.no-toc .toc-rail { display: none; }
 .layout.no-sidebar.no-toc { grid-template-columns: 1fr; }
 .sidebar {
     border-right: 1px solid var(--border);
-    background: #000000;
+    background: var(--bg);
     padding: 16px 0;
     overflow-y: auto;
     max-height: calc(100vh - 56px);
     position: sticky;
     top: 56px;
 }
-:root[data-theme="light"] .sidebar { background: #ffffff; }
 .sidebar h3 {
     font-size: 11px;
-    font-weight: 600;
+    font-weight: 400;
     color: var(--text2);
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    margin: 14px 16px 6px;
+    margin: 16px 16px 8px;
 }
 .sidebar a {
     display: block;
     color: var(--text1);
     text-decoration: none;
-    font-size: 13px;
-    padding: 5px 16px 5px 24px;
+    font-size: 16px;
+    padding: 6px 16px 6px 24px;
     border-left: 2px solid transparent;
 }
-.sidebar a:hover { background: var(--bg3); }
+.sidebar a:hover { color: var(--accent); }
 .sidebar a.active {
-    background: var(--accent-soft);
     border-left-color: var(--accent);
     color: var(--accent);
     font-weight: 500;
 }
 .sidebar a.section-head {
-    padding-left: 16px;
-    font-weight: 500;
+    padding-left: 24px;
 }
-.sidebar a .chev {
-    display: inline-block;
-    width: 12px;
-    margin-right: 6px;
-    font-size: 11px;
-    line-height: 1;
-    color: var(--text2);
-    vertical-align: 1px;
-}
-.sidebar .sidebar-children.collapsed { display: none; }
-.sidebar .empty { padding: 16px; color: var(--text2); font-size: 13px; }
+.sidebar a .chev { display: none; }
+.sidebar .sidebar-children,
+.sidebar .sidebar-children.collapsed { display: block; }
+.sidebar .sidebar-children a { padding-left: 40px; }
+.sidebar .empty { padding: 16px; color: var(--text2); font-size: 14px; }
 
 .content {
     padding: 40px 56px;
@@ -183,8 +183,10 @@ body {
     margin-left: auto;
     margin-right: auto;
     width: 100%;
+    font-size: 16px;
+    line-height: 1.71;
 }
-.content h1 { font-size: 30px; margin: 0 0 18px; font-weight: 600; line-height: 1.25; }
+.content h1 { font-size: 28px; margin: 0 0 18px; font-weight: 400; line-height: 1.14; }
 .content h2 { font-size: 21px; margin: 32px 0 12px; font-weight: 600; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
 .content h3 { font-size: 16px; margin: 24px 0 10px; font-weight: 600; }
 .content h4 { font-size: 14px; margin: 18px 0 8px; font-weight: 600; color: var(--text2); }
@@ -215,7 +217,7 @@ body {
     color: var(--text1);
     border-radius: 0 var(--radius) var(--radius) 0;
 }
-.content table { border-collapse: collapse; margin: 14px 0; font-size: 13px; width: 100%; }
+.content table { border-collapse: collapse; margin: 14px 0; width: 100%; }
 .content .table-scroll { overflow-x: auto; max-width: 100%; margin: 14px 0; -webkit-overflow-scrolling: touch; }
 .content .table-scroll table { margin: 0; }
 .content th, .content td {
@@ -230,7 +232,7 @@ body {
 .content table.grid td,
 .content table.grid tr:nth-child(even) td { background: transparent; border: none; }
 .content table.grid th { font-weight: inherit; text-align: left; }
-.content table.grid td, .content table.grid th { vertical-align: middle; padding: 14px; }
+.content table.grid td, .content table.grid th { vertical-align: top; padding: 14px; }
 .content .video-embed { position: relative; padding-top: 56.25%; margin: 16px 0; }
 .content .video-embed iframe {
     position: absolute; top: 0; left: 0;
@@ -250,7 +252,7 @@ body {
 
 .meta {
     color: var(--text2);
-    font-size: 12px;
+    font-size: 14px;
     margin-bottom: 24px;
     padding-bottom: 14px;
     border-bottom: 1px solid var(--border);
@@ -487,10 +489,10 @@ body {
     overflow-y: auto;
     max-height: calc(100vh - 56px);
     position: sticky; top: 56px;
-    font-size: 12.5px;
+    font-size: 16px;
 }
 .toc-rail .toc-title {
-    font-size: 11px; font-weight: 600;
+    font-size: 11px; font-weight: 400;
     color: var(--text2);
     text-transform: uppercase; letter-spacing: 0.06em;
     margin-bottom: 8px;
@@ -506,8 +508,8 @@ body {
     color: var(--accent); border-left-color: var(--accent);
     font-weight: 500;
 }
-.toc-rail a.lvl-3 { padding-left: 22px; font-size: 12px; }
-.toc-rail a.lvl-4 { padding-left: 34px; font-size: 11.5px; color: var(--text2); }
+.toc-rail a.lvl-3 { padding-left: 22px; }
+.toc-rail a.lvl-4 { padding-left: 34px; color: var(--text2); }
 
 @media (max-width: 1100px) {
     .layout,
@@ -633,7 +635,10 @@ body {
             <line x1="3" y1="18" x2="21" y2="18"></line>
         </svg>
     </button>
-    <a href="/site" class="brand">Xikaku</a>
+    <a href="/site" class="brand" aria-label="Xikaku">
+        <img class="logo-dark" src="/static/logo-dark.png" alt="Xikaku">
+        <img class="logo-light" src="/static/logo.png" alt="Xikaku">
+    </a>
     <div class="header-right">
         <button id="editBtn" class="btn" onclick="enterEditMode()" style="display:none;">Edit</button>
         <button id="newPageBtn" class="btn" onclick="newPage()" style="display:none;">+ Page</button>
@@ -725,6 +730,17 @@ if (window.matchMedia) {
 }
 
 const API = '/api/v1';
+
+// On the canonical public domain (xikaku.com) the website lives at clean URLs
+// (/contact, /about, etc.). On other hosts (susi.lp-research.com) it stays
+// under /site/{slug} so the admin dashboard at / isn't shadowed.
+const CANONICAL_HOSTS = ['xikaku.com', 'www.xikaku.com'];
+const SITE_PATH_PREFIX = CANONICAL_HOSTS.includes(location.host) ? '' : '/site';
+function pageHref(slug) { return SITE_PATH_PREFIX + '/' + encodeURIComponent(slug); }
+function siteRootHref() { return SITE_PATH_PREFIX || '/'; }
+// Top-level paths that must NOT be intercepted as website slugs on xikaku.com.
+const RESERVED_TOP_PATHS = new Set(['site', 'shop', 'api', 'static', 'docs', 'robots.txt', 'sitemap.xml', 'llms.txt', 'favicon.ico', 'health', '.well-known']);
+
 let pages = [];
 let assets = [];
 let currentSlug = null;
@@ -824,7 +840,7 @@ function renderInline(s) {
     });
     out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => {
         const safe = url.startsWith('http') || url.startsWith('#') || url.startsWith('/')
-            ? url : '/site/' + url;
+            ? url : pageHref(url);
         return '<a href="' + safe + '">' + text + '</a>';
     });
     out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
@@ -1041,7 +1057,7 @@ function renderSidebar() {
 function renderSidebarItem(p, isHead, hasChildren, expanded) {
     const cls = (p.slug === currentSlug ? 'active' : '') + (isHead ? ' section-head' : '');
     const chev = hasChildren ? '<span class="chev">' + (expanded ? '▼' : '▶') + '</span>' : '';
-    return '<a class="' + cls + '" href="/site/' + encodeURIComponent(p.slug) + '">'
+    return '<a class="' + cls + '" href="' + pageHref(p.slug) + '">'
         + chev + escHtml(p.title) + '</a>';
 }
 
@@ -1467,19 +1483,27 @@ async function newPage() {
 // Routing
 // ---------------------------------------------------------------------------
 
-// Path-based routing with legacy hash backcompat. Canonical URLs are
-// /site/{slug}; if a visitor lands on /site#/foo we transparently upgrade to
-// /site/foo via replaceState so crawlers and shared links resolve cleanly.
+// Path-based routing with legacy hash backcompat. On the canonical public
+// domain (xikaku.com) URLs are /{slug}; on susi.lp-research.com they're
+// /site/{slug}. If a visitor lands on /site#/foo we transparently upgrade to
+// the canonical path form via replaceState so crawlers and shared links
+// resolve cleanly.
 function slugFromLocation() {
     const path = location.pathname || '';
-    const m = path.match(/^\/site\/([^\/\?#]+)/);
-    if (m) return decodeURIComponent(m[1]);
+    // Always recognize legacy /site/{slug} so old links keep working.
+    const legacy = path.match(/^\/site\/([^\/\?#]+)/);
+    if (legacy) return decodeURIComponent(legacy[1]);
+    // Clean URL form on the canonical host: /{slug} where slug isn't reserved.
+    if (SITE_PATH_PREFIX === '') {
+        const m = path.match(/^\/([^\/\?#]+)$/);
+        if (m && !RESERVED_TOP_PATHS.has(m[1])) return decodeURIComponent(m[1]);
+    }
     const hash = location.hash.replace(/^#\/?/, '');
     return decodeURIComponent(hash.split('/').filter(Boolean)[0] || '');
 }
 
 function navigateTo(slug) {
-    const target = slug ? '/site/' + encodeURIComponent(slug) : '/site';
+    const target = slug ? pageHref(slug) : siteRootHref();
     if (location.pathname + location.search !== target) {
         history.pushState({}, '', target);
     }
@@ -1503,11 +1527,10 @@ async function route() {
     }
 
     const slug = slugFromLocation();
-    // Upgrade legacy hash URLs (#/foo) to the canonical path form so bookmarks
-    // and share-links come out as /site/foo. Crawlers don't follow fragments
-    // but users still get a clean URL in the address bar.
+    // Upgrade legacy hash URLs (#/foo) to the canonical path form. Crawlers
+    // don't follow fragments but users still get a clean URL in the address bar.
     if (location.hash) {
-        const clean = slug ? '/site/' + encodeURIComponent(slug) : '/site';
+        const clean = slug ? pageHref(slug) : siteRootHref();
         history.replaceState({}, '', clean + location.search);
     }
     await loadIndex();
@@ -1518,7 +1541,7 @@ async function route() {
         // Default: first top-level page by ord
         const sorted = [...pages].sort((a, b) => a.ord - b.ord || a.title.localeCompare(b.title));
         const first = sorted.find(p => !p.parent_slug) || sorted[0];
-        history.replaceState({}, '', '/site/' + encodeURIComponent(first.slug));
+        history.replaceState({}, '', pageHref(first.slug));
         await loadPage(first.slug);
     }
 }
@@ -1529,10 +1552,11 @@ window.addEventListener('hashchange', route);
 // Intercept intra-site link clicks for SPA navigation.
 // Lets Ctrl/Cmd/middle-click still open in a new tab (server renders them fine).
 document.addEventListener('click', (e) => {
-    const a = e.target.closest && e.target.closest('a[href^="/site/"], a[href^="/shop"]');
+    const a = e.target.closest && e.target.closest('a[href^="/"]');
     if (!a) return;
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
     const href = a.getAttribute('href');
+    if (!href) return;
     if (href.startsWith('/shop')) {
         // Same-origin /shop, /shop/, /shop/{sku}, /shop/success, /shop/cancel.
         // Skip /shop#... (fragment-only) so anchors still work.
@@ -1544,10 +1568,21 @@ document.addEventListener('click', (e) => {
         route();
         return;
     }
-    const m = href.match(/^\/site\/([^\/\?#]+)/);
-    if (!m) return;
-    e.preventDefault();
-    navigateTo(decodeURIComponent(m[1]));
+    // Legacy /site/{slug} form (susi.lp-research.com or old links on xikaku).
+    const legacy = href.match(/^\/site\/([^\/\?#]+)/);
+    if (legacy) {
+        e.preventDefault();
+        navigateTo(decodeURIComponent(legacy[1]));
+        return;
+    }
+    // Clean form (xikaku.com): /{slug} where slug isn't a reserved top-level path.
+    if (SITE_PATH_PREFIX === '') {
+        const clean = href.match(/^\/([^\/\?#]+)$/);
+        if (clean && !RESERVED_TOP_PATHS.has(clean[1])) {
+            e.preventDefault();
+            navigateTo(decodeURIComponent(clean[1]));
+        }
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -2258,6 +2293,10 @@ function shopRouteFromLocation() {
     if (m) return { kind: 'detail', sku: decodeURIComponent(m[1]) };
     return null;
 }
+
+// Rewrite static "/site" home-links so on xikaku.com the brand and "Home"
+// links point to "/" directly instead of triggering a 301 hop through nginx.
+document.querySelectorAll('a[href="/site"]').forEach(a => { a.setAttribute('href', siteRootHref()); });
 
 (async () => {
     await resolveAdminStatus();

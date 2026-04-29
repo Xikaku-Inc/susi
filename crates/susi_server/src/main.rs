@@ -1035,6 +1035,121 @@ async fn handle_change_password(
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
 
+// ---------------------------------------------------------------------------
+// Password reset (forgot-password) flow
+// ---------------------------------------------------------------------------
+//
+// 1. POST /auth/forgot-password { username } — always responds 200 (no
+//    enumeration). If the user exists and has an email and SMTP is configured,
+//    a one-time reset link is sent.
+// 2. User clicks the link, lands at /#/reset/<token>. Frontend prompts for a
+//    new password and POSTs it to /auth/reset-password.
+// 3. POST /auth/reset-password { token, new_password } — consumes the token,
+//    updates the password, clears must_change_password (since the user just
+//    proved control of the inbox).
+//
+// Reset tokens are stored in `login_tokens` with kind='reset' so they can't
+// be replayed against the magic-link-sign-in endpoint.
+
+const PASSWORD_RESET_TTL_MINUTES: i64 = 30;
+
+#[derive(Deserialize)]
+struct ForgotPasswordRequest {
+    username: String,
+}
+
+async fn handle_forgot_password(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<ForgotPasswordRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let ip = client_ip(peer, &headers);
+    check_login_rate_limit(&state, ip)?;
+
+    // Generic OK response — never leak whether username/email/SMTP are set up.
+    let ok = || Json(serde_json::json!({ "status": "OK" }));
+
+    let username = req.username.trim().to_string();
+    if username.is_empty() {
+        return Ok(ok());
+    }
+    if magic_link_disabled(&state) {
+        return Ok(ok());
+    }
+
+    let email_addr = {
+        let db = state.db.lock().unwrap();
+        if !db.user_exists(&username).unwrap_or(false) {
+            return Ok(ok());
+        }
+        db.get_user_email(&username).ok().flatten()
+    };
+    let Some(email_addr) = email_addr else {
+        return Ok(ok());
+    };
+
+    let raw_token = random_magic_token();
+    let token_hash = hash_token(&raw_token);
+    {
+        let db = state.db.lock().unwrap();
+        let _ = db.purge_old_login_tokens();
+        db.insert_password_reset_token(
+            &token_hash,
+            &username,
+            PASSWORD_RESET_TTL_MINUTES * 60,
+        )
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    }
+
+    let link = format!(
+        "{}/#/reset/{}",
+        state.magic_link_base_url.trim_end_matches('/'),
+        raw_token
+    );
+    let email_service = state.email.clone().expect("checked above");
+    let to = email_addr.clone();
+    let uname = username.clone();
+    let ip_str = ip.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = email_service
+            .send_password_reset(&to, &uname, &link, PASSWORD_RESET_TTL_MINUTES, &ip_str)
+            .await
+        {
+            log::error!("Failed to send password-reset email to {}: {:#}", to, e);
+        }
+    });
+
+    Ok(ok())
+}
+
+#[derive(Deserialize)]
+struct ResetPasswordSubmitRequest {
+    token: String,
+    new_password: String,
+}
+
+async fn handle_reset_password_submit(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ResetPasswordSubmitRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    if req.new_password.len() < 8 {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Password must be at least 8 characters"));
+    }
+    let token_hash = hash_token(&req.token);
+    let new_hash = hash_password(&req.new_password)?;
+
+    let db = state.db.lock().unwrap();
+    let username = db
+        .consume_password_reset_token(&token_hash)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Link is invalid, already used, or expired"))?;
+    db.update_user_password(&username, &new_hash)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "status": "OK", "username": username })))
+}
+
 async fn handle_setup_2fa(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1713,6 +1828,7 @@ struct CreateUserRequest {
     password: String,
     #[serde(default = "default_user_role")]
     role: String,
+    email: String,
 }
 
 fn default_user_role() -> String {
@@ -1738,13 +1854,22 @@ async fn handle_create_user(
     if !matches!(req.role.as_str(), "admin" | "user") {
         return Err(error_response(StatusCode::BAD_REQUEST, "Role must be admin or user"));
     }
+    let email = normalize_email(&req.email)?
+        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "Email is required"))?;
 
     let pw_hash = hash_password(&req.password)?;
     let db = state.db.lock().unwrap();
     db.create_user(username, &pw_hash, &req.role)
         .map_err(|e| error_response(StatusCode::CONFLICT, &e.to_string()))?;
+    db.set_user_email(username, Some(&email))
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "status": "OK", "username": username, "role": req.role })))
+    Ok(Json(serde_json::json!({
+        "status": "OK",
+        "username": username,
+        "role": req.role,
+        "email": email,
+    })))
 }
 
 async fn handle_delete_user(
@@ -3004,6 +3129,14 @@ async fn main() -> Result<()> {
         // per-page SEO head (title, description, OG, JSON-LD) injected.
         .route("/site", get(website::handle_website_render_root))
         .route("/site/{slug}", get(website::handle_website_render_slug))
+        // Brand assets referenced from <head> (og:image, Organization.logo, favicons)
+        .route("/static/logo.png", get(website::handle_logo_png))
+        .route("/static/logo-dark.png", get(website::handle_logo_dark_png))
+        .route("/static/og-image.png", get(website::handle_og_image_png))
+        .route("/static/icon.png", get(website::handle_icon_png))
+        .route("/static/favicon-32.png", get(website::handle_favicon_32_png))
+        .route("/static/favicon-180.png", get(website::handle_favicon_180_png))
+        .route("/favicon.ico", get(website::handle_favicon_ico))
         // SEO / AI-crawler endpoints
         .route("/robots.txt", get(website::handle_robots_txt))
         .route("/sitemap.xml", get(website::handle_sitemap_xml))
@@ -3015,6 +3148,8 @@ async fn main() -> Result<()> {
         // Auth endpoints
         .route("/api/v1/auth/login", post(handle_login))
         .route("/api/v1/auth/magic", post(handle_magic_exchange))
+        .route("/api/v1/auth/forgot-password", post(handle_forgot_password))
+        .route("/api/v1/auth/reset-password", post(handle_reset_password_submit))
         .route("/api/v1/auth/status", get(handle_auth_status))
         .route("/api/v1/auth/change-password", post(handle_change_password))
         .route("/api/v1/auth/setup-2fa", post(handle_setup_2fa))

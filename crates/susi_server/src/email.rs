@@ -130,6 +130,69 @@ impl EmailService {
         Ok(())
     }
 
+    pub async fn send_password_reset(
+        &self,
+        to_addr: &str,
+        username: &str,
+        link: &str,
+        ttl_minutes: i64,
+        ip: &str,
+    ) -> Result<()> {
+        let to: Mailbox = to_addr
+            .parse()
+            .with_context(|| format!("Invalid recipient address: {}", to_addr))?;
+
+        let subject = format!("Susi: password reset link ({} min)", ttl_minutes);
+        let text = format!(
+            "Hi {user},\n\n\
+             Someone requested a password reset for your Susi account from IP {ip}.\n\n\
+             If this was you, click the link below within {ttl} minutes to set a new password:\n\n\
+             {link}\n\n\
+             If this wasn't you, you can ignore this email — your password stays unchanged.\n\n\
+             — Susi\n",
+            user = username, ip = ip, ttl = ttl_minutes, link = link
+        );
+
+        let html = format!(
+            "<p>Hi {user},</p>\
+             <p>Someone requested a password reset for your Susi account from IP <strong>{ip}</strong>.</p>\
+             <p>If this was you, click the link below within <strong>{ttl} minutes</strong> to set a new password:</p>\
+             <p><a href=\"{link}\" style=\"display:inline-block;padding:10px 18px;background:#6c8cff;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;\">Reset password</a></p>\
+             <p style=\"color:#888;font-size:12px;word-break:break-all;\">Or paste this into your browser: {link}</p>\
+             <p style=\"color:#888;font-size:12px;\">If this wasn't you, you can ignore this email — your password stays unchanged.</p>\
+             <p style=\"color:#888;font-size:12px;\">— Susi</p>",
+            user = html_escape(username),
+            ip = html_escape(ip),
+            ttl = ttl_minutes,
+            link = html_escape(link),
+        );
+
+        let email = Message::builder()
+            .from(self.cfg.from.clone())
+            .to(to)
+            .subject(subject)
+            .multipart(
+                lettre::message::MultiPart::alternative()
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_PLAIN)
+                            .body(text),
+                    )
+                    .singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_HTML)
+                            .body(html),
+                    ),
+            )
+            .context("Failed to build password-reset email")?;
+
+        self.transport
+            .send(email)
+            .await
+            .context("SMTP send failed")?;
+        Ok(())
+    }
+
     /// Send a multipart/alternative email with both plain-text and HTML
     /// bodies. Use for customer-facing transactional mails (shipped
     /// notifications, etc.) where HTML formatting is expected.

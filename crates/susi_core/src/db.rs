@@ -378,6 +378,13 @@ impl LicenseDb {
             "ALTER TABLE website_pages ADD COLUMN meta_description TEXT NOT NULL DEFAULT '';"
         );
 
+        // Distinguish device-trust magic links from password-reset links so a
+        // sign-in token can't be replayed against the reset endpoint to take
+        // over an account.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE login_tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'device';"
+        );
+
         // Migrate single-admin table to multi-user table
         let has_admin_user: bool = self.conn
             .query_row(
@@ -1011,7 +1018,7 @@ impl LicenseDb {
         let row: Option<(String, String, String, String, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT username, device_fp, device_label, expires_at, used_at FROM login_tokens WHERE token_hash = ?1",
+                "SELECT username, device_fp, device_label, expires_at, used_at FROM login_tokens WHERE token_hash = ?1 AND kind = 'device'",
                 params![token_hash],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
@@ -1041,7 +1048,7 @@ impl LicenseDb {
         let row: Option<(String, String, String, String, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT username, device_fp, device_label, expires_at, used_at FROM login_tokens WHERE token_hash = ?1",
+                "SELECT username, device_fp, device_label, expires_at, used_at FROM login_tokens WHERE token_hash = ?1 AND kind = 'device'",
                 params![token_hash],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
@@ -1064,7 +1071,7 @@ impl LicenseDb {
         let now = Utc::now().to_rfc3339();
         let n = self.conn
             .execute(
-                "UPDATE login_tokens SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL",
+                "UPDATE login_tokens SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND kind = 'device'",
                 params![now, token_hash],
             )
             .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
@@ -1073,6 +1080,63 @@ impl LicenseDb {
             return Ok(None);
         }
         Ok(Some(LoginTokenRow { username, device_fp, device_label }))
+    }
+
+    pub fn insert_password_reset_token(
+        &self,
+        token_hash: &str,
+        username: &str,
+        ttl_seconds: i64,
+    ) -> Result<(), LicenseError> {
+        let now = Utc::now();
+        let expires = now + Duration::seconds(ttl_seconds);
+        self.conn
+            .execute(
+                "INSERT INTO login_tokens (token_hash, username, device_fp, device_label, created_at, expires_at, kind)
+                 VALUES (?1, ?2, '', '', ?3, ?4, 'reset')",
+                params![token_hash, username, now.to_rfc3339(), expires.to_rfc3339()],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB insert: {}", e)))?;
+        Ok(())
+    }
+
+    /// Validate a password-reset token and mark it consumed. Returns the
+    /// username on success. Single-use; only matches `kind = 'reset'` rows.
+    pub fn consume_password_reset_token(&self, token_hash: &str) -> Result<Option<String>, LicenseError> {
+        let row: Option<(String, String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT username, expires_at, used_at FROM login_tokens WHERE token_hash = ?1 AND kind = 'reset'",
+                params![token_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
+
+        let Some((username, expires_at, used_at)) = row else {
+            return Ok(None);
+        };
+        if used_at.is_some() {
+            return Ok(None);
+        }
+        let expires: DateTime<Utc> = DateTime::parse_from_rfc3339(&expires_at)
+            .map_err(|e| LicenseError::Other(format!("Bad token expires_at: {}", e)))?
+            .with_timezone(&Utc);
+        if Utc::now() > expires {
+            return Ok(None);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let n = self.conn
+            .execute(
+                "UPDATE login_tokens SET used_at = ?1 WHERE token_hash = ?2 AND used_at IS NULL AND kind = 'reset'",
+                params![now, token_hash],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(username))
     }
 
     // -----------------------------------------------------------------------

@@ -469,6 +469,65 @@ const SITE_TAGLINE: &str = "Sight beyond Sight";
 const ORG_LEGAL_NAME: &str = "LP-Research Inc.";
 const ORG_ADDR_LOCALITY: &str = "Tokyo";
 const ORG_ADDR_COUNTRY: &str = "JP";
+const CONTACT_EMAIL: &str = "info@xikaku.com";
+
+/// Canonical public domain. All canonical/og:url/sitemap/breadcrumb URLs
+/// point here regardless of which host served the request, consolidating
+/// SEO equity to xikaku.com. Clean slug form: /{slug} (no /site/ prefix).
+const PUBLIC_BASE: &str = "https://xikaku.com";
+
+/// Brand asset URLs. og-image is the 1200x630 social-card; logo is the
+/// horizontal wordmark used by Google's knowledge-panel via Organization.logo.
+const LOGO_URL: &str = "https://xikaku.com/static/logo.png";
+const OG_IMAGE_URL: &str = "https://xikaku.com/static/og-image.png";
+
+/// Public profile URLs included as Organization.sameAs in JSON-LD.
+const SOCIAL_LINKS: &[&str] = &[
+    "https://github.com/xikaku-inc",
+    "https://www.linkedin.com/company/xikaku",
+];
+
+/// Embedded brand assets, served at /static/* (and /favicon.ico).
+const LOGO_PNG: &[u8] = include_bytes!("assets/xikaku-logo.png");
+const LOGO_DARK_PNG: &[u8] = include_bytes!("assets/xikaku-logo-dark.png");
+const OG_IMAGE_PNG: &[u8] = include_bytes!("assets/xikaku-og-image.png");
+const ICON_PNG: &[u8] = include_bytes!("assets/xikaku-icon.png");
+const FAVICON_32_PNG: &[u8] = include_bytes!("assets/xikaku-favicon-32.png");
+const FAVICON_180_PNG: &[u8] = include_bytes!("assets/xikaku-favicon-180.png");
+const FAVICON_ICO: &[u8] = include_bytes!("assets/favicon.ico");
+
+fn cached_image(content_type: &'static str, bytes: &'static [u8]) -> (HeaderMap, Vec<u8>) {
+    let mut h = HeaderMap::new();
+    h.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    h.insert(header::CACHE_CONTROL, "public, max-age=86400, immutable".parse().unwrap());
+    (h, bytes.to_vec())
+}
+
+pub async fn handle_logo_png() -> impl IntoResponse { cached_image("image/png", LOGO_PNG) }
+pub async fn handle_logo_dark_png() -> impl IntoResponse { cached_image("image/png", LOGO_DARK_PNG) }
+pub async fn handle_og_image_png() -> impl IntoResponse { cached_image("image/png", OG_IMAGE_PNG) }
+pub async fn handle_icon_png() -> impl IntoResponse { cached_image("image/png", ICON_PNG) }
+pub async fn handle_favicon_32_png() -> impl IntoResponse { cached_image("image/png", FAVICON_32_PNG) }
+pub async fn handle_favicon_180_png() -> impl IntoResponse { cached_image("image/png", FAVICON_180_PNG) }
+pub async fn handle_favicon_ico() -> impl IntoResponse { cached_image("image/x-icon", FAVICON_ICO) }
+
+/// Build the canonical URL for a website page. The home slug renders as the
+/// bare domain (`https://xikaku.com/`); other slugs render as `/{slug}`.
+fn canonical_page_url(slug: &str, is_home: bool) -> String {
+    if is_home {
+        format!("{}/", PUBLIC_BASE)
+    } else {
+        format!("{}/{}", PUBLIC_BASE, slug)
+    }
+}
+
+/// Convert SQLite's "YYYY-MM-DD HH:MM:SS" timestamp to ISO 8601 with a Z
+/// suffix so schema.org consumers (Google, Bing) parse it correctly.
+fn iso8601_z(sqlite_ts: &str) -> String {
+    if sqlite_ts.is_empty() { return String::new(); }
+    if sqlite_ts.contains('T') { return sqlite_ts.to_string(); }
+    format!("{}Z", sqlite_ts.replacen(' ', "T", 1))
+}
 
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -551,20 +610,6 @@ fn derive_description(body_md: &str) -> String {
     first_para
 }
 
-/// Build base URL from reverse-proxy headers. Falls back to Host + https.
-fn base_url(headers: &HeaderMap) -> String {
-    let host = headers
-        .get("x-forwarded-host")
-        .and_then(|h| h.to_str().ok())
-        .or_else(|| headers.get(header::HOST).and_then(|h| h.to_str().ok()))
-        .unwrap_or("staging.susi.lp-research.com");
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("https");
-    format!("{}://{}", proto, host)
-}
-
 fn first_default_slug(pages: &[(String, String, Option<String>, i64, String, String)]) -> Option<&str> {
     let mut top: Vec<&(String, String, Option<String>, i64, String, String)> =
         pages.iter().filter(|p| p.2.is_none()).collect();
@@ -575,7 +620,7 @@ fn first_default_slug(pages: &[(String, String, Option<String>, i64, String, Str
 fn build_breadcrumbs(
     pages: &[(String, String, Option<String>, i64, String, String)],
     slug: &str,
-    base: &str,
+    home_slug: Option<&str>,
 ) -> String {
     let by_slug: std::collections::HashMap<&str, &(String, String, Option<String>, i64, String, String)> =
         pages.iter().map(|p| (p.0.as_str(), p)).collect();
@@ -590,12 +635,12 @@ fn build_breadcrumbs(
         .iter()
         .enumerate()
         .map(|(i, p)| {
+            let is_home = home_slug == Some(p.0.as_str());
             format!(
-                r#"{{"@type":"ListItem","position":{},"name":"{}","item":"{}/site/{}"}}"#,
+                r#"{{"@type":"ListItem","position":{},"name":"{}","item":"{}"}}"#,
                 i + 1,
                 html_escape(&p.1),
-                base,
-                html_escape(&p.0),
+                html_escape(&canonical_page_url(&p.0, is_home)),
             )
         })
         .collect();
@@ -606,46 +651,73 @@ fn build_breadcrumbs(
 }
 
 fn render_seo_head(
-    base: &str,
     slug: &str,
     page_title: &str,
     description: &str,
     updated_at: &str,
     pages: &[(String, String, Option<String>, i64, String, String)],
+    products: &[(String, String, String, i64, String, Option<String>, String, bool, i64, String)],
 ) -> String {
-    let canonical = format!("{}/site/{}", base, slug);
-    let is_home = pages
-        .iter()
-        .find(|p| p.2.is_none())
-        .map(|p| p.0.as_str() == slug)
-        .unwrap_or(false);
+    let home_slug = first_default_slug(pages);
+    let is_home = home_slug == Some(slug);
+    let canonical = canonical_page_url(slug, is_home);
     let full_title = if is_home {
         format!("{} — {}", SITE_NAME, SITE_TAGLINE)
     } else {
         format!("{} — {}", page_title, SITE_NAME)
     };
 
+    // Organization (always emitted, identical across pages).
+    let same_as = SOCIAL_LINKS
+        .iter()
+        .map(|u| format!("\"{}\"", html_escape(u)))
+        .collect::<Vec<_>>()
+        .join(",");
     let org_jsonld = format!(
-        r#"{{"@context":"https://schema.org","@type":"Organization","name":"{}","legalName":"{}","url":"{}","slogan":"{}","address":{{"@type":"PostalAddress","addressLocality":"{}","addressCountry":"{}"}}}}"#,
-        html_escape(SITE_NAME),
-        html_escape(ORG_LEGAL_NAME),
-        html_escape(base),
-        html_escape(SITE_TAGLINE),
-        html_escape(ORG_ADDR_LOCALITY),
-        html_escape(ORG_ADDR_COUNTRY),
+        r#"{{"@context":"https://schema.org","@type":"Organization","name":"{name}","legalName":"{legal}","url":"{url}","logo":"{logo}","slogan":"{slogan}","email":"{email}","address":{{"@type":"PostalAddress","addressLocality":"{loc}","addressCountry":"{country}"}},"contactPoint":{{"@type":"ContactPoint","contactType":"customer support","email":"{email}","areaServed":["US","CA"]}},"sameAs":[{same_as}]}}"#,
+        name = html_escape(SITE_NAME),
+        legal = html_escape(ORG_LEGAL_NAME),
+        url = html_escape(PUBLIC_BASE),
+        logo = html_escape(LOGO_URL),
+        slogan = html_escape(SITE_TAGLINE),
+        email = html_escape(CONTACT_EMAIL),
+        loc = html_escape(ORG_ADDR_LOCALITY),
+        country = html_escape(ORG_ADDR_COUNTRY),
+        same_as = same_as,
     );
-    let article_jsonld = format!(
-        r#"{{"@context":"https://schema.org","@type":"Article","headline":"{}","description":"{}","url":"{}","dateModified":"{}","publisher":{{"@type":"Organization","name":"{}","url":"{}"}}}}"#,
-        html_escape(page_title),
-        html_escape(description),
-        html_escape(&canonical),
-        html_escape(updated_at),
-        html_escape(SITE_NAME),
-        html_escape(base),
-    );
-    let breadcrumb_jsonld = build_breadcrumbs(pages, slug, base);
 
-    format!(
+    // Per-page schema: WebSite (with sitelinks search action stub) for the
+    // home page, WebPage for everything else. This matches what Google's
+    // structured-data parser expects and powers rich results.
+    let date_modified = iso8601_z(updated_at);
+    let page_jsonld = if is_home {
+        format!(
+            r#"{{"@context":"https://schema.org","@type":"WebSite","name":"{name}","url":"{url}","description":"{desc}","publisher":{{"@type":"Organization","name":"{name}","url":"{url}"}},"potentialAction":{{"@type":"SearchAction","target":{{"@type":"EntryPoint","urlTemplate":"{url}/?q={{search_term_string}}"}},"query-input":"required name=search_term_string"}}}}"#,
+            name = html_escape(SITE_NAME),
+            url = html_escape(PUBLIC_BASE),
+            desc = html_escape(description),
+        )
+    } else {
+        format!(
+            r#"{{"@context":"https://schema.org","@type":"WebPage","name":"{title}","description":"{desc}","url":"{url}","dateModified":"{date}","isPartOf":{{"@type":"WebSite","name":"{site}","url":"{base}"}},"publisher":{{"@type":"Organization","name":"{site}","url":"{base}"}}}}"#,
+            title = html_escape(page_title),
+            desc = html_escape(description),
+            url = html_escape(&canonical),
+            date = html_escape(&date_modified),
+            site = html_escape(SITE_NAME),
+            base = html_escape(PUBLIC_BASE),
+        )
+    };
+
+    let breadcrumb_jsonld = build_breadcrumbs(pages, slug, home_slug);
+
+    // Product schema: emit one Product per matching shop SKU. A page slug
+    // like `lpms-curs3` matches every shop product whose SKU starts with the
+    // slug (e.g., lpms-curs3-can, lpms-curs3-rs232) so the page describes the
+    // family with one Offer per variant.
+    let product_blocks = build_product_jsonld(slug, products);
+
+    let mut head = format!(
         concat!(
             "<title>{title}</title>\n",
             "<meta name=\"description\" content=\"{desc}\">\n",
@@ -655,21 +727,61 @@ fn render_seo_head(
             "<meta property=\"og:title\" content=\"{title}\">\n",
             "<meta property=\"og:description\" content=\"{desc}\">\n",
             "<meta property=\"og:url\" content=\"{canonical}\">\n",
+            "<meta property=\"og:image\" content=\"{og_image}\">\n",
+            "<meta property=\"og:image:width\" content=\"1200\">\n",
+            "<meta property=\"og:image:height\" content=\"630\">\n",
             "<meta name=\"twitter:card\" content=\"summary_large_image\">\n",
             "<meta name=\"twitter:title\" content=\"{title}\">\n",
             "<meta name=\"twitter:description\" content=\"{desc}\">\n",
+            "<meta name=\"twitter:image\" content=\"{og_image}\">\n",
             "<script type=\"application/ld+json\">{org_ld}</script>\n",
-            "<script type=\"application/ld+json\">{article_ld}</script>\n",
+            "<script type=\"application/ld+json\">{page_ld}</script>\n",
             "<script type=\"application/ld+json\">{bc_ld}</script>\n",
         ),
         title = html_escape(&full_title),
         desc = html_escape(description),
         canonical = html_escape(&canonical),
         site = html_escape(SITE_NAME),
+        og_image = html_escape(OG_IMAGE_URL),
         org_ld = org_jsonld,
-        article_ld = article_jsonld,
+        page_ld = page_jsonld,
         bc_ld = breadcrumb_jsonld,
-    )
+    );
+    for block in product_blocks {
+        head.push_str(&format!("<script type=\"application/ld+json\">{}</script>\n", block));
+    }
+    head
+}
+
+/// Emit a Product JSON-LD block for each shop SKU whose key matches the page
+/// slug (slug is a prefix of SKU). Returns an empty Vec if no products match,
+/// so non-product pages render no extra schema.
+fn build_product_jsonld(
+    slug: &str,
+    products: &[(String, String, String, i64, String, Option<String>, String, bool, i64, String)],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (sku, title, desc_md, price_cents, currency, _img, _tax, active, _ord, _upd) in products {
+        if !active { continue; }
+        let sku_lc = sku.to_lowercase();
+        let slug_lc = slug.to_lowercase();
+        if sku_lc != slug_lc && !sku_lc.starts_with(&format!("{}-", slug_lc)) { continue; }
+        let price = format!("{}.{:02}", price_cents / 100, (price_cents % 100).abs());
+        let cur_upper = currency.to_uppercase();
+        let desc = derive_description(desc_md);
+        out.push(format!(
+            r#"{{"@context":"https://schema.org","@type":"Product","name":"{name}","description":"{desc}","sku":"{sku}","brand":{{"@type":"Brand","name":"Xikaku"}},"image":"{img}","offers":{{"@type":"Offer","price":"{price}","priceCurrency":"{cur}","availability":"https://schema.org/InStock","url":"{url}","seller":{{"@type":"Organization","name":"Xikaku","url":"{base}"}}}}}}"#,
+            name = html_escape(title),
+            desc = html_escape(&desc),
+            sku = html_escape(sku),
+            img = html_escape(OG_IMAGE_URL),
+            price = price,
+            cur = html_escape(&cur_upper),
+            url = html_escape(&format!("{}/shop/{}", PUBLIC_BASE, sku)),
+            base = html_escape(PUBLIC_BASE),
+        ));
+    }
+    out
 }
 
 pub async fn handle_website_render_root(
@@ -689,13 +801,15 @@ pub async fn handle_website_render_slug(
 
 fn render_website(
     state: &Arc<AppState>,
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
     requested_slug: Option<String>,
 ) -> (HeaderMap, String) {
-    let base = base_url(headers);
-    let pages = {
+    let (pages, products) = {
         let db = state.db.lock().unwrap();
-        db.list_website_pages().unwrap_or_default()
+        (
+            db.list_website_pages().unwrap_or_default(),
+            db.list_products(true).unwrap_or_default(),
+        )
     };
     let slug_owned: Option<String> = requested_slug.or_else(|| {
         first_default_slug(&pages).map(|s| s.to_string())
@@ -724,7 +838,7 @@ fn render_website(
         };
 
     let injected = match valid_slug {
-        Some(s) => render_seo_head(&base, &s, &title, &description, &updated_at, &pages),
+        Some(s) => render_seo_head(&s, &title, &description, &updated_at, &pages, &products),
         None => format!(
             "<title>{}</title>\n<meta name=\"description\" content=\"{}\">\n",
             html_escape(SITE_NAME),
@@ -740,8 +854,7 @@ fn render_website(
     (h, html)
 }
 
-pub async fn handle_robots_txt(headers: HeaderMap) -> impl IntoResponse {
-    let base = base_url(&headers);
+pub async fn handle_robots_txt(_headers: HeaderMap) -> impl IntoResponse {
     let body = format!(
         concat!(
             "User-agent: *\n",
@@ -762,7 +875,7 @@ pub async fn handle_robots_txt(headers: HeaderMap) -> impl IntoResponse {
             "User-agent: YouBot\nAllow: /\n\n",
             "Sitemap: {base}/sitemap.xml\n",
         ),
-        base = base,
+        base = PUBLIC_BASE,
     );
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, "text/plain; charset=utf-8".parse().unwrap());
@@ -772,22 +885,22 @@ pub async fn handle_robots_txt(headers: HeaderMap) -> impl IntoResponse {
 
 pub async fn handle_sitemap_xml(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> impl IntoResponse {
-    let base = base_url(&headers);
     let pages = {
         let db = state.db.lock().unwrap();
         db.list_website_pages().unwrap_or_default()
     };
+    let home_slug = first_default_slug(&pages).map(|s| s.to_string());
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
     );
     for (slug, _title, _parent, _ord, updated_at, _meta) in &pages {
+        let is_home = home_slug.as_deref() == Some(slug.as_str());
         xml.push_str("  <url>\n");
         xml.push_str(&format!(
-            "    <loc>{}/site/{}</loc>\n",
-            xml_escape(&base),
-            xml_escape(slug),
+            "    <loc>{}</loc>\n",
+            xml_escape(&canonical_page_url(slug, is_home)),
         ));
         if !updated_at.is_empty() {
             xml.push_str(&format!("    <lastmod>{}</lastmod>\n", xml_escape(updated_at)));
@@ -805,13 +918,13 @@ pub async fn handle_sitemap_xml(
 
 pub async fn handle_llms_txt(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> impl IntoResponse {
-    let base = base_url(&headers);
     let pages = {
         let db = state.db.lock().unwrap();
         db.list_website_pages().unwrap_or_default()
     };
+    let home_slug = first_default_slug(&pages).map(|s| s.to_string());
 
     let mut body = String::new();
     body.push_str(&format!("# {}\n\n", SITE_NAME));
@@ -836,16 +949,12 @@ pub async fn handle_llms_txt(
                 .unwrap_or_default()
         };
         let indent = if parent.is_some() { "  " } else { "" };
+        let is_home = home_slug.as_deref() == Some(slug.as_str());
+        let url = canonical_page_url(slug, is_home);
         if desc_source.is_empty() {
-            body.push_str(&format!(
-                "{}- [{}]({}/site/{})\n",
-                indent, title, base, slug
-            ));
+            body.push_str(&format!("{}- [{}]({})\n", indent, title, url));
         } else {
-            body.push_str(&format!(
-                "{}- [{}]({}/site/{}): {}\n",
-                indent, title, base, slug, desc_source
-            ));
+            body.push_str(&format!("{}- [{}]({}): {}\n", indent, title, url, desc_source));
         }
     }
 

@@ -14,7 +14,9 @@
     }
 })();
 </script>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='46 46 420 420'%3E%3Cdefs%3E%3ClinearGradient id='core' x1='30%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' style='stop-color:%2364d8ff'/%3E%3Cstop offset='100%25' style='stop-color:%239b6dff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='256' cy='256' r='210' fill='url(%23core)' opacity='0.95'/%3E%3Ccircle cx='244' cy='244' r='85' fill='%23a0e8ff' opacity='0.55'/%3E%3C/svg%3E">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/favicon-180.png">
 <style>
 :root {
     --bg: #0f1117;
@@ -105,6 +107,26 @@ button.secondary:hover { background: var(--border); }
 button.danger { background: var(--red); }
 button.danger:hover { background: #ef4444; }
 button.small { padding: 4px 10px; font-size: 12px; }
+
+/* Anchor styled to match the standard <button>. Used where we want
+   right-click / middle-click open-in-new-tab semantics but the same
+   pill shape (e.g., dashboard "Open editor ↗" links). */
+a.btn, a.btn:visited {
+    background: var(--accent);
+    color: #fff;
+    text-decoration: none;
+    display: inline-block;
+    padding: 8px 16px;
+    border-radius: var(--radius);
+    font-size: 13px;
+    font-weight: 500;
+    min-width: 180px;
+    text-align: center;
+    box-sizing: border-box;
+    transition: background 0.15s;
+}
+a.btn:hover { background: var(--accent-hover); color: #fff; }
+a.btn.small { padding: 4px 10px; font-size: 12px; }
 
 input, select {
     background: var(--bg);
@@ -473,15 +495,6 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
 .dash-page { display: none; }
 .dash-page.active { display: block; }
 
-/* Anonymous-landing card shown on / when not logged in */
-.anon-landing {
-    text-align: center;
-    padding: 60px 24px;
-    color: var(--text2);
-}
-.anon-landing h2 { color: var(--text1); margin: 0 0 8px; font-size: 18px; }
-.anon-landing p { font-size: 13px; max-width: 440px; margin: 0 auto 18px; }
-
 @media (max-width: 768px) {
     .container { padding: 12px; }
     .detail-grid { grid-template-columns: 1fr; }
@@ -528,17 +541,8 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
 
 <div class="container">
 
-<!-- Anonymous landing page (only shown when not logged in and on home route) -->
-<div id="page-home" class="dash-page">
-    <div class="anon-landing">
-        <h2>Susi Server</h2>
-        <p>Public documentation is available without a login. To manage licenses, workspaces, releases, or users, please sign in.</p>
-        <div style="display:flex;gap:8px;justify-content:center;">
-            <a href="/docs" class="small secondary" style="text-decoration:none;padding:8px 16px;border:1px solid var(--border);border-radius:var(--radius);color:var(--text1);font-size:13px;">Browse Documentation</a>
-            <button onclick="showLogin()" style="padding:8px 16px;font-size:13px;">Sign In</button>
-        </div>
-    </div>
-</div>
+<!-- Anonymous landing route — login overlay is auto-shown by route(). -->
+<div id="page-home" class="dash-page"></div>
 
 <!-- Workspaces page -->
 <div id="page-workspaces" class="dash-page">
@@ -735,40 +739,37 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
 
 <!-- Shop page -->
 <div id="page-shop" class="dash-page">
-    <div style="margin-top:32px;margin-bottom:14px;">
-        <h2 style="font-size:16px;font-weight:600;margin:0 0 14px;">Settings</h2>
-        <div class="card settings-card">
-            <div class="detail-header">
-                <h3>Email notifications</h3>
-            </div>
-            <div class="detail-body">
-                <div class="form-row">
-                    <label for="shopSetEmails">Order notification recipients</label>
-                    <input type="text" id="shopSetEmails" placeholder="klaus@xikaku.com, ops@lp-research.com">
-                    <div class="field-help">Comma-separated. Each address gets the &ldquo;new order&rdquo; email when a customer pays.</div>
-                    <div id="shopSetEmailsHint" class="field-help" style="display:none;"></div>
-                </div>
-                <div class="toggle-row">
-                    <input type="checkbox" id="shopSetCustomerEnabled">
-                    <label for="shopSetCustomerEnabled">Send branded order confirmation email to customer</label>
-                </div>
-                <div class="form-row">
-                    <label for="shopSetSupport">Customer support contact (shown in emails)</label>
-                    <input type="text" id="shopSetSupport" placeholder="support@lp-research.com">
-                </div>
-                <div class="form-row">
-                    <label for="shopSetThankYou">Optional thank-you message (HTML)</label>
-                    <textarea id="shopSetThankYou" rows="3" placeholder="Free-form HTML shown in the customer confirmation email above the items list."></textarea>
-                </div>
-                <div id="shopSetError" class="form-error" style="display:none;"></div>
-            </div>
-            <div class="form-footer">
-                <button class="primary" onclick="saveShopSettings()">Save settings</button>
-            </div>
+    <div style="margin-top:32px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <h2 style="font-size:16px;font-weight:600;">Orders</h2>
+        <div style="display:flex;gap:8px;">
+            <select id="ordersStatusFilter" onchange="loadShopOrders()" style="padding:6px 10px;">
+                <option value="">All statuses</option>
+                <option value="paid">Paid (awaiting fulfillment)</option>
+                <option value="shipped">Shipped</option>
+            </select>
+            <button class="secondary" onclick="loadShopOrders()">Refresh</button>
         </div>
     </div>
+    <div class="card" style="padding:0;">
+        <table style="width:100%;" id="shopOrdersTable">
+            <thead>
+                <tr>
+                    <th style="width:60px;">#</th>
+                    <th style="width:160px;">Created</th>
+                    <th>Customer</th>
+                    <th style="width:120px;">Total</th>
+                    <th style="width:110px;">Status</th>
+                    <th>Tracking</th>
+                    <th style="width:160px;"></th>
+                </tr>
+            </thead>
+            <tbody id="shopOrdersBody">
+                <tr><td colspan="7" class="empty-state"><p>Loading...</p></td></tr>
+            </tbody>
+        </table>
+    </div>
 
-    <div style="margin-top:32px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;">
+    <div style="margin-top:40px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;">
         <h2 style="font-size:16px;font-weight:600;">Shop — Products</h2>
         <button onclick="showProductModal()">+ New Product</button>
     </div>
@@ -816,36 +817,67 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
         Tip: shop ships to US and CA only. Use <code>*</code> for both, or <code>US</code> / <code>CA</code> for a single-country rate. Admin fields map directly to Stripe's <code>shipping_options</code>.
     </p>
 
-    <div style="margin-top:40px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
-        <h2 style="font-size:16px;font-weight:600;">Orders</h2>
-        <div style="display:flex;gap:8px;">
-            <select id="ordersStatusFilter" onchange="loadShopOrders()" style="padding:6px 10px;">
-                <option value="">All statuses</option>
-                <option value="paid">Paid (awaiting fulfillment)</option>
-                <option value="shipped">Shipped</option>
-            </select>
-            <button class="secondary" onclick="loadShopOrders()">Refresh</button>
+    <div style="margin-top:40px;margin-bottom:14px;">
+        <h2 style="font-size:16px;font-weight:600;margin:0 0 14px;">Settings</h2>
+        <div class="card settings-card">
+            <div class="detail-header">
+                <h3>Email notifications</h3>
+            </div>
+            <div class="detail-body">
+                <div class="form-row">
+                    <label for="shopSetEmails">Order notification recipients</label>
+                    <input type="text" id="shopSetEmails" placeholder="klaus@xikaku.com, ops@lp-research.com">
+                    <div class="field-help">Comma-separated. Each address gets the &ldquo;new order&rdquo; email when a customer pays.</div>
+                    <div id="shopSetEmailsHint" class="field-help" style="display:none;"></div>
+                </div>
+                <div class="toggle-row">
+                    <input type="checkbox" id="shopSetCustomerEnabled">
+                    <label for="shopSetCustomerEnabled">Send branded order confirmation email to customer</label>
+                </div>
+                <div class="form-row">
+                    <label for="shopSetSupport">Customer support contact (shown in emails)</label>
+                    <input type="text" id="shopSetSupport" placeholder="support@lp-research.com">
+                </div>
+                <div class="form-row">
+                    <label for="shopSetThankYou">Optional thank-you message (HTML)</label>
+                    <textarea id="shopSetThankYou" rows="3" placeholder="Free-form HTML shown in the customer confirmation email above the items list."></textarea>
+                </div>
+                <div id="shopSetError" class="form-error" style="display:none;"></div>
+            </div>
+            <div class="form-footer">
+                <button class="primary" onclick="saveShopSettings()">Save settings</button>
+            </div>
         </div>
     </div>
+</div><!-- /page-shop -->
+
+<!-- Website Pages -->
+<div id="page-website" class="dash-page">
+    <div style="margin-top:8px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <h2 style="font-size:16px;font-weight:600;">Website — Pages</h2>
+        <button onclick="showWebsitePageModal()">+ New Page</button>
+    </div>
+    <p style="margin-top:0;margin-bottom:16px;font-size:12px;color:var(--text2);">
+        Click <em>Open editor</em> to edit a page on the public site (Edit button appears in the header). Pages are reachable at <code>https://xikaku.com/{slug}</code> on the canonical domain.
+    </p>
     <div class="card" style="padding:0;">
-        <table style="width:100%;" id="shopOrdersTable">
+        <table style="width:100%;" id="websitePagesTable">
             <thead>
                 <tr>
-                    <th style="width:60px;">#</th>
-                    <th style="width:160px;">Created</th>
-                    <th>Customer</th>
-                    <th style="width:120px;">Total</th>
-                    <th style="width:110px;">Status</th>
-                    <th>Tracking</th>
-                    <th style="width:160px;"></th>
+                    <th>Slug</th>
+                    <th>Title</th>
+                    <th style="width:140px;">Parent</th>
+                    <th style="width:80px;">Ord</th>
+                    <th style="width:180px;">Updated</th>
+                    <th style="width:200px;"></th>
                 </tr>
             </thead>
-            <tbody id="shopOrdersBody">
-                <tr><td colspan="7" class="empty-state"><p>Loading...</p></td></tr>
+            <tbody id="websitePagesBody">
+                <tr><td colspan="6" class="empty-state"><p>Loading...</p></td></tr>
             </tbody>
         </table>
     </div>
-</div><!-- /page-shop -->
+</div><!-- /page-website -->
 
 <!-- Order detail modal -->
 <div id="orderModal" class="modal-overlay" onclick="if(event.target===this)closeOrderModal()">
@@ -879,6 +911,31 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
         <div class="form-actions">
             <button class="secondary" onclick="closeOrderModal()">Close</button>
             <button class="primary" id="orderShipBtn" onclick="submitMarkShipped()" style="display:none;">Mark shipped + email customer</button>
+        </div>
+    </div>
+</div>
+
+<!-- New Website Page Modal -->
+<div id="websitePageModal" class="modal-overlay" onclick="if(event.target===this)closeWebsitePageModal()">
+    <div class="modal">
+        <h2>New Page</h2>
+        <div class="form-row">
+            <label>Slug</label>
+            <input type="text" id="websitePageSlug" placeholder="my-new-page">
+            <p style="font-size:11px;color:var(--text2);margin:4px 0 0;">Lowercase letters, digits, and hyphens. Will be reachable at <code>/{slug}</code>.</p>
+        </div>
+        <div class="form-row">
+            <label>Title</label>
+            <input type="text" id="websitePageTitle" placeholder="My New Page">
+        </div>
+        <div class="form-row" style="display:grid;grid-template-columns:1fr 100px;gap:12px;">
+            <div><label>Parent slug (optional)</label><input type="text" id="websitePageParent" placeholder="(top-level)"></div>
+            <div><label>Ord</label><input type="number" id="websitePageOrd" value="0"></div>
+        </div>
+        <div id="websitePageError" style="background:rgba(248,113,113,0.15);border:1px solid var(--red);color:var(--red);padding:10px 14px;border-radius:var(--radius);margin-top:12px;font-size:12px;display:none;"></div>
+        <div class="form-actions">
+            <button class="secondary" onclick="closeWebsitePageModal()">Cancel</button>
+            <button class="primary" onclick="createWebsitePage()">Create + Open editor</button>
         </div>
     </div>
 </div>
@@ -1104,6 +1161,44 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
             <input type="text" id="loginTotp" placeholder="6-digit code, or XXXXX-XXXXX" maxlength="20" autocomplete="one-time-code" onkeydown="if(event.key==='Enter')submitLogin()">
         </div>
         <button onclick="submitLogin()">Sign In</button>
+        <div style="text-align:center;margin-top:12px;font-size:12px;">
+            <a href="#" onclick="event.preventDefault();showForgotPassword();" style="color:var(--text2);">Forgot password?</a>
+        </div>
+    </div>
+</div>
+
+<!-- Forgot-password overlay: ask for username, then send reset email. -->
+<div id="forgotPasswordOverlay" class="auth-overlay">
+    <div class="auth-card">
+        <h2>Reset your password</h2>
+        <div class="subtitle">Enter your username — we'll email a reset link if an address is on file.</div>
+        <div id="forgotPasswordError" class="auth-error"></div>
+        <div class="form-row">
+            <label>Username</label>
+            <input type="text" id="forgotUsername" placeholder="Username" autocomplete="username" onkeydown="if(event.key==='Enter')submitForgotPassword()">
+        </div>
+        <button onclick="submitForgotPassword()">Send reset link</button>
+        <div style="text-align:center;margin-top:12px;font-size:12px;">
+            <a href="#" onclick="event.preventDefault();document.getElementById('forgotPasswordOverlay').classList.remove('visible');showLogin();" style="color:var(--text2);">Back to sign in</a>
+        </div>
+    </div>
+</div>
+
+<!-- Password-reset overlay: shown when user lands on /#/reset/<token>. -->
+<div id="resetPasswordOverlay" class="auth-overlay">
+    <div class="auth-card">
+        <h2>Set a new password</h2>
+        <div class="subtitle">Choose a new password for your Susi account.</div>
+        <div id="resetPasswordError" class="auth-error"></div>
+        <div class="form-row">
+            <label>New Password (min 8 chars)</label>
+            <input type="password" id="rpNew" placeholder="New password" autocomplete="new-password">
+        </div>
+        <div class="form-row">
+            <label>Confirm New Password</label>
+            <input type="password" id="rpConfirm" placeholder="Confirm password" autocomplete="new-password" onkeydown="if(event.key==='Enter')submitResetPassword()">
+        </div>
+        <button onclick="submitResetPassword()">Set new password</button>
     </div>
 </div>
 
@@ -1203,6 +1298,7 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
             <h3 style="font-size:14px;margin-bottom:12px;">Add User</h3>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
                 <input type="text" id="newUsername" placeholder="Username" style="flex:1;min-width:120px;">
+                <input type="email" id="newUserEmail" placeholder="Email" style="flex:1;min-width:160px;" required>
                 <input type="password" id="newPassword" placeholder="Password (min 8)" style="flex:1;min-width:120px;">
                 <select id="newUserRole" style="width:90px;">
                     <option value="user">User</option>
@@ -1346,7 +1442,7 @@ function tryHandleMagicLink() {
     // Clear any stale overlays from the tab's prior state (login prompt,
     // change-password prompt from an old session) so the magic-exchange
     // overlay is the only thing showing.
-    ['loginOverlay', 'changePasswordOverlay'].forEach(id => {
+    ['loginOverlay', 'changePasswordOverlay', 'forgotPasswordOverlay', 'resetPasswordOverlay'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.classList.remove('visible');
     });
@@ -1365,15 +1461,40 @@ function tryHandleMagicLink() {
     return true;
 }
 
+// Intercept password-reset landings (#/reset/<token>). Same dual-fire
+// reasoning as tryHandleMagicLink. Returns true if a reset token was
+// captured. The actual submit happens when the user fills in the new
+// password and clicks the button.
+let pendingResetToken = '';
+function tryHandleResetLink() {
+    const resetMatch = window.location.hash.match(/^#\/reset\/([A-Za-z0-9]+)/);
+    if (!resetMatch) return false;
+    pendingResetToken = resetMatch[1];
+    ['loginOverlay', 'changePasswordOverlay', 'forgotPasswordOverlay', 'magicExchangeOverlay'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.remove('visible');
+    });
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    document.getElementById('resetPasswordError').classList.remove('visible');
+    document.getElementById('rpNew').value = '';
+    document.getElementById('rpConfirm').value = '';
+    document.getElementById('resetPasswordOverlay').classList.add('visible');
+    setTimeout(() => document.getElementById('rpNew').focus(), 50);
+    return true;
+}
+
 (function init() {
     authToken = localStorage.getItem('auth_token') || '';
 
     if (tryHandleMagicLink()) return;
+    if (tryHandleResetLink()) return;
 
     window.addEventListener('hashchange', () => {
         // An email link that opens in an already-open tab only fires
-        // hashchange, not a full reload. Catch #/magic/<token> here too.
+        // hashchange, not a full reload. Catch #/magic/<token> and
+        // #/reset/<token> here too.
         if (tryHandleMagicLink()) return;
+        if (tryHandleResetLink()) return;
         route();
     });
     if (!authToken) {
@@ -1394,7 +1515,10 @@ function route() {
         showLogin();
         return;
     }
-    if (!authToken) target = 'home';
+    if (!authToken) {
+        target = 'home';
+        showLogin();
+    }
     if (authToken && (target === '' || target === 'home')) {
         // Logged-in user landing on / — pick the first available section.
         target = (userRole === 'admin') ? 'releases' : 'workspaces';
@@ -1422,6 +1546,7 @@ function renderNav() {
         { page: 'workspaces', label: 'Workspaces', href: '#/workspaces', show: !!authToken },
         { page: 'releases', label: 'Releases', href: '#/releases', show: !!authToken },
         { page: 'licenses', label: 'Licenses', href: '#/licenses', show: !!authToken && isAdmin },
+        { page: 'website', label: 'Website', href: '#/website', show: !!authToken && isAdmin },
         { page: 'shop', label: 'Shop', href: '#/shop', show: !!authToken && isAdmin },
     ];
     nav.innerHTML = items.filter(i => i.show).map(i =>
@@ -1615,7 +1740,74 @@ async function submitChangePassword() {
         }
         document.getElementById('changePasswordOverlay').classList.remove('visible');
         toast('Password changed successfully', 'success');
-        enterDashboard();
+        // Re-sync auth state from the server. enterDashboard() alone leaves
+        // mustEnableTotp/currentUsername/totpEnabled stale (magic-exchange
+        // never populated them), which makes the admin /licenses 403 get
+        // misrouted as another change-password prompt — the loop the user hit.
+        await checkAuthStatus();
+    } catch (e) {
+        errEl.textContent = 'Connection failed: ' + e.message;
+        errEl.classList.add('visible');
+    }
+}
+
+function showForgotPassword() {
+    document.getElementById('loginOverlay').classList.remove('visible');
+    document.getElementById('forgotPasswordOverlay').classList.add('visible');
+    document.getElementById('forgotPasswordError').classList.remove('visible');
+    document.getElementById('forgotUsername').value =
+        document.getElementById('loginUsername').value || '';
+    setTimeout(() => document.getElementById('forgotUsername').focus(), 50);
+}
+
+async function submitForgotPassword() {
+    const errEl = document.getElementById('forgotPasswordError');
+    errEl.classList.remove('visible');
+    const username = document.getElementById('forgotUsername').value.trim();
+    if (!username) { errEl.textContent = 'Enter your username'; errEl.classList.add('visible'); return; }
+    try {
+        // Server always responds 200 to avoid leaking which usernames exist.
+        // We mirror that by always advancing to the "check your inbox" view.
+        await fetch(API + '/auth/forgot-password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username }),
+        });
+        document.getElementById('forgotPasswordOverlay').classList.remove('visible');
+        document.getElementById('magicLinkHint').textContent =
+            'If an email is on file for that account, a reset link is on its way.';
+        document.getElementById('magicLinkTtl').textContent = '30';
+        document.getElementById('magicLinkOverlay').classList.add('visible');
+    } catch (e) {
+        errEl.textContent = 'Connection failed: ' + e.message;
+        errEl.classList.add('visible');
+    }
+}
+
+async function submitResetPassword() {
+    const errEl = document.getElementById('resetPasswordError');
+    errEl.classList.remove('visible');
+    const newPw = document.getElementById('rpNew').value;
+    const confirm = document.getElementById('rpConfirm').value;
+    if (newPw.length < 8) { errEl.textContent = 'Password must be at least 8 characters'; errEl.classList.add('visible'); return; }
+    if (newPw !== confirm) { errEl.textContent = 'Passwords do not match'; errEl.classList.add('visible'); return; }
+    if (!pendingResetToken) { errEl.textContent = 'Reset link missing — open the email link again'; errEl.classList.add('visible'); return; }
+    try {
+        const resp = await fetch(API + '/auth/reset-password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: pendingResetToken, new_password: newPw }),
+        });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            errEl.textContent = data.error || 'Reset failed';
+            errEl.classList.add('visible');
+            return;
+        }
+        pendingResetToken = '';
+        document.getElementById('resetPasswordOverlay').classList.remove('visible');
+        toast('Password reset — please sign in', 'success');
+        showLogin();
     } catch (e) {
         errEl.textContent = 'Connection failed: ' + e.message;
         errEl.classList.add('visible');
@@ -1669,6 +1861,7 @@ function enterDashboard() {
     if (isAdmin) {
         loadLicenses();
         loadShop();
+        loadWebsitePages();
     }
     loadReleases();
     loadWorkspaces();
@@ -2200,6 +2393,16 @@ async function verify2FA() {
         mustEnableTotp = false;
         backupCodesRemaining = (data.backup_codes || []).length;
         showBackupCodes(data.backup_codes || [], /*firstTime*/ true);
+        // Pages loaded before enrollment got 403'd by the admin-TOTP gate;
+        // re-fetch now that this session can pass the gate. The 2FA modal
+        // stays visible on top so the user can still save backup codes.
+        if (userRole === 'admin') {
+            loadLicenses();
+            loadShop();
+            loadWebsitePages();
+        }
+        loadReleases();
+        loadWorkspaces();
     } catch (e) {
         toast('Failed: ' + e.message, 'error');
     }
@@ -2339,16 +2542,19 @@ async function loadUsers() {
 
 async function createUser() {
     const username = document.getElementById('newUsername').value.trim();
+    const email = document.getElementById('newUserEmail').value.trim();
     const password = document.getElementById('newPassword').value;
     const role = document.getElementById('newUserRole').value;
     if (!username) { toast('Username is required', 'error'); return; }
+    if (!email) { toast('Email is required', 'error'); return; }
     if (password.length < 8) { toast('Password must be at least 8 characters', 'error'); return; }
 
+    const body = { username, email, password, role };
     try {
         const resp = await fetch(API + '/auth/users', {
             method: 'POST',
             headers: authHeaders(),
-            body: JSON.stringify({ username, password, role }),
+            body: JSON.stringify(body),
         });
         if (!resp.ok) {
             const data = await resp.json();
@@ -2356,6 +2562,7 @@ async function createUser() {
             return;
         }
         document.getElementById('newUsername').value = '';
+        document.getElementById('newUserEmail').value = '';
         document.getElementById('newPassword').value = '';
         document.getElementById('newUserRole').value = 'user';
         toast('User "' + username + '" created', 'success');
@@ -3565,6 +3772,138 @@ async function submitMarkShipped() {
         closeOrderModal();
         await loadShopOrders();
     } catch (e) { errEl.textContent = e.message; errEl.style.display = ''; }
+}
+
+// ---------------------------------------------------------------------------
+// Website pages admin
+//
+// We don't ship a full markdown editor in the dashboard — page editing happens
+// inline on /site/{slug} where the existing EasyMDE-based editor lives. This
+// tab just lists pages and lets you create / delete / jump-to-editor.
+// ---------------------------------------------------------------------------
+let websitePages = [];
+
+async function loadWebsitePages() {
+    if (userRole !== 'admin') return;
+    const tbody = document.getElementById('websitePagesBody');
+    try {
+        const resp = await fetch(API + '/website/pages', { headers: authHeaders() });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        websitePages = data.pages || [];
+        renderWebsitePagesTable();
+    } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><p>Failed to load: ' + escHtml(e.message) + '</p></td></tr>';
+    }
+}
+
+function renderWebsitePagesTable() {
+    const tbody = document.getElementById('websitePagesBody');
+    if (!websitePages.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><p>No pages yet</p><button onclick="showWebsitePageModal()">Create your first page</button></td></tr>';
+        return;
+    }
+    tbody.innerHTML = websitePages.map(p => {
+        const editUrl = '/site/' + encodeURIComponent(p.slug);
+        const parent = p.parent_slug
+            ? '<code>' + escHtml(p.parent_slug) + '</code>'
+            : '<span style="color:var(--text2);">—</span>';
+        return '<tr>'
+            + '<td><code>' + escHtml(p.slug) + '</code></td>'
+            + '<td>' + escHtml(p.title) + '</td>'
+            + '<td>' + parent + '</td>'
+            + '<td>' + p.ord + '</td>'
+            + '<td style="color:var(--text2);font-size:12px;">' + escHtml(p.updated_at || '') + '</td>'
+            + '<td>'
+            +   '<a class="btn small" href="' + escHtml(editUrl) + '" target="_blank" rel="noopener" style="margin-right:4px;">Open editor ↗</a>'
+            +   '<button class="small danger" onclick="deleteWebsitePage(' + JSON.stringify(p.slug) + ')">Delete</button>'
+            + '</td>'
+            + '</tr>';
+    }).join('');
+}
+
+function showWebsitePageModal() {
+    document.getElementById('websitePageSlug').value = '';
+    document.getElementById('websitePageTitle').value = '';
+    document.getElementById('websitePageParent').value = '';
+    document.getElementById('websitePageOrd').value = 0;
+    document.getElementById('websitePageError').style.display = 'none';
+    document.getElementById('websitePageModal').classList.add('visible');
+    setTimeout(() => document.getElementById('websitePageSlug').focus(), 50);
+}
+
+function closeWebsitePageModal() {
+    document.getElementById('websitePageModal').classList.remove('visible');
+}
+
+async function createWebsitePage() {
+    const errEl = document.getElementById('websitePageError');
+    errEl.style.display = 'none';
+    const slug = document.getElementById('websitePageSlug').value.trim();
+    const title = document.getElementById('websitePageTitle').value.trim();
+    const parent = document.getElementById('websitePageParent').value.trim();
+    const ord = parseInt(document.getElementById('websitePageOrd').value, 10) || 0;
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+        errEl.textContent = 'Slug must be lowercase letters, digits, and hyphens (no spaces).';
+        errEl.style.display = '';
+        return;
+    }
+    if (!title) {
+        errEl.textContent = 'Title is required.';
+        errEl.style.display = '';
+        return;
+    }
+    if (websitePages.some(p => p.slug === slug)) {
+        errEl.textContent = 'Slug already exists.';
+        errEl.style.display = '';
+        return;
+    }
+    const body = {
+        title,
+        body_md: '# ' + title + '\n\nWrite your page content here.\n',
+        parent_slug: parent || null,
+        ord,
+        meta_description: '',
+    };
+    try {
+        const resp = await fetch(API + '/website/pages/' + encodeURIComponent(slug), {
+            method: 'PUT',
+            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            errEl.textContent = data.error || ('HTTP ' + resp.status);
+            errEl.style.display = '';
+            return;
+        }
+        closeWebsitePageModal();
+        await loadWebsitePages();
+        // Open the inline editor in a new tab so the user can write content.
+        window.open('/site/' + encodeURIComponent(slug), '_blank', 'noopener');
+    } catch (e) {
+        errEl.textContent = e.message || 'Failed to create page';
+        errEl.style.display = '';
+    }
+}
+
+async function deleteWebsitePage(slug) {
+    if (!confirm('Delete page "' + slug + '"? This cannot be undone.')) return;
+    try {
+        const resp = await fetch(API + '/website/pages/' + encodeURIComponent(slug), {
+            method: 'DELETE',
+            headers: authHeaders(),
+        });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            alert(data.error || ('HTTP ' + resp.status));
+            return;
+        }
+        await loadWebsitePages();
+        toast('Page deleted', 'success');
+    } catch (e) {
+        alert(e.message || 'Failed to delete');
+    }
 }
 </script>
 </body>
