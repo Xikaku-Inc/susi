@@ -1011,6 +1011,26 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
             </tbody>
         </table>
     </div>
+
+    <div style="margin-top:40px;margin-bottom:14px;">
+        <h2 style="font-size:16px;font-weight:600;margin:0 0 14px;">Site Settings</h2>
+        <div class="card settings-card">
+            <div class="detail-header">
+                <h3>Analytics</h3>
+            </div>
+            <div class="detail-body">
+                <div class="form-row">
+                    <label for="siteSetGaId">Google Analytics Measurement ID</label>
+                    <input type="text" id="siteSetGaId" placeholder="G-XXXXXXXXXX">
+                    <div class="field-help">Leave empty to disable. When set, the gtag.js snippet is injected on every public page.</div>
+                </div>
+                <div id="siteSetError" class="form-error" style="display:none;"></div>
+            </div>
+            <div class="form-footer">
+                <button class="primary" onclick="saveSiteSettings()">Save settings</button>
+            </div>
+        </div>
+    </div>
 </div><!-- /page-website -->
 
 <!-- Order detail modal -->
@@ -2044,6 +2064,7 @@ function enterDashboard() {
         loadLicenses();
         loadShop();
         loadWebsitePages();
+        loadSiteSettings();
     }
     loadReleases();
     loadWorkspaces();
@@ -3998,6 +4019,37 @@ async function saveShopSettings() {
         if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); errEl.style.display = ''; return; }
         toast('Shop settings saved', 'success');
         await loadShopSettings();
+    } catch (e) { errEl.textContent = e.message; errEl.style.display = ''; }
+}
+
+async function loadSiteSettings() {
+    if (userRole !== 'admin') return;
+    try {
+        const resp = await fetch(API + '/site/admin/settings', { headers: authHeaders() });
+        if (!resp.ok) return;
+        const s = await resp.json();
+        document.getElementById('siteSetGaId').value = s.google_analytics_id || '';
+    } catch (e) {
+        // Non-fatal — settings just won't pre-fill.
+    }
+}
+
+async function saveSiteSettings() {
+    const errEl = document.getElementById('siteSetError');
+    errEl.style.display = 'none';
+    const body = {
+        google_analytics_id: document.getElementById('siteSetGaId').value.trim(),
+    };
+    try {
+        const resp = await fetch(API + '/site/admin/settings', {
+            method: 'PUT',
+            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) { errEl.textContent = data.error || ('HTTP ' + resp.status); errEl.style.display = ''; return; }
+        toast('Site settings saved', 'success');
+        await loadSiteSettings();
     } catch (e) { errEl.textContent = e.message; errEl.style.display = ''; }
 }
 

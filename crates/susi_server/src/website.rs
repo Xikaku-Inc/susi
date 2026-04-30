@@ -846,12 +846,48 @@ fn render_website(
         ),
     };
 
-    let html = WEBSITE_HTML.replacen("<!--SEO_HEAD-->", &injected, 1);
+    let analytics = analytics_head(state);
+    let html = WEBSITE_HTML
+        .replacen("<!--SEO_HEAD-->", &injected, 1)
+        .replacen("<!--ANALYTICS-->", &analytics, 1);
 
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
     h.insert(header::CACHE_CONTROL, "public, max-age=60".parse().unwrap());
     (h, html)
+}
+
+pub const SETTING_GOOGLE_ANALYTICS_ID: &str = "google_analytics_id";
+
+/// Validate a Google Analytics Measurement ID. Restrict to `[A-Za-z0-9_-]`
+/// so it can be safely interpolated into the gtag.js URL and `gtag('config', ...)`
+/// call without escaping. Length cap keeps stored values sane.
+fn is_valid_analytics_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Render the analytics `<script>` block from the configured Measurement ID,
+/// or empty string when unset. Called per-request — DB lookup is cheap.
+pub fn analytics_head(state: &Arc<AppState>) -> String {
+    let id = {
+        let db = state.db.lock().unwrap();
+        db.get_site_setting(SETTING_GOOGLE_ANALYTICS_ID).ok().flatten()
+    };
+    let Some(id) = id else { return String::new() };
+    if !is_valid_analytics_id(&id) { return String::new() }
+    format!(
+        "<!-- Google tag (gtag.js) -->\n\
+         <script async src=\"https://www.googletagmanager.com/gtag/js?id={id}\"></script>\n\
+         <script>\n\
+         window.dataLayer = window.dataLayer || [];\n\
+         function gtag(){{dataLayer.push(arguments);}}\n\
+         gtag('js', new Date());\n\
+         gtag('config', '{id}');\n\
+         </script>\n",
+        id = id,
+    )
 }
 
 pub async fn handle_robots_txt(_headers: HeaderMap) -> impl IntoResponse {
@@ -962,4 +998,62 @@ pub async fn handle_llms_txt(
     h.insert(header::CONTENT_TYPE, "text/plain; charset=utf-8".parse().unwrap());
     h.insert(header::CACHE_CONTROL, "public, max-age=600".parse().unwrap());
     (h, body)
+}
+
+// ---------------------------------------------------------------------------
+// Site settings admin (JWT)
+// ---------------------------------------------------------------------------
+
+const KNOWN_SITE_SETTING_KEYS: &[&str] = &[SETTING_GOOGLE_ANALYTICS_ID];
+
+pub async fn handle_admin_get_site_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let p = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &p)?;
+    require_admin(&state, &p)?;
+    let pairs = {
+        let db = state.db.lock().unwrap();
+        db.list_site_settings().map_err(db_err)?
+    };
+    let mut out = serde_json::Map::new();
+    for k in KNOWN_SITE_SETTING_KEYS {
+        out.insert((*k).to_string(), serde_json::Value::String(String::new()));
+    }
+    for (k, v) in pairs {
+        out.insert(k, serde_json::Value::String(v));
+    }
+    Ok(Json(serde_json::Value::Object(out)))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateSiteSettingsRequest {
+    #[serde(flatten)]
+    pub fields: std::collections::HashMap<String, String>,
+}
+
+pub async fn handle_admin_put_site_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateSiteSettingsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let p = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &p)?;
+    require_admin(&state, &p)?;
+    for (k, v) in &req.fields {
+        if !KNOWN_SITE_SETTING_KEYS.contains(&k.as_str()) {
+            return Err(error_response(StatusCode::BAD_REQUEST, &format!("Unknown setting: {}", k)));
+        }
+        let trimmed = v.trim();
+        if k == SETTING_GOOGLE_ANALYTICS_ID && !trimmed.is_empty() && !is_valid_analytics_id(trimmed) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "google_analytics_id must contain only letters, digits, '-' or '_' (max 64 chars)",
+            ));
+        }
+        let db = state.db.lock().unwrap();
+        db.set_site_setting(k, trimmed).map_err(db_err)?;
+    }
+    Ok(Json(json!({ "status": "OK" })))
 }

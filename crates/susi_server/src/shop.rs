@@ -1681,12 +1681,15 @@ pub async fn handle_admin_put_settings(
 
 const WEBSITE_HTML: &str = include_str!("website.html");
 
-pub async fn handle_shop_page() -> axum::response::Html<String> {
+pub async fn handle_shop_page(State(state): State<Arc<AppState>>) -> axum::response::Html<String> {
     let head = "<title>Shop — Xikaku</title>\n\
                 <meta name=\"description\" content=\"Order Xikaku IMU and inertial sensors directly. Shipped from our Los Angeles office.\">\n\
                 <meta property=\"og:title\" content=\"Shop — Xikaku\">\n\
                 <meta property=\"og:type\" content=\"website\">\n";
-    let html = WEBSITE_HTML.replacen("<!--SEO_HEAD-->", head, 1);
+    let analytics = crate::website::analytics_head(&state);
+    let html = WEBSITE_HTML
+        .replacen("<!--SEO_HEAD-->", head, 1)
+        .replacen("<!--ANALYTICS-->", &analytics, 1);
     axum::response::Html(html)
 }
 

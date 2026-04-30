@@ -3619,6 +3619,12 @@ async fn main() -> Result<()> {
             get(shop::handle_admin_get_settings)
                 .put(shop::handle_admin_put_settings),
         )
+        // Site-wide settings (JWT) — analytics IDs and other site-level config.
+        .route(
+            "/api/v1/site/admin/settings",
+            get(website::handle_admin_get_site_settings)
+                .put(website::handle_admin_put_site_settings),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cli.listen)

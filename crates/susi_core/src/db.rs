@@ -329,6 +329,14 @@ impl LicenseDb {
             CREATE TABLE IF NOT EXISTS shop_settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            -- Site-wide key/value config (analytics IDs, etc.). Distinct from
+            -- shop_settings so site-level concerns don't bleed into the shop
+            -- admin namespace.
+            CREATE TABLE IF NOT EXISTS site_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
             )
             .map_err(|e| LicenseError::Other(format!("DB init: {}", e)))?;
@@ -3255,6 +3263,40 @@ impl LicenseDb {
     pub fn list_shop_settings(&self) -> Result<Vec<(String, String)>, LicenseError> {
         let mut stmt = self.conn
             .prepare("SELECT key, value FROM shop_settings ORDER BY key")
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn get_site_setting(&self, key: &str) -> Result<Option<String>, LicenseError> {
+        match self.conn.query_row(
+            "SELECT value FROM site_settings WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(LicenseError::Other(format!("DB get site setting: {}", e))),
+        }
+    }
+
+    pub fn set_site_setting(&self, key: &str, value: &str) -> Result<(), LicenseError> {
+        self.conn.execute(
+            "INSERT INTO site_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(|e| LicenseError::Other(format!("DB set site setting: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn list_site_settings(&self) -> Result<Vec<(String, String)>, LicenseError> {
+        let mut stmt = self.conn
+            .prepare("SELECT key, value FROM site_settings ORDER BY key")
             .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
