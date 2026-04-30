@@ -107,6 +107,9 @@ button.secondary:hover { background: var(--border); }
 button.danger { background: var(--red); }
 button.danger:hover { background: #ef4444; }
 button.small { padding: 4px 10px; font-size: 12px; }
+/* Header icon-only buttons are an exception to the 180px standard width.
+   The theme toggle holds a single emoji; padding around it is enough. */
+button.header-icon { min-width: 0; padding: 4px 10px; }
 
 /* Anchor styled to match the standard <button>. Used where we want
    right-click / middle-click open-in-new-tab semantics but the same
@@ -128,7 +131,7 @@ a.btn, a.btn:visited {
 a.btn:hover { background: var(--accent-hover); color: #fff; }
 a.btn.small { padding: 4px 10px; font-size: 12px; }
 
-input, select {
+input, select, textarea {
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text);
@@ -136,9 +139,10 @@ input, select {
     border-radius: var(--radius);
     font-size: 13px;
     outline: none;
+    font-family: inherit;
 }
-input:focus, select:focus { border-color: var(--accent); }
-input::placeholder { color: var(--text2); }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+input::placeholder, textarea::placeholder { color: var(--text2); }
 
 label {
     display: block;
@@ -331,6 +335,86 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
     margin: 16px 0 8px;
     padding-bottom: 4px;
     border-bottom: 1px solid var(--border);
+}
+
+/* Tabs styled like the top-nav menu items: pill hover with rounded corners,
+   accent-tinted active state. No underline. */
+.ws-tabs {
+    display: flex;
+    gap: 4px;
+    margin: 16px 0 12px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+}
+.ws-tab {
+    padding: 6px 12px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    color: var(--text2);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: color 0.15s, background 0.15s;
+}
+.ws-tab:hover {
+    background: var(--bg2);
+    color: var(--text);
+}
+.ws-tab.active {
+    color: var(--accent);
+    background: rgba(106,169,255,0.10);
+}
+.ws-tab-panel { display: none; }
+.ws-tab-panel.active { display: block; }
+
+/* Releases tab: each release is wrapped in a .ws-release-row so the head and
+   the expanded body visually stay attached, with breathing room between rows. */
+.ws-release-row { margin-bottom: 8px; }
+.ws-release-row.open { margin-bottom: 16px; }
+.ws-release-row .ws-release-head { margin-bottom: 0; }
+.ws-release-row.open .ws-release-head {
+    border-radius: var(--radius) var(--radius) 0 0;
+}
+.ws-release-row.open .ws-release-expand {
+    border-top: 1px solid var(--border);
+}
+
+.dropdown { position: relative; display: inline-block; }
+.dropdown-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+    z-index: 100;
+    min-width: 160px;
+    padding: 4px 0;
+}
+.dropdown-menu button {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    text-align: left;
+    background: transparent;
+    border: none;
+    padding: 8px 14px;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 400;
+    border-radius: 0;
+    box-shadow: none;
+}
+.dropdown-menu button:hover { background: var(--bg3); }
+.dropdown-menu button.danger { color: var(--red); background: transparent; }
+.dropdown-menu button.danger:hover { background: var(--bg3); }
+.dropdown-menu .divider {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 0;
 }
 
 .machines-list { margin-top: 4px; }
@@ -530,11 +614,17 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
     <div class="header-actions">
         <span id="connectionStatus" class="status">Connecting...</span>
         <span id="currentUser" style="display:none;font-size:13px;color:var(--text2);"></span>
-        <button id="btnTheme" class="small secondary" onclick="cycleTheme()" title="Toggle theme">🌓</button>
-        <button id="btnUsers" class="small secondary" onclick="showUsersModal()" style="display:none;">Users</button>
-        <button id="btn2FA" class="small secondary" onclick="show2FAModal()" style="display:none;">2FA</button>
-        <button id="btnApiTokens" class="small secondary" onclick="showApiTokensModal()" style="display:none;">API Tokens</button>
-        <button id="btnLogout" class="small secondary" onclick="logout()" style="display:none;">Logout</button>
+        <button id="btnTheme" class="small secondary header-icon" onclick="cycleTheme()" title="Toggle theme">🌓</button>
+        <span class="dropdown" id="headerActions" style="display:none;">
+            <button class="small secondary" onclick="toggleDropdown(event,'headerActionsMenu')">Actions &#9662;</button>
+            <div id="headerActionsMenu" class="dropdown-menu" style="display:none;">
+                <button id="btnUsers" onclick="showUsersModal()" style="display:none;">Users</button>
+                <button id="btn2FA" onclick="show2FAModal()" style="display:none;">2FA</button>
+                <button id="btnApiTokens" onclick="showApiTokensModal()" style="display:none;">API Tokens</button>
+                <div class="divider"></div>
+                <button class="danger" id="btnLogout" onclick="logout()">Logout</button>
+            </div>
+        </span>
         <button id="btnLogin" class="small secondary" onclick="showLogin()" style="display:none;">Login</button>
     </div>
 </div>
@@ -580,35 +670,69 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
                 </div>
             </div>
 
-            <div class="detail-section-title">Members</div>
-            <div id="wsDetailMembers" class="machines-list"></div>
-            <div id="wsAddMemberRow" style="display:flex;gap:8px;margin-top:8px;">
-                <select id="wsNewMember" style="flex:1;"><option value="">Select user...</option></select>
-                <select id="wsNewMemberRole" style="width:100px;">
-                    <option value="viewer">Viewer</option>
-                    <option value="editor">Editor</option>
-                    <option value="owner">Owner</option>
-                </select>
-                <button class="small" onclick="addWsMember()">Add</button>
+            <div class="ws-tabs" role="tablist">
+                <button class="ws-tab active" data-ws-tab="releases" onclick="setWsTab('releases')">Releases</button>
+                <button class="ws-tab" data-ws-tab="configs" onclick="setWsTab('configs')">Configs</button>
+                <button class="ws-tab" data-ws-tab="members" onclick="setWsTab('members')">Members</button>
+                <button class="ws-tab" data-ws-tab="settings" data-ws-admin-only onclick="setWsTab('settings')">Settings</button>
             </div>
 
-            <div class="detail-section-title">Config Revisions</div>
-            <div id="wsDetailConfigs" class="machines-list"></div>
-
-            <div class="detail-section-title" style="display:flex;align-items:center;justify-content:space-between;">
-                <span>Documentation</span>
-                <button id="wsCreateDocReleaseBtn" class="small" style="display:none;" onclick="createWsDocRelease()">+ New doc release</button>
+            <div class="ws-tab-panel active" data-ws-panel="releases">
+                <div class="detail-section-title" style="display:flex;align-items:center;justify-content:space-between;">
+                    <span>Releases</span>
+                    <span style="display:flex;gap:6px;">
+                        <button id="wsCreateDocReleaseBtn" class="small" style="display:none;" onclick="createWsDocRelease()">Add release</button>
+                    </span>
+                </div>
+                <div id="wsDetailReleases" class="machines-list"></div>
             </div>
-            <div id="wsDetailDocReleases" class="machines-list"></div>
 
-            <div class="detail-section-title" style="display:flex;align-items:center;justify-content:space-between;">
-                <span>Software Releases</span>
-                <button id="wsUploadSoftwareBtn" class="small" style="display:none;" onclick="showUploadReleaseModal(selectedWsId)">+ Upload software</button>
+            <div class="ws-tab-panel" data-ws-panel="configs">
+                <div class="detail-section-title">Config Revisions</div>
+                <div id="wsDetailConfigs" class="machines-list"></div>
             </div>
-            <div id="wsDetailReleases" class="machines-list"></div>
 
-            <div id="wsDeleteRow" style="margin-top:16px;display:flex;justify-content:flex-end;">
-                <button class="small danger" onclick="deleteWorkspace()">Delete Workspace</button>
+            <div class="ws-tab-panel" data-ws-panel="members">
+                <div class="detail-section-title">Members</div>
+                <div id="wsDetailMembers" class="machines-list"></div>
+                <div id="wsAddMemberRow" style="display:flex;gap:8px;margin-top:8px;">
+                    <select id="wsNewMember" style="flex:1;"><option value="">Select user...</option></select>
+                    <select id="wsNewMemberRole" style="width:100px;">
+                        <option value="viewer">Viewer</option>
+                        <option value="editor">Editor</option>
+                        <option value="owner">Owner</option>
+                    </select>
+                    <button class="small" onclick="addWsMember()">Add</button>
+                </div>
+            </div>
+
+            <div class="ws-tab-panel" data-ws-panel="settings">
+                <div class="detail-section-title">Workspace Properties</div>
+                <div style="display:grid;grid-template-columns:1fr;gap:10px;max-width:560px;">
+                    <label style="display:flex;flex-direction:column;gap:4px;">
+                        <span class="field-label">Name</span>
+                        <input type="text" id="wsEditName" autocomplete="off">
+                    </label>
+                    <label style="display:flex;flex-direction:column;gap:4px;">
+                        <span class="field-label">Product</span>
+                        <input type="text" id="wsEditProduct" autocomplete="off">
+                    </label>
+                    <label style="display:flex;flex-direction:column;gap:4px;">
+                        <span class="field-label">Description</span>
+                        <textarea id="wsEditDesc" rows="3" style="resize:vertical;"></textarea>
+                    </label>
+                    <label style="display:flex;flex-direction:column;gap:4px;">
+                        <span class="field-label">Created By</span>
+                        <select id="wsEditCreatedBy"></select>
+                    </label>
+                    <div>
+                        <button class="small" onclick="saveWsProperties()">Save</button>
+                    </div>
+                </div>
+                <div class="detail-section-title" style="margin-top:24px;color:var(--red);">Danger Zone</div>
+                <div style="display:flex;justify-content:flex-start;">
+                    <button class="small danger" onclick="deleteWorkspace()">Delete Workspace</button>
+                </div>
             </div>
         </div>
     </div>
@@ -1114,7 +1238,7 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
         </div>
         <div class="form-row">
             <label>Asset File (zip)</label>
-            <input type="file" id="releaseFile" style="font-size:13px;color:var(--text);">
+            <input type="file" id="releaseFile" multiple style="font-size:13px;color:var(--text);">
         </div>
         <div id="uploadProgress" style="display:none;margin-bottom:12px;">
             <div style="background:var(--bg);border-radius:4px;height:22px;overflow:hidden;">
@@ -1124,6 +1248,35 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
         <div class="form-actions">
             <button class="secondary" onclick="closeUploadReleaseModal()">Cancel</button>
             <button id="uploadBtn" onclick="uploadRelease()">Upload</button>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Release Modal -->
+<div id="editReleaseModal" class="modal-overlay" onclick="if(event.target===this)closeEditReleaseModal()">
+    <div class="modal">
+        <h2>Edit Release</h2>
+        <div class="form-row">
+            <label>Version Tag</label>
+            <input type="text" id="editReleaseTag" disabled style="opacity:0.6;">
+        </div>
+        <div class="form-row">
+            <label>Release Name</label>
+            <input type="text" id="editReleaseName">
+        </div>
+        <div class="form-row">
+            <label>Release Notes (Markdown)</label>
+            <textarea id="editReleaseBody" rows="6" style="width:100%;resize:vertical;" placeholder="## Changes&#10;- ..."></textarea>
+        </div>
+        <div class="form-row">
+            <label class="checkbox" style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;color:var(--text2);">
+                <input type="checkbox" id="editReleasePrerelease" style="accent-color:var(--accent);width:16px;height:16px;">
+                Pre-release
+            </label>
+        </div>
+        <div class="form-actions">
+            <button class="secondary" onclick="closeEditReleaseModal()">Cancel</button>
+            <button onclick="saveEditedRelease()">Save</button>
         </div>
     </div>
 </div>
@@ -1563,11 +1716,11 @@ function renderNav() {
     ).join('');
     // Login/logout button visibility
     document.getElementById('btnLogin').style.display = authToken ? 'none' : '';
-    document.getElementById('btnLogout').style.display = authToken ? '' : 'none';
+    document.getElementById('headerActions').style.display = authToken ? '' : 'none';
     document.getElementById('currentUser').style.display = authToken ? '' : 'none';
-    document.getElementById('btn2FA').style.display = authToken ? '' : 'none';
-    document.getElementById('btnUsers').style.display = (authToken && isAdmin) ? '' : 'none';
-    document.getElementById('btnApiTokens').style.display = authToken ? '' : 'none';
+    document.getElementById('btn2FA').style.display = authToken ? 'block' : 'none';
+    document.getElementById('btnUsers').style.display = (authToken && isAdmin) ? 'block' : 'none';
+    document.getElementById('btnApiTokens').style.display = authToken ? 'block' : 'none';
 }
 
 function showLogin() {
@@ -2972,7 +3125,9 @@ async function populateReleaseWorkspaceDropdown(presetWorkspaceId) {
 }
 
 function showUploadReleaseModal(presetWorkspaceId) {
-    document.getElementById('releaseTag').value = '';
+    const tagInput = document.getElementById('releaseTag');
+    tagInput.value = '';
+    tagInput.disabled = false; // may have been locked by replaceWsReleaseFile
     document.getElementById('releaseName').value = '';
     document.getElementById('releaseBody').value = '';
     document.getElementById('releasePrerelease').checked = false;
@@ -2981,7 +3136,7 @@ function showUploadReleaseModal(presetWorkspaceId) {
     document.getElementById('uploadBtn').disabled = false;
     document.getElementById('uploadReleaseModal').classList.add('visible');
     populateReleaseWorkspaceDropdown(presetWorkspaceId);
-    document.getElementById('releaseTag').focus();
+    tagInput.focus();
 }
 
 function closeUploadReleaseModal() {
@@ -3005,7 +3160,9 @@ async function uploadRelease() {
     formData.append('body', body);
     formData.append('prerelease', prerelease ? 'true' : 'false');
     if (workspaceId) formData.append('workspace_id', workspaceId);
-    formData.append('file', fileInput.files[0]);
+    // The backend handler iterates over every "file" multipart field, so a
+    // single submission can attach (or replace) several binaries at once.
+    for (const f of fileInput.files) formData.append('file', f);
 
     document.getElementById('uploadBtn').disabled = true;
     document.getElementById('uploadProgress').style.display = '';
@@ -3121,6 +3278,7 @@ async function showWsDetail(id) {
     renderWorkspaces();
     const panel = document.getElementById('wsDetailPanel');
     panel.classList.add('visible');
+    setWsTab('releases');
 
     try {
         const resp = await fetch(API + '/workspaces/' + id, { headers: authHeaders() });
@@ -3144,10 +3302,30 @@ async function showWsDetail(id) {
                 </div>
             `).join('');
 
-        // Only admins can manage members and delete workspaces
+        // Only admins can manage members, edit workspace properties, or delete.
         const showMemberMgmt = userRole === 'admin';
         document.getElementById('wsAddMemberRow').style.display = showMemberMgmt ? 'flex' : 'none';
-        document.getElementById('wsDeleteRow').style.display = showMemberMgmt ? 'flex' : 'none';
+        document.querySelectorAll('#wsDetailPanel [data-ws-admin-only]').forEach(el => {
+            el.style.display = showMemberMgmt ? '' : 'none';
+        });
+        if (showMemberMgmt) {
+            document.getElementById('wsEditName').value = ws.name || '';
+            document.getElementById('wsEditProduct').value = ws.product || '';
+            document.getElementById('wsEditDesc').value = ws.description || '';
+            // Populate the Created By selector with all known users so admins
+            // can re-attribute the workspace. Fetched once per panel open.
+            const cbSel = document.getElementById('wsEditCreatedBy');
+            try {
+                const uResp = await fetch(API + '/auth/users', { headers: authHeaders() });
+                if (uResp.ok) {
+                    const allUsers = await uResp.json();
+                    cbSel.innerHTML = allUsers
+                        .map(u => '<option value="' + esc(u.username) + '">' + esc(u.username) + '</option>')
+                        .join('');
+                    cbSel.value = ws.created_by || '';
+                }
+            } catch (_) {}
+        }
         if (showMemberMgmt) {
             const memberNames = new Set(members.map(m => m.username));
             try {
@@ -3167,39 +3345,169 @@ async function showWsDetail(id) {
         // a workspace they're a member of. Workspace members can read.
         const canEdit = userRole === 'admin';
         document.getElementById('wsCreateDocReleaseBtn').style.display = canEdit ? '' : 'none';
-        document.getElementById('wsUploadSoftwareBtn').style.display = canEdit ? '' : 'none';
 
-        // Load configs, software releases, and doc releases.
+        // Load configs and the unified releases list.
         loadWsConfigs(id);
         loadWsReleases(id);
-        loadWsDocReleases(id);
     } catch (e) {
         toast('Error: ' + e.message, 'error');
     }
 }
 
-async function loadWsDocReleases(wsId) {
-    const container = document.getElementById('wsDetailDocReleases');
+function setWsTab(name) {
+    document.querySelectorAll('#wsDetailPanel .ws-tab').forEach(b => {
+        b.classList.toggle('active', b.dataset.wsTab === name);
+    });
+    document.querySelectorAll('#wsDetailPanel .ws-tab-panel').forEach(p => {
+        p.classList.toggle('active', p.dataset.wsPanel === name);
+    });
+}
+
+function toggleDropdown(event, id) {
+    event.stopPropagation();
+    document.querySelectorAll('.dropdown-menu').forEach(el => {
+        if (el.id !== id) el.style.display = 'none';
+    });
+    const m = document.getElementById(id);
+    if (m) m.style.display = (m.style.display === 'block') ? 'none' : 'block';
+}
+document.addEventListener('click', () => {
+    document.querySelectorAll('.dropdown-menu').forEach(el => { el.style.display = 'none'; });
+});
+
+async function addWsReleaseSoftware(tag) {
+    // Identical wiring to "Replace file": pre-fill the upload modal with the
+    // current metadata and lock the tag. The semantic difference is intent —
+    // the user picks a NEW file to add. The backend will preserve any
+    // existing assets with different filenames; uploading a same-named file
+    // overwrites it (existing add_release_asset upsert behaviour). The
+    // modal supports multi-select, so several binaries can ship at once.
+    return replaceWsReleaseFile(tag);
+}
+
+async function replaceWsReleaseFile(tag) {
+    if (!selectedWsId) return;
+    // Pre-fill the existing upload modal with the current metadata so the user
+    // only has to pick a new file. The tag input is locked because the
+    // backend keys re-uploads off the tag.
     try {
-        const resp = await fetch(API + '/workspaces/' + wsId + '/docs/releases', { headers: authHeaders() });
-        if (!resp.ok) { container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load</div>'; return; }
+        const resp = await fetch(API + '/workspaces/' + selectedWsId + '/releases', { headers: authHeaders() });
+        if (!resp.ok) { toast('Failed to load release', 'error'); return; }
         const data = await resp.json();
-        const rels = data.releases || [];
-        if (rels.length === 0) {
-            container.innerHTML = '<div style="color:var(--text2);font-size:13px;">No documentation releases yet</div>';
+        const r = (data.releases || []).find(x => x.tag === tag);
+        if (!r) { toast('Release not found', 'error'); return; }
+        showUploadReleaseModal(selectedWsId);
+        const tagInput = document.getElementById('releaseTag');
+        tagInput.value = r.tag;
+        tagInput.disabled = true;
+        document.getElementById('releaseName').value = r.name || '';
+        document.getElementById('releaseBody').value = r.body || '';
+        document.getElementById('releasePrerelease').checked = !!r.prerelease;
+        document.getElementById('releaseFile').focus();
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function editWsRelease(tag) {
+    if (!selectedWsId) return;
+    // Pull the current metadata so the modal pre-fills accurately. The
+    // workspace releases listing has the fields we need; one extra fetch
+    // keeps things idempotent if other admins changed the row meanwhile.
+    try {
+        const resp = await fetch(API + '/workspaces/' + selectedWsId + '/releases', { headers: authHeaders() });
+        if (!resp.ok) { toast('Failed to load release', 'error'); return; }
+        const data = await resp.json();
+        const r = (data.releases || []).find(x => x.tag === tag);
+        if (!r) { toast('Release not found', 'error'); return; }
+        document.getElementById('editReleaseTag').value = r.tag;
+        document.getElementById('editReleaseName').value = r.name || '';
+        document.getElementById('editReleaseBody').value = r.body || '';
+        document.getElementById('editReleasePrerelease').checked = !!r.prerelease;
+        document.getElementById('editReleaseModal').classList.add('visible');
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+function closeEditReleaseModal() {
+    document.getElementById('editReleaseModal').classList.remove('visible');
+}
+
+async function saveEditedRelease() {
+    const tag = document.getElementById('editReleaseTag').value;
+    const name = document.getElementById('editReleaseName').value.trim();
+    const body = document.getElementById('editReleaseBody').value;
+    const prerelease = document.getElementById('editReleasePrerelease').checked;
+    if (!tag) return;
+    try {
+        const resp = await fetch(API + '/releases/' + encodeURIComponent(tag), {
+            method: 'PUT',
+            headers: authHeaders(),
+            body: JSON.stringify({ name, body, prerelease }),
+        });
+        if (!resp.ok) {
+            const d = await resp.json().catch(() => ({}));
+            toast('Error: ' + (d.error || 'Could not save'), 'error');
             return;
         }
-        container.innerHTML = rels.map(r => {
-            const url = '/docs?workspace=' + encodeURIComponent(wsId) + '&tag=' + encodeURIComponent(r.tag);
-            return '<div class="machine-item">' +
-                '<span><strong style="font-family:monospace;">' + esc(r.tag) + '</strong>' +
-                (r.name && r.name !== r.tag ? ' <span style="color:var(--text2);margin-left:6px;">' + esc(r.name) + '</span>' : '') +
-                ' <span style="color:var(--text2);margin-left:6px;font-size:11px;">' + r.page_count + ' page' + (r.page_count === 1 ? '' : 's') + '</span></span>' +
-                '<a class="small" style="text-decoration:none;" href="' + url + '" target="_blank">Open &rarr;</a>' +
-            '</div>';
-        }).join('');
+        toast('Release ' + tag + ' updated', 'success');
+        closeEditReleaseModal();
+        if (selectedWsId) loadWsReleases(selectedWsId);
     } catch (e) {
-        container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load doc releases</div>';
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function deleteWsRelease(tag) {
+    if (!selectedWsId) return;
+    if (!confirm('Delete release "' + tag + '"? Binary assets and any documentation pages on this release will be removed.')) return;
+    try {
+        const resp = await fetch(API + '/releases/' + encodeURIComponent(tag), {
+            method: 'DELETE',
+            headers: authHeaders(),
+        });
+        if (!resp.ok) {
+            const d = await resp.json().catch(() => ({}));
+            toast('Error: ' + (d.error || 'Could not delete'), 'error');
+            return;
+        }
+        toast('Release ' + tag + ' deleted', 'success');
+        loadWsReleases(selectedWsId);
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+async function saveWsProperties() {
+    if (!selectedWsId) return;
+    const name = document.getElementById('wsEditName').value.trim();
+    const product = document.getElementById('wsEditProduct').value.trim();
+    const description = document.getElementById('wsEditDesc').value;
+    const createdBy = document.getElementById('wsEditCreatedBy').value;
+    if (!name) { toast('Name is required', 'error'); return; }
+    const payload = { name, product, description };
+    if (createdBy) payload.created_by = createdBy;
+    try {
+        const resp = await fetch(API + '/workspaces/' + selectedWsId, {
+            method: 'PUT',
+            headers: authHeaders(),
+            body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+            const d = await resp.json().catch(() => ({}));
+            toast('Error: ' + (d.error || 'Could not save'), 'error');
+            return;
+        }
+        toast('Workspace updated', 'success');
+        // Refresh both the card grid and the panel header.
+        loadWorkspaces();
+        document.getElementById('wsDetailTitle').textContent = name;
+        document.getElementById('wsDetailProduct').textContent = product || '-';
+        document.getElementById('wsDetailDesc').textContent = description || '-';
+        document.getElementById('wsDetailCreatedBy').textContent = createdBy || '-';
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
     }
 }
 
@@ -3221,43 +3529,166 @@ async function createWsDocRelease() {
             toast('Error: ' + (data.error || 'Could not create release'), 'error');
             return;
         }
-        toast('Doc release ' + trimmed + ' created', 'success');
-        loadWsDocReleases(selectedWsId);
+        toast('Release ' + trimmed + ' created', 'success');
+        loadWsReleases(selectedWsId);
     } catch (e) {
         toast('Failed: ' + e.message, 'error');
     }
 }
 
+// Cached state for the unified Releases tab so toggling expansion doesn't
+// trigger a network refetch.
+let wsReleasesData = { wsId: null, allRels: [], docPageCounts: new Map() };
+const wsExpandedTags = new Set();
+const wsReleasePages = new Map(); // tag -> [{slug, title, parent_slug, ord}]
+
 async function loadWsReleases(wsId) {
     const container = document.getElementById('wsDetailReleases');
     try {
-        const resp = await fetch(API + '/workspaces/' + wsId + '/releases', { headers: authHeaders() });
-        if (!resp.ok) { container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load</div>'; return; }
-        const data = await resp.json();
-        // The endpoint returns every workspace release row, including those
-        // that exist only as doc releases. Filter to releases that actually
-        // ship binaries — otherwise creating a doc release would also surface
-        // an empty entry under "Software Releases".
-        const rels = (data.releases || []).filter(r => (r.assets || []).length > 0);
-        if (rels.length === 0) {
-            container.innerHTML = '<div style="color:var(--text2);font-size:13px;">No software uploaded yet</div>';
-            return;
+        // Pull both the software view (assets) and the doc view (page counts)
+        // and merge by tag. Both endpoints are workspace-scoped now, so the
+        // union is the full per-workspace release set.
+        const [relsResp, docsResp] = await Promise.all([
+            fetch(API + '/workspaces/' + wsId + '/releases', { headers: authHeaders() }),
+            fetch(API + '/workspaces/' + wsId + '/docs/releases', { headers: authHeaders() }),
+        ]);
+        if (!relsResp.ok) { container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load</div>'; return; }
+        const relsData = await relsResp.json();
+        const docsData = docsResp.ok ? await docsResp.json() : { releases: [] };
+
+        const docPageCounts = new Map();
+        (docsData.releases || []).forEach(r => docPageCounts.set(r.tag, r.page_count || 0));
+
+        const merged = new Map();
+        (relsData.releases || []).forEach(r => merged.set(r.tag, r));
+        (docsData.releases || []).forEach(d => {
+            if (!merged.has(d.tag)) {
+                merged.set(d.tag, { tag: d.tag, name: d.name, published_at: d.published_at, prerelease: false, assets: [] });
+            }
+        });
+        const allRels = Array.from(merged.values())
+            .sort((a, b) => (b.published_at || '').localeCompare(a.published_at || ''));
+
+        // Reset expansion state on workspace change so we don't carry stale
+        // open rows from a different workspace.
+        if (wsReleasesData.wsId !== wsId) {
+            wsExpandedTags.clear();
+            wsReleasePages.clear();
         }
-        container.innerHTML = rels.map(r => {
-            const dlBtns = (r.assets || []).map(a =>
-                '<button class="small" onclick="downloadAsset(event,\'' + esc(r.tag) + '\',\'' + esc(a.name) + '\')" title="' + esc(a.name) + ' (' + formatSize(a.size) + ')">' +
-                esc(a.name) + '</button>'
-            ).join(' ');
-            const pre = r.prerelease ? ' <span style="background:rgba(251,191,36,0.15);color:var(--yellow);font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;">Pre</span>' : '';
-            return '<div class="machine-item">' +
-                '<span><strong style="font-family:monospace;">' + esc(r.tag) + '</strong>' + pre +
-                (r.name && r.name !== r.tag ? ' <span style="color:var(--text2);margin-left:6px;">' + esc(r.name) + '</span>' : '') +
-                ' <span style="color:var(--text2);margin-left:6px;font-size:11px;">' + formatDate(r.published_at) + '</span></span>' +
-                '<span style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">' + (dlBtns || '<span style="color:var(--text2);font-size:12px;">no assets</span>') + '</span>' +
-            '</div>';
-        }).join('');
+        wsReleasesData = { wsId, allRels, docPageCounts };
+        renderWsReleases();
     } catch (e) {
         container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load releases</div>';
+    }
+}
+
+function renderWsReleases() {
+    const container = document.getElementById('wsDetailReleases');
+    const { wsId, allRels, docPageCounts } = wsReleasesData;
+    if (!wsId) return;
+    if (allRels.length === 0) {
+        container.innerHTML = '<div style="color:var(--text2);font-size:13px;">No releases yet. Upload software or create an empty release to start adding documentation.</div>';
+        return;
+    }
+    const isAdmin = userRole === 'admin';
+    container.innerHTML = allRels.map(r => {
+        const pre = r.prerelease ? ' <span style="background:rgba(251,191,36,0.15);color:var(--yellow);font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;">Pre</span>' : '';
+        const menuId = 'rel-menu-' + r.tag.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const adminBtns = isAdmin
+            ? ' <span class="dropdown" onclick="event.stopPropagation();">' +
+                '<button class="small secondary" onclick="toggleDropdown(event,\'' + menuId + '\')">Actions &#9662;</button>' +
+                '<div id="' + menuId + '" class="dropdown-menu" style="display:none;">' +
+                    '<button onclick="editWsRelease(\'' + esc(r.tag) + '\')">Edit metadata</button>' +
+                    '<button onclick="addWsReleaseSoftware(\'' + esc(r.tag) + '\')">Add software</button>' +
+                    '<button onclick="replaceWsReleaseFile(\'' + esc(r.tag) + '\')">Replace file</button>' +
+                    '<div class="divider"></div>' +
+                    '<button class="danger" onclick="deleteWsRelease(\'' + esc(r.tag) + '\')">Delete</button>' +
+                '</div>' +
+              '</span>'
+            : '';
+        const expanded = wsExpandedTags.has(r.tag);
+        const chev = expanded ? '&#9662;' : '&#9656;';
+        const expandedBlock = expanded ? renderWsReleaseExpansion(r, docPageCounts.has(r.tag)) : '';
+        return '<div class="ws-release-row' + (expanded ? ' open' : '') + '">' +
+            '<div class="machine-item ws-release-head" style="flex-wrap:wrap;gap:8px;cursor:pointer;" onclick="toggleWsRelease(\'' + esc(r.tag) + '\')">' +
+                '<span style="flex:1;min-width:200px;display:flex;align-items:center;gap:6px;">' +
+                    '<span class="ws-release-chev" style="color:var(--text2);width:12px;display:inline-block;">' + chev + '</span>' +
+                    '<strong style="font-family:monospace;">' + esc(r.tag) + '</strong>' + pre +
+                    (r.name && r.name !== r.tag ? ' <span style="color:var(--text2);margin-left:6px;">' + esc(r.name) + '</span>' : '') +
+                    ' <span style="color:var(--text2);margin-left:6px;font-size:11px;">' + formatDate(r.published_at) + '</span>' +
+                '</span>' +
+                '<span style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;justify-content:flex-end;">' +
+                    adminBtns +
+                '</span>' +
+            '</div>' +
+            expandedBlock +
+        '</div>';
+    }).join('');
+}
+
+function renderWsReleaseExpansion(r, hasDocReleaseRow) {
+    const wsId = wsReleasesData.wsId;
+    const tag = r.tag;
+    const pages = wsReleasePages.get(tag);
+    const docsUrl = '/docs?workspace=' + encodeURIComponent(wsId) + '&tag=' + encodeURIComponent(tag);
+    let pagesHtml;
+    if (!hasDocReleaseRow) {
+        pagesHtml = '<div style="color:var(--text2);font-size:12px;">No documentation pages yet.</div>';
+    } else if (pages === undefined) {
+        pagesHtml = '<div style="color:var(--text2);font-size:12px;">Loading pages…</div>';
+    } else if (pages.length === 0) {
+        pagesHtml = '<div style="color:var(--text2);font-size:12px;">No pages on this release.</div>';
+    } else {
+        const sorted = [...pages].sort((a, b) => (a.ord - b.ord) || a.title.localeCompare(b.title));
+        pagesHtml = '<ul style="list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:2px;">' +
+            sorted.map(p => {
+                const indent = p.parent_slug ? '12px' : '0';
+                const pageUrl = docsUrl + '#/' + encodeURIComponent(tag) + '/' + encodeURIComponent(p.slug);
+                return '<li style="padding-left:' + indent + ';"><a href="' + pageUrl + '" style="color:var(--accent);text-decoration:none;font-size:13px;">' + esc(p.title) + '</a> <span style="color:var(--text2);font-size:11px;font-family:monospace;">' + esc(p.slug) + '</span></li>';
+            }).join('') +
+        '</ul>';
+    }
+
+    let filesHtml;
+    if ((r.assets || []).length === 0) {
+        filesHtml = '<div style="color:var(--text2);font-size:12px;">No software files attached.</div>';
+    } else {
+        filesHtml = '<ul style="list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:2px;">' +
+            r.assets.map(a => '<li style="display:flex;justify-content:space-between;gap:8px;font-size:13px;">' +
+                '<a href="#" onclick="event.preventDefault();downloadAsset(event,\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" style="color:var(--accent);text-decoration:none;font-family:monospace;">' + esc(a.name) + '</a>' +
+                '<span style="color:var(--text2);font-size:11px;">' + formatSize(a.size) + '</span>' +
+            '</li>').join('') +
+        '</ul>';
+    }
+
+    return '<div class="ws-release-expand" style="padding:8px 12px 12px 30px;display:grid;grid-template-columns:1fr 1fr;gap:16px;background:var(--bg);border-radius:0 0 var(--radius) var(--radius);">' +
+        '<div><div class="field-label">Documentation pages</div>' + pagesHtml + '</div>' +
+        '<div><div class="field-label">Software files</div>' + filesHtml + '</div>' +
+    '</div>';
+}
+
+async function toggleWsRelease(tag) {
+    if (wsExpandedTags.has(tag)) {
+        wsExpandedTags.delete(tag);
+        renderWsReleases();
+        return;
+    }
+    wsExpandedTags.add(tag);
+    renderWsReleases(); // optimistic; shows "Loading pages…" until fetch returns
+    // Lazy-fetch the pages list once per release tag.
+    if (!wsReleasePages.has(tag) && wsReleasesData.docPageCounts.has(tag)) {
+        try {
+            const resp = await fetch(API + '/docs/' + encodeURIComponent(tag) + '/pages', { headers: authHeaders() });
+            if (resp.ok) {
+                const data = await resp.json();
+                wsReleasePages.set(tag, data.pages || []);
+            } else {
+                wsReleasePages.set(tag, []);
+            }
+        } catch (_) {
+            wsReleasePages.set(tag, []);
+        }
+        if (wsExpandedTags.has(tag)) renderWsReleases();
     }
 }
 

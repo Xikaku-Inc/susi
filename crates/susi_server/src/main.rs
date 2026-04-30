@@ -2532,6 +2532,41 @@ async fn handle_upload_release(
     })))
 }
 
+#[derive(Deserialize)]
+struct UpdateReleaseRequest {
+    name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    prerelease: bool,
+}
+
+/// Update a release's metadata (name/body/prerelease) without touching the
+/// binary assets or its workspace scope. Admin only (JWT).
+async fn handle_update_release(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tag): Path<String>,
+    Json(req): Json<UpdateReleaseRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+
+    let db = state.db.lock().unwrap();
+    let release_id = db
+        .get_release_by_tag(&tag)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Release not found"))?;
+    let existing_ws = db
+        .get_release_workspace_id(&tag)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .flatten();
+    db.update_release_metadata(release_id, &req.name, &req.body, req.prerelease, existing_ws.as_deref())
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
 /// Delete a release — admin only (JWT)
 async fn handle_delete_release(
     State(state): State<Arc<AppState>>,
@@ -2579,6 +2614,11 @@ struct UpdateWorkspaceRequest {
     product: String,
     #[serde(default)]
     description: String,
+    /// Optional: re-assign the "created by" attribution to a different
+    /// existing user. Workspace membership is unaffected; this only changes
+    /// the display label and is admin-only.
+    #[serde(default)]
+    created_by: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2718,7 +2758,24 @@ async fn handle_update_workspace(
         return Err(error_response(StatusCode::FORBIDDEN, "Insufficient permissions"));
     }
 
-    db.update_workspace(&id, &req.name, &req.product, &req.description)
+    // Re-assigning the "created by" attribution is admin-only (the field is
+    // mostly cosmetic but we want admins to be the gate). Validate the target
+    // user exists before persisting.
+    let new_created_by = match req.created_by.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(target) => {
+            let is_admin = db.get_user_role(&principal.username).map(|r| r == "admin").unwrap_or(false);
+            if !is_admin {
+                return Err(error_response(StatusCode::FORBIDDEN, "Only site admins can change 'created by'"));
+            }
+            if !db.user_exists(target).map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))? {
+                return Err(error_response(StatusCode::BAD_REQUEST, "Target user does not exist"));
+            }
+            Some(target.to_string())
+        }
+        None => None,
+    };
+
+    db.update_workspace(&id, &req.name, &req.product, &req.description, new_created_by.as_deref())
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "status": "OK" })))
@@ -3050,16 +3107,35 @@ async fn handle_create_workspace_doc_release(
         return Err(error_response(StatusCode::BAD_REQUEST, "Missing 'tag'"));
     }
 
-    // Reject tag collisions across scopes.
+    // Idempotent within a single workspace: if the tag already lives in this
+    // workspace (e.g. created by a prior software upload), we just return the
+    // existing release so the caller can attach docs. Cross-scope collisions
+    // (different workspace, or a global release with the same tag) are
+    // rejected — those would change ownership semantics.
     let existing_ws = {
         let db = state.db.lock().unwrap();
         db.get_release_workspace_id(&tag)
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
     };
-    if let Some(existing) = existing_ws {
+    if let Some(ref existing) = existing_ws {
         match existing {
-            Some(ref ws) if ws == &workspace_id => {
-                return Err(error_response(StatusCode::CONFLICT, "Release tag already exists in this workspace"));
+            Some(ws) if ws == &workspace_id => {
+                let id = {
+                    let db = state.db.lock().unwrap();
+                    db.get_release_by_tag(&tag)
+                        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+                        .ok_or_else(|| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Release vanished"))?
+                };
+                // Seeding is INSERT OR IGNORE, so calling again is a no-op
+                // when user pages already exist for this release.
+                docs::seed_user_docs_into_release(&state, id, &tag, Some(&workspace_id))?;
+                return Ok(Json(serde_json::json!({
+                    "tag": tag,
+                    "name": req.name,
+                    "workspace_id": workspace_id,
+                    "id": id,
+                    "already_existed": true,
+                })));
             }
             _ => {
                 return Err(error_response(StatusCode::CONFLICT, "Release tag already exists in another scope"));
@@ -3360,7 +3436,7 @@ async fn main() -> Result<()> {
                 .route("/api/v1/releases", post(handle_upload_release))
                 .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         )
-        .route("/api/v1/releases/{tag}", axum::routing::delete(handle_delete_release))
+        .route("/api/v1/releases/{tag}", axum::routing::put(handle_update_release).delete(handle_delete_release))
         // Workspace endpoints (JWT protected)
         .route("/api/v1/workspaces", get(handle_list_workspaces).post(handle_create_workspace))
         .route("/api/v1/workspaces/{id}", get(handle_get_workspace).put(handle_update_workspace).delete(handle_delete_workspace))

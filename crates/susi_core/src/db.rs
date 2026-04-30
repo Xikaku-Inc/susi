@@ -1536,14 +1536,23 @@ impl LicenseDb {
         name: &str,
         product: &str,
         description: &str,
+        created_by: Option<&str>,
     ) -> Result<bool, LicenseError> {
         let now = Utc::now().to_rfc3339();
-        let rows = self.conn
-            .execute(
-                "UPDATE workspaces SET name = ?1, product = ?2, description = ?3, updated_at = ?4 WHERE id = ?5",
-                params![name, product, description, now, id],
-            )
-            .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?;
+        let rows = match created_by {
+            Some(cb) => self.conn
+                .execute(
+                    "UPDATE workspaces SET name = ?1, product = ?2, description = ?3, created_by = ?4, updated_at = ?5 WHERE id = ?6",
+                    params![name, product, description, cb, now, id],
+                )
+                .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?,
+            None => self.conn
+                .execute(
+                    "UPDATE workspaces SET name = ?1, product = ?2, description = ?3, updated_at = ?4 WHERE id = ?5",
+                    params![name, product, description, now, id],
+                )
+                .map_err(|e| LicenseError::Other(format!("DB update: {}", e)))?,
+        };
         Ok(rows > 0)
     }
 
@@ -1852,12 +1861,14 @@ impl LicenseDb {
         Ok(rows)
     }
 
-    /// List releases visible to a workspace (workspace-specific + global).
+    /// List releases that belong to a single workspace. Global releases are
+    /// excluded — those are reachable through the public/admin global release
+    /// listing and don't belong on a workspace-specific surface.
     pub fn list_releases_for_workspace(&self, workspace_id: &str) -> Result<Vec<(i64, String, String, String, bool, String)>, LicenseError> {
         let mut stmt = self.conn
             .prepare(
                 "SELECT id, tag, name, body, prerelease, created_at FROM releases
-                 WHERE workspace_id = ?1 OR workspace_id IS NULL
+                 WHERE workspace_id = ?1
                  ORDER BY id DESC"
             )
             .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
@@ -3940,7 +3951,7 @@ mod tests {
         let db = test_db();
         db.create_workspace("ws-1", "Old Name", "P", "D", "admin").unwrap();
 
-        let updated = db.update_workspace("ws-1", "New Name", "NewP", "NewD").unwrap();
+        let updated = db.update_workspace("ws-1", "New Name", "NewP", "NewD", None).unwrap();
         assert!(updated);
 
         let ws = db.get_workspace("ws-1").unwrap().unwrap();
@@ -4215,18 +4226,19 @@ mod tests {
         db.insert_release("v1.0", "Global", "", false, None).unwrap();
         db.insert_release("v1.1", "Scoped", "", false, Some("ws-1")).unwrap();
 
-        // Global list shows all
+        // Global list shows all releases regardless of scope.
         let all = db.list_releases().unwrap();
         assert_eq!(all.len(), 2);
 
-        // Workspace list shows global + workspace-specific
+        // Workspace list shows ONLY workspace-specific releases — global
+        // releases are surfaced through the public/admin endpoints instead.
         let ws_releases = db.list_releases_for_workspace("ws-1").unwrap();
-        assert_eq!(ws_releases.len(), 2);
+        assert_eq!(ws_releases.len(), 1);
+        assert_eq!(ws_releases[0].1, "v1.1");
 
-        // Different workspace only sees global
+        // Different workspace sees none of these.
         let other = db.list_releases_for_workspace("ws-other").unwrap();
-        assert_eq!(other.len(), 1);
-        assert_eq!(other[0].1, "v1.0");
+        assert_eq!(other.len(), 0);
     }
 
     #[test]
