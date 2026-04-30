@@ -604,10 +604,60 @@ fn derive_description(body_md: &str) -> String {
     }
     if first_para.chars().count() > 300 {
         let truncated: String = first_para.chars().take(297).collect();
+        // Prefer ending on a sentence boundary so the description reads as a
+        // complete thought, not "...software. Pick a…". Fall back to a word
+        // boundary if no sentence end is reachable in the budget.
+        let sentence_end = [". ", "! ", "? "]
+            .iter()
+            .filter_map(|sep| truncated.rfind(sep).map(|i| i + 1))
+            .max();
+        if let Some(cut) = sentence_end {
+            if cut > 80 {
+                return truncated[..cut].trim_end().to_string();
+            }
+        }
         let cut = truncated.rfind(' ').unwrap_or(truncated.len());
         return format!("{}…", &truncated[..cut]);
     }
     first_para
+}
+
+/// Extract the first image URL from a markdown body. Used to set per-page
+/// `og:image` so social previews don't all share the generic site card.
+/// Returns the absolute URL when the source is already absolute, or
+/// `{PUBLIC_BASE}/{path}` when relative.
+fn first_image_url(body_md: &str) -> Option<String> {
+    use pulldown_cmark::{Event, Parser, Tag};
+    for ev in Parser::new(body_md) {
+        if let Event::Start(Tag::Image { dest_url, .. }) = ev {
+            let s = dest_url.into_string();
+            if s.is_empty() { continue; }
+            if s.starts_with("http://") || s.starts_with("https://") {
+                return Some(s);
+            }
+            let path = if s.starts_with('/') { s } else { format!("/{}", s) };
+            return Some(format!("{}{}", PUBLIC_BASE, path));
+        }
+    }
+    None
+}
+
+/// Render markdown body into HTML for SSR injection. Pages are admin-edited
+/// so we don't sanitize — we just render with tables, footnotes, strikethrough,
+/// and task lists enabled. Relative image src/href stay relative; the existing
+/// page CSS handles image sizing.
+fn render_body_html(body_md: &str) -> String {
+    use pulldown_cmark::{html, Options, Parser};
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+    let parser = Parser::new_ext(body_md, opts);
+    let mut out = String::with_capacity(body_md.len() * 2);
+    html::push_html(&mut out, parser);
+    out
 }
 
 fn first_default_slug(pages: &[(String, String, Option<String>, i64, String, String)]) -> Option<&str> {
@@ -631,19 +681,35 @@ fn build_breadcrumbs(
         cur = p.2.as_deref().and_then(|pp| by_slug.get(pp).copied());
     }
     chain.reverse();
-    let items: Vec<String> = chain
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let is_home = home_slug == Some(p.0.as_str());
-            format!(
-                r#"{{"@type":"ListItem","position":{},"name":"{}","item":"{}"}}"#,
-                i + 1,
-                html_escape(&p.1),
-                html_escape(&canonical_page_url(&p.0, is_home)),
-            )
-        })
-        .collect();
+    // Prepend Home so deep pages emit Home › Sensors › LPMS-B2 instead of
+    // starting at Sensors. Skip when we're already on the home page or the
+    // chain root already is home.
+    let home_already = chain.first().map(|p| Some(p.0.as_str()) == home_slug).unwrap_or(false);
+    let mut items: Vec<String> = Vec::with_capacity(chain.len() + 1);
+    let mut pos = 1;
+    if !home_already {
+        if let Some(hs) = home_slug {
+            if let Some(home_page) = by_slug.get(hs) {
+                items.push(format!(
+                    r#"{{"@type":"ListItem","position":{},"name":"{}","item":"{}"}}"#,
+                    pos,
+                    html_escape(&home_page.1),
+                    html_escape(&canonical_page_url(hs, true)),
+                ));
+                pos += 1;
+            }
+        }
+    }
+    for p in &chain {
+        let is_home = home_slug == Some(p.0.as_str());
+        items.push(format!(
+            r#"{{"@type":"ListItem","position":{},"name":"{}","item":"{}"}}"#,
+            pos,
+            html_escape(&p.1),
+            html_escape(&canonical_page_url(&p.0, is_home)),
+        ));
+        pos += 1;
+    }
     format!(
         r#"{{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{}]}}"#,
         items.join(",")
@@ -655,6 +721,7 @@ fn render_seo_head(
     page_title: &str,
     description: &str,
     updated_at: &str,
+    og_image_override: Option<&str>,
     pages: &[(String, String, Option<String>, i64, String, String)],
     products: &[(String, String, String, i64, String, Option<String>, String, bool, i64, String)],
 ) -> String {
@@ -692,7 +759,7 @@ fn render_seo_head(
     let date_modified = iso8601_z(updated_at);
     let page_jsonld = if is_home {
         format!(
-            r#"{{"@context":"https://schema.org","@type":"WebSite","name":"{name}","url":"{url}","description":"{desc}","publisher":{{"@type":"Organization","name":"{name}","url":"{url}"}},"potentialAction":{{"@type":"SearchAction","target":{{"@type":"EntryPoint","urlTemplate":"{url}/?q={{search_term_string}}"}},"query-input":"required name=search_term_string"}}}}"#,
+            r#"{{"@context":"https://schema.org","@type":"WebSite","name":"{name}","url":"{url}","description":"{desc}","publisher":{{"@type":"Organization","name":"{name}","url":"{url}"}}}}"#,
             name = html_escape(SITE_NAME),
             url = html_escape(PUBLIC_BASE),
             desc = html_escape(description),
@@ -717,6 +784,18 @@ fn render_seo_head(
     // family with one Offer per variant.
     let product_blocks = build_product_jsonld(slug, products);
 
+    let og_image = og_image_override.unwrap_or(OG_IMAGE_URL);
+    // Per-page hero image keeps standard 1200x630 dimensions only when we
+    // fall back to the bundled site card; for body-derived images we omit
+    // the dimensions to avoid lying about the source image.
+    let omit_og_dims = og_image_override.is_some();
+
+    let og_dims = if omit_og_dims {
+        String::new()
+    } else {
+        "<meta property=\"og:image:width\" content=\"1200\">\n\
+         <meta property=\"og:image:height\" content=\"630\">\n".to_string()
+    };
     let mut head = format!(
         concat!(
             "<title>{title}</title>\n",
@@ -728,8 +807,7 @@ fn render_seo_head(
             "<meta property=\"og:description\" content=\"{desc}\">\n",
             "<meta property=\"og:url\" content=\"{canonical}\">\n",
             "<meta property=\"og:image\" content=\"{og_image}\">\n",
-            "<meta property=\"og:image:width\" content=\"1200\">\n",
-            "<meta property=\"og:image:height\" content=\"630\">\n",
+            "{og_dims}",
             "<meta name=\"twitter:card\" content=\"summary_large_image\">\n",
             "<meta name=\"twitter:title\" content=\"{title}\">\n",
             "<meta name=\"twitter:description\" content=\"{desc}\">\n",
@@ -742,7 +820,8 @@ fn render_seo_head(
         desc = html_escape(description),
         canonical = html_escape(&canonical),
         site = html_escape(SITE_NAME),
-        og_image = html_escape(OG_IMAGE_URL),
+        og_image = html_escape(og_image),
+        og_dims = og_dims,
         org_ld = org_jsonld,
         page_ld = page_jsonld,
         bc_ld = breadcrumb_jsonld,
@@ -761,7 +840,7 @@ fn build_product_jsonld(
     products: &[(String, String, String, i64, String, Option<String>, String, bool, i64, String)],
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for (sku, title, desc_md, price_cents, currency, _img, _tax, active, _ord, _upd) in products {
+    for (sku, title, desc_md, price_cents, currency, image_url, _tax, active, _ord, _upd) in products {
         if !active { continue; }
         let sku_lc = sku.to_lowercase();
         let slug_lc = slug.to_lowercase();
@@ -769,12 +848,21 @@ fn build_product_jsonld(
         let price = format!("{}.{:02}", price_cents / 100, (price_cents % 100).abs());
         let cur_upper = currency.to_uppercase();
         let desc = derive_description(desc_md);
+        let img = image_url.as_deref().filter(|s| !s.is_empty()).map(|s| {
+            if s.starts_with("http://") || s.starts_with("https://") {
+                s.to_string()
+            } else if s.starts_with('/') {
+                format!("{}{}", PUBLIC_BASE, s)
+            } else {
+                format!("{}/{}", PUBLIC_BASE, s)
+            }
+        }).unwrap_or_else(|| OG_IMAGE_URL.to_string());
         out.push(format!(
             r#"{{"@context":"https://schema.org","@type":"Product","name":"{name}","description":"{desc}","sku":"{sku}","brand":{{"@type":"Brand","name":"Xikaku"}},"image":"{img}","offers":{{"@type":"Offer","price":"{price}","priceCurrency":"{cur}","availability":"https://schema.org/InStock","url":"{url}","seller":{{"@type":"Organization","name":"Xikaku","url":"{base}"}}}}}}"#,
             name = html_escape(title),
             desc = html_escape(&desc),
             sku = html_escape(sku),
-            img = html_escape(OG_IMAGE_URL),
+            img = html_escape(&img),
             price = price,
             cur = html_escape(&cur_upper),
             url = html_escape(&format!("{}/shop/{}", PUBLIC_BASE, sku)),
@@ -816,7 +904,8 @@ fn render_website(
     });
     // If the requested slug is unknown, render the shell anyway (SPA shows "Page not found")
     // but omit the SEO head — better than 500'ing.
-    let (title, description, updated_at, valid_slug): (String, String, String, Option<String>) =
+    let (title, description, updated_at, valid_slug, body_md):
+        (String, String, String, Option<String>, String) =
         if let Some(s) = slug_owned.as_deref() {
             let row = {
                 let db = state.db.lock().unwrap();
@@ -829,16 +918,17 @@ fn render_website(
                     let d = derive_description(&body);
                     if d.is_empty() { SITE_TAGLINE.to_string() } else { d }
                 };
-                (t, desc, upd, Some(s.to_string()))
+                (t, desc, upd, Some(s.to_string()), body)
             } else {
-                (SITE_NAME.to_string(), SITE_TAGLINE.to_string(), String::new(), None)
+                (SITE_NAME.to_string(), SITE_TAGLINE.to_string(), String::new(), None, String::new())
             }
         } else {
-            (SITE_NAME.to_string(), SITE_TAGLINE.to_string(), String::new(), None)
+            (SITE_NAME.to_string(), SITE_TAGLINE.to_string(), String::new(), None, String::new())
         };
 
-    let injected = match valid_slug {
-        Some(s) => render_seo_head(&s, &title, &description, &updated_at, &pages, &products),
+    let og_image = first_image_url(&body_md);
+    let injected = match valid_slug.as_deref() {
+        Some(s) => render_seo_head(s, &title, &description, &updated_at, og_image.as_deref(), &pages, &products),
         None => format!(
             "<title>{}</title>\n<meta name=\"description\" content=\"{}\">\n",
             html_escape(SITE_NAME),
@@ -846,10 +936,17 @@ fn render_website(
         ),
     };
 
+    let body_html = if body_md.is_empty() {
+        "<div class=\"empty-state\">Loading…</div>".to_string()
+    } else {
+        render_body_html(&body_md)
+    };
+
     let analytics = analytics_head(state);
     let html = WEBSITE_HTML
         .replacen("<!--SEO_HEAD-->", &injected, 1)
-        .replacen("<!--ANALYTICS-->", &analytics, 1);
+        .replacen("<!--ANALYTICS-->", &analytics, 1)
+        .replacen("<!--BODY_CONTENT-->", &body_html, 1);
 
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
@@ -878,7 +975,8 @@ pub fn analytics_head(state: &Arc<AppState>) -> String {
     let Some(id) = id else { return String::new() };
     if !is_valid_analytics_id(&id) { return String::new() }
     format!(
-        "<!-- Google tag (gtag.js) -->\n\
+        "<link rel=\"preconnect\" href=\"https://www.googletagmanager.com\" crossorigin>\n\
+         <!-- Google tag (gtag.js) -->\n\
          <script async src=\"https://www.googletagmanager.com/gtag/js?id={id}\"></script>\n\
          <script>\n\
          window.dataLayer = window.dataLayer || [];\n\
@@ -939,9 +1037,8 @@ pub async fn handle_sitemap_xml(
             xml_escape(&canonical_page_url(slug, is_home)),
         ));
         if !updated_at.is_empty() {
-            xml.push_str(&format!("    <lastmod>{}</lastmod>\n", xml_escape(updated_at)));
+            xml.push_str(&format!("    <lastmod>{}</lastmod>\n", xml_escape(&iso8601_z(updated_at))));
         }
-        xml.push_str("    <changefreq>weekly</changefreq>\n");
         xml.push_str("  </url>\n");
     }
     xml.push_str("</urlset>\n");
@@ -1056,4 +1153,82 @@ pub async fn handle_admin_put_site_settings(
         db.set_site_setting(k, trimmed).map_err(db_err)?;
     }
     Ok(Json(json!({ "status": "OK" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_description_cuts_on_sentence_boundary() {
+        let md = "The Xikaku LPMS series delivers 9-axis and 6-axis inertial measurement \
+            across a wide range of applications — from wearables to autonomous vehicles \
+            to structural monitoring. All models expose raw data, Euler angles, and \
+            quaternions, and are configurable through LPMS-Control software. \
+            Pick a sensor to see specs, datasheets, and application notes.";
+        let d = derive_description(md);
+        assert!(d.ends_with('.'), "should end on a period, got: {}", d);
+        assert!(!d.contains("Pick a…"), "should not truncate mid-phrase, got: {}", d);
+    }
+
+    #[test]
+    fn derive_description_short_passes_through() {
+        let d = derive_description("Hello world");
+        assert_eq!(d, "Hello world");
+    }
+
+    #[test]
+    fn derive_description_word_boundary_fallback() {
+        let long: String = "x".repeat(400);
+        let d = derive_description(&long);
+        assert!(d.ends_with('…'));
+    }
+
+    #[test]
+    fn first_image_url_extracts_relative() {
+        let md = "# Title\n\nIntro text.\n\n![hero](/static/foo.png)\n\nMore text.\n";
+        assert_eq!(
+            first_image_url(md),
+            Some("https://xikaku.com/static/foo.png".to_string())
+        );
+    }
+
+    #[test]
+    fn first_image_url_passes_absolute() {
+        let md = "![hero](https://cdn.example.com/img.jpg)";
+        assert_eq!(
+            first_image_url(md),
+            Some("https://cdn.example.com/img.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn first_image_url_none_when_no_images() {
+        assert_eq!(first_image_url("# Just text\n\nNo images here."), None);
+    }
+
+    #[test]
+    fn render_body_html_emits_headings_and_paras() {
+        let h = render_body_html("# Title\n\nA paragraph.\n");
+        assert!(h.contains("<h1>"));
+        assert!(h.contains("Title"));
+        assert!(h.contains("<p>"));
+        assert!(h.contains("A paragraph"));
+    }
+
+    #[test]
+    fn iso8601_z_handles_naive_sqlite_format() {
+        assert_eq!(iso8601_z("2026-04-26 23:21:37"), "2026-04-26T23:21:37Z");
+        assert_eq!(iso8601_z("2026-04-29T23:35:28+00:00"), "2026-04-29T23:35:28+00:00");
+        assert_eq!(iso8601_z(""), "");
+    }
+
+    #[test]
+    fn analytics_id_validator() {
+        assert!(is_valid_analytics_id("G-XSW6TEN1CZ"));
+        assert!(is_valid_analytics_id("UA-12345-1"));
+        assert!(!is_valid_analytics_id(""));
+        assert!(!is_valid_analytics_id("evil';alert(1)"));
+        assert!(!is_valid_analytics_id(&"x".repeat(65)));
+    }
 }

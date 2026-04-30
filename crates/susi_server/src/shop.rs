@@ -1689,7 +1689,8 @@ pub async fn handle_shop_page(State(state): State<Arc<AppState>>) -> axum::respo
     let analytics = crate::website::analytics_head(&state);
     let html = WEBSITE_HTML
         .replacen("<!--SEO_HEAD-->", head, 1)
-        .replacen("<!--ANALYTICS-->", &analytics, 1);
+        .replacen("<!--ANALYTICS-->", &analytics, 1)
+        .replacen("<!--BODY_CONTENT-->", "<div class=\"empty-state\">Loading…</div>", 1);
     axum::response::Html(html)
 }
 

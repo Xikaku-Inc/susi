@@ -36,3 +36,4 @@ hmac = "0.12"
 url = "2"
 printpdf = { version = "0.7", default-features = false, features = ["embedded_images"] }
 ammonia = "4"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
