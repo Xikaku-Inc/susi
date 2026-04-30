@@ -642,20 +642,46 @@ fn first_image_url(body_md: &str) -> Option<String> {
     None
 }
 
+/// Strip pandoc-style attribute spans (`{width=400px .class}`) that follow
+/// an image close `)`. The site's markdown was authored with pandoc syntax
+/// pulldown-cmark doesn't understand, so without this they'd render as
+/// literal text in the SSR body.
+fn strip_pandoc_attrs(body_md: &str) -> String {
+    let bytes = body_md.as_bytes();
+    let mut out = String::with_capacity(body_md.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        out.push(c as char);
+        // Detect an image-close `)` followed by `{...}` (no nested braces).
+        if c == b')' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end_off) = bytes[i + 2..].iter().position(|&b| b == b'}' || b == b'\n') {
+                if bytes[i + 2 + end_off] == b'}' {
+                    i += 2 + end_off + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Render markdown body into HTML for SSR injection. Pages are admin-edited
 /// so we don't sanitize — we just render with tables, footnotes, strikethrough,
 /// and task lists enabled. Relative image src/href stay relative; the existing
 /// page CSS handles image sizing.
 fn render_body_html(body_md: &str) -> String {
     use pulldown_cmark::{html, Options, Parser};
+    let cleaned = strip_pandoc_attrs(body_md);
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_SMART_PUNCTUATION);
-    let parser = Parser::new_ext(body_md, opts);
-    let mut out = String::with_capacity(body_md.len() * 2);
+    let parser = Parser::new_ext(&cleaned, opts);
+    let mut out = String::with_capacity(cleaned.len() * 2);
     html::push_html(&mut out, parser);
     out
 }
@@ -1214,6 +1240,21 @@ mod tests {
         assert!(h.contains("Title"));
         assert!(h.contains("<p>"));
         assert!(h.contains("A paragraph"));
+    }
+
+    #[test]
+    fn strip_pandoc_attrs_removes_image_attrs() {
+        let md = "![logo](/static/logo.png){width=400px .logo-dark}\n\nText.";
+        let cleaned = strip_pandoc_attrs(md);
+        assert!(!cleaned.contains("{width"), "got: {}", cleaned);
+        assert!(cleaned.contains("![logo](/static/logo.png)"));
+        assert!(cleaned.contains("Text."));
+    }
+
+    #[test]
+    fn strip_pandoc_attrs_leaves_normal_text_intact() {
+        let md = "Use the `{config}` field to configure.";
+        assert_eq!(strip_pandoc_attrs(md), md);
     }
 
     #[test]
