@@ -2567,6 +2567,56 @@ async fn handle_update_release(
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
 
+#[derive(Deserialize)]
+struct MoveReleaseRequest {
+    /// Target workspace id, or empty/null to make the release global.
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+/// Move a release to a different workspace (or to global). Admin only.
+/// Files on disk stay put — releases are keyed by tag, not workspace.
+async fn handle_move_release(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tag): Path<String>,
+    Json(req): Json<MoveReleaseRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+    require_admin(&state, &principal)?;
+
+    let target = req
+        .workspace_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    let db = state.db.lock().unwrap();
+    if let Some(ws) = target {
+        if db
+            .get_workspace(ws)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .is_none()
+        {
+            return Err(error_response(StatusCode::NOT_FOUND, "Target workspace not found"));
+        }
+    }
+    let release_id = db
+        .get_release_by_tag(&tag)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Release not found"))?;
+    db.set_release_workspace(release_id, target)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    log::info!("Release {} moved to workspace {:?}", tag, target);
+    Ok(Json(serde_json::json!({
+        "status": "OK",
+        "tag": tag,
+        "workspace_id": target,
+    })))
+}
+
 /// Delete a release — admin only (JWT)
 async fn handle_delete_release(
     State(state): State<Arc<AppState>>,
@@ -3437,6 +3487,7 @@ async fn main() -> Result<()> {
                 .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         )
         .route("/api/v1/releases/{tag}", axum::routing::put(handle_update_release).delete(handle_delete_release))
+        .route("/api/v1/releases/{tag}/move", post(handle_move_release))
         // Workspace endpoints (JWT protected)
         .route("/api/v1/workspaces", get(handle_list_workspaces).post(handle_create_workspace))
         .route("/api/v1/workspaces/{id}", get(handle_get_workspace).put(handle_update_workspace).delete(handle_delete_workspace))

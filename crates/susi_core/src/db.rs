@@ -1915,6 +1915,23 @@ impl LicenseDb {
         }
     }
 
+    /// Reassign a release to a different workspace (or to global with `None`).
+    /// Doesn't touch any other column — doc pages, assets, and software files
+    /// stay attached because they FK on release_id, not on workspace_id.
+    pub fn set_release_workspace(
+        &self,
+        release_id: i64,
+        workspace_id: Option<&str>,
+    ) -> Result<(), LicenseError> {
+        self.conn
+            .execute(
+                "UPDATE releases SET workspace_id = ?1 WHERE id = ?2",
+                params![workspace_id, release_id],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB move release: {}", e)))?;
+        Ok(())
+    }
+
     /// Return `Some(workspace_id_or_none)` if the tag exists, else `None`.
     /// Inner `Option` is `Some(ws_id)` for workspace-scoped, `None` for global.
     pub fn get_release_workspace_id(&self, tag: &str) -> Result<Option<Option<String>>, LicenseError> {

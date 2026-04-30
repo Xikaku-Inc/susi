@@ -307,6 +307,7 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
 .detail-panel {
     display: none;
     margin-bottom: 20px;
+    overflow: visible;
 }
 .detail-panel.visible { display: block; }
 .detail-header {
@@ -1277,6 +1278,25 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
         <div class="form-actions">
             <button class="secondary" onclick="closeEditReleaseModal()">Cancel</button>
             <button onclick="saveEditedRelease()">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- Move Release Modal -->
+<div id="moveReleaseModal" class="modal-overlay" onclick="if(event.target===this)closeMoveReleaseModal()">
+    <div class="modal">
+        <h2>Move Release</h2>
+        <div class="form-row">
+            <label>Release</label>
+            <input type="text" id="moveReleaseTag" disabled style="opacity:0.6;">
+        </div>
+        <div class="form-row">
+            <label>Target workspace</label>
+            <select id="moveReleaseTarget" style="width:100%;"></select>
+        </div>
+        <div class="form-actions">
+            <button class="secondary" onclick="closeMoveReleaseModal()">Cancel</button>
+            <button onclick="confirmMoveRelease()">Move</button>
         </div>
     </div>
 </div>
@@ -3409,6 +3429,77 @@ async function replaceWsReleaseFile(tag) {
     }
 }
 
+// Move a release to a different workspace. The dropdown of targets is built
+// from the cached `workspaces` list (excluding the current workspace) — same
+// list rendered on the Workspaces tab, so it's already authoritative.
+function moveWsRelease(tag) {
+    if (!selectedWsId) return;
+    const select = document.getElementById('moveReleaseTarget');
+    const options = (workspaces || [])
+        .filter(w => w.id !== selectedWsId)
+        .map(w => '<option value="' + esc(w.id) + '">' + esc(w.name) + '</option>')
+        .join('');
+    if (!options) {
+        toast('No other workspaces available', 'error');
+        return;
+    }
+    select.innerHTML = options;
+    document.getElementById('moveReleaseTag').value = tag;
+    document.getElementById('moveReleaseModal').classList.add('visible');
+}
+
+function closeMoveReleaseModal() {
+    document.getElementById('moveReleaseModal').classList.remove('visible');
+}
+
+async function confirmMoveRelease() {
+    const tag = document.getElementById('moveReleaseTag').value;
+    const target = document.getElementById('moveReleaseTarget').value;
+    if (!tag || !target) return;
+    try {
+        const resp = await fetch(API + '/releases/' + encodeURIComponent(tag) + '/move', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({ workspace_id: target }),
+        });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            toast('Error: ' + (data.error || 'Could not move release'), 'error');
+            return;
+        }
+        closeMoveReleaseModal();
+        toast('Release ' + tag + ' moved', 'success');
+        // Reload current workspace's releases — the moved release is no longer
+        // in scope here, so the row will disappear.
+        loadWsReleases(selectedWsId);
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+// Open the documentation editor for a release. Idempotently ensures a
+// doc-release row exists for the tag (so the docs page has something to load
+// and the user can immediately add pages), then opens /docs in a new tab.
+async function editWsReleaseDocs(tag) {
+    if (!selectedWsId) return;
+    try {
+        const resp = await fetch(API + '/workspaces/' + selectedWsId + '/docs/releases', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({ tag, name: tag }),
+        });
+        if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            toast('Error: ' + (data.error || 'Could not open documentation'), 'error');
+            return;
+        }
+        const url = '/docs?workspace=' + encodeURIComponent(selectedWsId) + '&tag=' + encodeURIComponent(tag);
+        window.open(url, '_blank');
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
 async function editWsRelease(tag) {
     if (!selectedWsId) return;
     // Pull the current metadata so the modal pre-fills accurately. The
@@ -3601,6 +3692,9 @@ function renderWsReleases() {
                     '<button onclick="editWsRelease(\'' + esc(r.tag) + '\')">Edit metadata</button>' +
                     '<button onclick="addWsReleaseSoftware(\'' + esc(r.tag) + '\')">Add software</button>' +
                     '<button onclick="replaceWsReleaseFile(\'' + esc(r.tag) + '\')">Replace file</button>' +
+                    '<div class="divider"></div>' +
+                    '<button onclick="editWsReleaseDocs(\'' + esc(r.tag) + '\')">Edit documentation</button>' +
+                    '<button onclick="moveWsRelease(\'' + esc(r.tag) + '\')">Move to workspace…</button>' +
                     '<div class="divider"></div>' +
                     '<button class="danger" onclick="deleteWsRelease(\'' + esc(r.tag) + '\')">Delete</button>' +
                 '</div>' +
