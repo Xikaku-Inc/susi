@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Multipart, Path, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{Multipart, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -275,14 +275,32 @@ pub async fn handle_get_doc_page(
     })))
 }
 
+#[derive(Deserialize)]
+pub struct AssetAuthQuery {
+    /// Bearer token passed via query string. Browser <img> requests can't set
+    /// an Authorization header, so workspace-scoped doc images need this
+    /// fallback. Identical validation path as the header form.
+    #[serde(default)]
+    auth: Option<String>,
+}
+
 pub async fn handle_get_doc_asset(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(q): Query<AssetAuthQuery>,
     Path((tag, file_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     safe_tag(&tag)?;
     safe_filename(&file_name)?;
-    let principal_opt = validate_principal(&headers, &state).ok();
+    let mut auth_headers = headers.clone();
+    if !auth_headers.contains_key("authorization") {
+        if let Some(tok) = q.auth.as_deref().filter(|s| !s.is_empty()) {
+            if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", tok)) {
+                auth_headers.insert("authorization", v);
+            }
+        }
+    }
+    let principal_opt = validate_principal(&auth_headers, &state).ok();
     release_reader_check(&state, principal_opt.as_ref(), &tag)?;
 
     let path = assets_dir(&state, &tag).join(&file_name);
