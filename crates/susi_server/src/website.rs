@@ -1267,7 +1267,12 @@ pub fn ping_indexnow(state: &Arc<AppState>, urls: Vec<String>) {
         .trim_start_matches("http://")
         .trim_end_matches('/')
         .to_string();
-    let key_location = format!("{}/api/v1/indexnow/{}.txt", PUBLIC_BASE, key);
+    // Root-level keyLocation so IndexNow accepts URLs under any path (the
+    // service only accepts URLs at the same directory level or deeper than
+    // the verification file). Nginx is configured to proxy
+    // `^/[a-f0-9]{32}\.txt$` to the backend `/api/v1/indexnow/{filename}`
+    // route.
+    let key_location = format!("{}/{}.txt", PUBLIC_BASE, key);
     let body = serde_json::to_string(&json!({
         "host": host,
         "key": key,
