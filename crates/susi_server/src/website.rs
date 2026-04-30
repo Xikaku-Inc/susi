@@ -1267,7 +1267,7 @@ pub fn ping_indexnow(state: &Arc<AppState>, urls: Vec<String>) {
         .trim_start_matches("http://")
         .trim_end_matches('/')
         .to_string();
-    let key_location = format!("{}/indexnow/{}.txt", PUBLIC_BASE, key);
+    let key_location = format!("{}/api/v1/indexnow/{}.txt", PUBLIC_BASE, key);
     let body = serde_json::to_string(&json!({
         "host": host,
         "key": key,

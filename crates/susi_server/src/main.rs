@@ -3428,8 +3428,9 @@ async fn main() -> Result<()> {
         .route("/sitemap.xml", get(website::handle_sitemap_xml))
         .route("/llms.txt", get(website::handle_llms_txt))
         // IndexNow key file — Bing/Yandex/etc. fetch this to verify ownership
-        // before accepting our URL update notifications.
-        .route("/indexnow/{filename}", get(website::handle_indexnow_key_file))
+        // before accepting our URL update notifications. Lives under /api/v1
+        // so the standard nginx /api proxy reaches it without extra routing.
+        .route("/api/v1/indexnow/{filename}", get(website::handle_indexnow_key_file))
         // Health
         .route("/health", get(handle_health))
         // Available license features
