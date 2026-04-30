@@ -394,7 +394,8 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
     min-width: 160px;
     padding: 4px 0;
 }
-.dropdown-menu button {
+.dropdown-menu button,
+.dropdown-menu a {
     display: block;
     width: 100%;
     min-width: 0;
@@ -408,8 +409,11 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
     font-weight: 400;
     border-radius: 0;
     box-shadow: none;
+    text-decoration: none;
+    box-sizing: border-box;
 }
-.dropdown-menu button:hover { background: var(--bg3); }
+.dropdown-menu button:hover,
+.dropdown-menu a:hover { background: var(--bg3); }
 .dropdown-menu button.danger { color: var(--red); background: transparent; }
 .dropdown-menu button.danger:hover { background: var(--bg3); }
 .dropdown-menu .divider {
@@ -4478,6 +4482,7 @@ function renderWebsitePagesTable() {
         const parent = p.parent_slug
             ? '<code>' + escHtml(p.parent_slug) + '</code>'
             : '<span style="color:var(--text2);">—</span>';
+        const menuId = 'website-page-menu-' + p.slug.replace(/[^a-zA-Z0-9_-]/g, '_');
         return '<tr>'
             + '<td><code>' + escHtml(p.slug) + '</code></td>'
             + '<td>' + escHtml(p.title) + '</td>'
@@ -4485,8 +4490,14 @@ function renderWebsitePagesTable() {
             + '<td>' + p.ord + '</td>'
             + '<td style="color:var(--text2);font-size:12px;">' + escHtml(p.updated_at || '') + '</td>'
             + '<td>'
-            +   '<a class="btn small" href="' + escHtml(editUrl) + '" target="_blank" rel="noopener" style="margin-right:4px;">Open editor ↗</a>'
-            +   '<button class="small danger" onclick="deleteWebsitePage(' + JSON.stringify(p.slug) + ')">Delete</button>'
+            +   '<span class="dropdown" onclick="event.stopPropagation();">'
+            +     '<button class="small secondary" onclick="toggleDropdown(event,\'' + menuId + '\')">Actions &#9662;</button>'
+            +     '<div id="' + menuId + '" class="dropdown-menu" style="display:none;">'
+            +       '<a href="' + escHtml(editUrl) + '" target="_blank" rel="noopener">Open editor ↗</a>'
+            +       '<div class="divider"></div>'
+            +       '<button class="danger" onclick="deleteWebsitePage(' + JSON.stringify(p.slug) + ')">Delete</button>'
+            +     '</div>'
+            +   '</span>'
             + '</td>'
             + '</tr>';
     }).join('');
