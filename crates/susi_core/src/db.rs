@@ -59,6 +59,19 @@ impl LicenseDb {
     pub fn open(path: &str) -> Result<Self, LicenseError> {
         let conn =
             Connection::open(path).map_err(|e| LicenseError::Other(format!("DB open: {}", e)))?;
+        // WAL: readers don't block writers (and vice versa); synchronous=NORMAL is
+        // safe with WAL and skips per-commit fsyncs; busy_timeout retries instead
+        // of returning SQLITE_BUSY when a write lock is briefly held; 256 MiB mmap
+        // lets the kernel page-cache satisfy reads without copying.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;\n\
+             PRAGMA synchronous=NORMAL;\n\
+             PRAGMA busy_timeout=5000;\n\
+             PRAGMA temp_store=MEMORY;\n\
+             PRAGMA mmap_size=268435456;\n\
+             PRAGMA foreign_keys=ON;",
+        )
+        .map_err(|e| LicenseError::Other(format!("DB pragma: {}", e)))?;
         let db = Self { conn };
         db.init_tables()?;
         Ok(db)
@@ -424,6 +437,22 @@ impl LicenseDb {
         Ok(())
     }
 
+    /// Single sweep across every license. Returns the number of rows removed.
+    /// Run periodically from a background task instead of on every license
+    /// read — the per-row variant turned every heartbeat into a DELETE.
+    pub fn cleanup_all_expired_leases(&self) -> Result<usize, LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM machine_activations
+                 WHERE lease_expires_at != '' AND lease_expires_at < ?1",
+                params![now],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB cleanup: {}", e)))?;
+        Ok(n)
+    }
+
     pub fn insert_license(&self, license: &License) -> Result<(), LicenseError> {
         let features_json = serde_json::to_string(&license.features)?;
         let expires_str = license
@@ -505,8 +534,9 @@ impl LicenseDb {
             .get(9)
             .map_err(|e| LicenseError::Other(format!("DB get: {}", e)))?;
 
-        // Cleanup expired leases immediately
-        self.cleanup_expired_leases(&id)?;
+        // Lease cleanup runs in a background task (`cleanup_all_expired_leases`),
+        // not on every read — issuing a DELETE on every heartbeat dominated the
+        // verify path and competed for the write lock with no benefit.
 
         let mut license = License {
             id: id.clone(),
@@ -538,6 +568,67 @@ impl LicenseDb {
 
         license.machines = self.get_machine_activations(&id)?;
         Ok(Some(license))
+    }
+
+    /// Batch variant of `get_machine_activations` for list endpoints. One
+    /// query covers every license id, with rows grouped into the returned
+    /// map by license_id. Avoids the per-license N+1 in `list_licenses`.
+    pub fn get_machine_activations_for_licenses(
+        &self,
+        license_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<MachineActivation>>, LicenseError> {
+        let mut out: std::collections::HashMap<String, Vec<MachineActivation>> =
+            std::collections::HashMap::with_capacity(license_ids.len());
+        if license_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(license_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT license_id, machine_code, friendly_name, activated_at, lease_expires_at
+             FROM machine_activations WHERE license_id IN ({})",
+            placeholders,
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let params_iter: Vec<&dyn rusqlite::ToSql> =
+            license_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(&params_iter[..], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
+        for r in rows.flatten() {
+            let (license_id, machine_code, friendly_name, activated_str, lease_str) = r;
+            let Some(activated_at) = DateTime::parse_from_rfc3339(&activated_str)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+            else { continue };
+            let lease_expires_at = if lease_str.is_empty() {
+                None
+            } else {
+                DateTime::parse_from_rfc3339(&lease_str)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+            };
+            out.entry(license_id).or_default().push(MachineActivation {
+                machine_code,
+                friendly_name,
+                activated_at,
+                lease_expires_at,
+            });
+        }
+        Ok(out)
     }
 
     fn get_machine_activations(
@@ -1289,6 +1380,33 @@ impl LicenseDb {
             .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))
     }
 
+    /// Combined `find + touch` for the auth hot path. Uses
+    /// `UPDATE ... RETURNING` so we do exactly one round-trip to validate the
+    /// bearer and bump `last_used_at` (instead of two distinct lock cycles).
+    /// Returns `None` if the hash is unknown.
+    pub fn find_and_touch_api_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<ApiTokenAuthRow>, LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .query_row(
+                "UPDATE api_tokens SET last_used_at = ?1
+                 WHERE token_hash = ?2
+                 RETURNING id, username, revoked_at",
+                params![now, token_hash],
+                |r| {
+                    Ok(ApiTokenAuthRow {
+                        id: r.get(0)?,
+                        username: r.get(1)?,
+                        revoked: r.get::<_, Option<String>>(2)?.is_some(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))
+    }
+
     /// Update last_used_at. Called on every authenticated request — best-effort,
     /// callers ignore errors so a transient DB hiccup doesn't 500 the request.
     pub fn touch_api_token_used(&self, id: i64) -> Result<(), LicenseError> {
@@ -1402,6 +1520,31 @@ impl LicenseDb {
                 params![username],
                 |r| r.get(0),
             )
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))
+    }
+
+    /// Single-row fetch of every user attribute the admin gate needs:
+    /// (role, must_change_password, totp_enabled). Replaces the three
+    /// separate `get_user_role` / `user_must_change_password` /
+    /// `user_totp_enabled` calls — saves two SQLite round-trips and two
+    /// extra mutex cycles per admin request. Returns `None` if the
+    /// username doesn't exist (which the caller should treat as a denied
+    /// auth, same as the unwrap-defaults the old helpers used).
+    pub fn get_user_admin_check(
+        &self,
+        username: &str,
+    ) -> Result<Option<(String, bool, bool)>, LicenseError> {
+        self.conn
+            .query_row(
+                "SELECT role, must_change_password, totp_enabled FROM users WHERE username = ?1",
+                params![username],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? != 0,
+                    r.get::<_, i64>(2)? != 0,
+                )),
+            )
+            .optional()
             .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))
     }
 
@@ -1911,6 +2054,43 @@ impl LicenseDb {
         Ok(rows)
     }
 
+    /// Batch variant of `get_release_assets` for list endpoints. Returns one
+    /// `release_id → assets` map after a single query, eliminating the
+    /// per-release N+1 in `handle_list_releases_admin` / workspace listings.
+    pub fn get_assets_for_releases(
+        &self,
+        release_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<(String, u64)>>, LicenseError> {
+        let mut out: std::collections::HashMap<i64, Vec<(String, u64)>> =
+            std::collections::HashMap::with_capacity(release_ids.len());
+        if release_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(release_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT release_id, file_name, file_size FROM release_assets WHERE release_id IN ({})",
+            placeholders,
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let params_iter: Vec<&dyn rusqlite::ToSql> =
+            release_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(&params_iter[..], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u64))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
+        for (rid, name, size) in rows.flatten() {
+            out.entry(rid).or_default().push((name, size));
+        }
+        Ok(out)
+    }
+
     pub fn get_release_by_tag(&self, tag: &str) -> Result<Option<i64>, LicenseError> {
         match self.conn.query_row(
             "SELECT id FROM releases WHERE tag = ?1",
@@ -1992,22 +2172,33 @@ impl LicenseDb {
             })
             .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
 
-        let mut licenses = Vec::new();
-        for row in rows {
-            let (
-                id,
-                product,
-                customer,
-                license_key,
-                created_str,
-                expires_str,
-                features_json,
-                max_machines,
-                revoked,
-                lease_duration_hours,
-                lease_grace_hours,
-            ) = row.map_err(|e| LicenseError::Other(format!("DB row: {}", e)))?;
+        // Materialise the parent rows first so we can issue a single batch
+        // query for activations instead of N round-trips. Lease cleanup runs
+        // periodically in the background (`spawn_lease_cleanup_task`); doing
+        // it here would issue another DELETE per license per list call.
+        let parents: Vec<_> = rows
+            .filter_map(|r| r.ok())
+            .collect();
+        let ids: Vec<String> = parents.iter().map(|r| r.0.clone()).collect();
+        let mut machines_by_id = self
+            .get_machine_activations_for_licenses(&ids)
+            .unwrap_or_default();
 
+        let mut licenses = Vec::with_capacity(parents.len());
+        for (
+            id,
+            product,
+            customer,
+            license_key,
+            created_str,
+            expires_str,
+            features_json,
+            max_machines,
+            revoked,
+            lease_duration_hours,
+            lease_grace_hours,
+        ) in parents
+        {
             let features: Vec<String> = serde_json::from_str(&features_json).unwrap_or_default();
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|d| d.with_timezone(&Utc))
@@ -2022,10 +2213,7 @@ impl LicenseDb {
                 )
             };
 
-            // Cleanup expired leases
-            let _ = self.cleanup_expired_leases(&id);
-
-            let machines = self.get_machine_activations(&id).unwrap_or_default();
+            let machines = machines_by_id.remove(&id).unwrap_or_default();
 
             licenses.push(License {
                 id,
@@ -2893,6 +3081,53 @@ impl LicenseDb {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// Batch lookup. Returns a map of `sku → product row` for every requested
+    /// SKU that exists. Use this for checkout / cart paths where a per-SKU
+    /// `get_product` loop would issue one round-trip per item under the lock.
+    pub fn get_products_by_skus(
+        &self,
+        skus: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, String, String, i64, String, Option<String>, String, bool, i64, String)>, LicenseError> {
+        let mut out = std::collections::HashMap::with_capacity(skus.len());
+        if skus.is_empty() {
+            return Ok(out);
+        }
+        // SQLite has no native array binding; build `?,?,?,…` placeholders.
+        let placeholders = std::iter::repeat("?")
+            .take(skus.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT sku, title, description_md, price_cents, currency, image_asset, tax_code, active, ord, updated_at
+             FROM shop_products WHERE sku IN ({})",
+            placeholders,
+        );
+        let mut stmt = self.conn
+            .prepare(&sql)
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let params_iter: Vec<&dyn rusqlite::ToSql> = skus.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(&params_iter[..], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7).map(|v| v != 0)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
+        for row in rows.flatten() {
+            out.insert(row.0.clone(), row);
+        }
+        Ok(out)
     }
 
     pub fn get_product(
@@ -3767,7 +4002,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expired_lease_cleaned_on_access() {
+    fn test_expired_lease_cleaned_by_sweep() {
         let db = test_db();
         let license = License::new(
             "FusionHub".to_string(),
@@ -3783,7 +4018,18 @@ mod tests {
         db.add_machine_activation(&license.id, "old_machine", "Old", expired_lease)
             .unwrap();
 
-        // Access triggers cleanup
+        // Reads no longer trigger cleanup — that ran on every heartbeat and
+        // dominated the verify path. Background `cleanup_all_expired_leases`
+        // is what now removes expired rows.
+        let retrieved = db
+            .get_license_by_key(&license.license_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved.machines.len(), 1);
+
+        let removed = db.cleanup_all_expired_leases().unwrap();
+        assert_eq!(removed, 1);
+
         let retrieved = db
             .get_license_by_key(&license.license_key)
             .unwrap()

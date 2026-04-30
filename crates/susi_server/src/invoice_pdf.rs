@@ -6,14 +6,40 @@
 // transitions to paid, so it always shows a "Pay online" CTA and an
 // "Amount due" line that don't make sense for a post-payment receipt.
 
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
-use printpdf::image_crate::{self, imageops::FilterType, GenericImageView, ImageFormat};
+use printpdf::image_crate::{self, imageops::FilterType, DynamicImage, GenericImageView, ImageFormat};
 use printpdf::*;
 use serde_json::Value;
 
 const LOGO_PNG: &[u8] = include_bytes!("assets/xikaku-logo.png");
 const LOGO_TARGET_WIDTH_MM: f32 = 28.0;
+
+/// Cache the decoded + Lanczos3-resized brand logo. Decoding+resizing is
+/// expensive (~tens of ms) and the result is identical for every invoice;
+/// pay it once and reuse the `DynamicImage` for the lifetime of the process.
+struct CachedLogo {
+    image: DynamicImage,
+    orig_w: u32,
+    orig_h: u32,
+}
+static LOGO_CACHE: OnceLock<CachedLogo> = OnceLock::new();
+
+fn cached_logo() -> Result<&'static CachedLogo> {
+    if let Some(c) = LOGO_CACHE.get() {
+        return Ok(c);
+    }
+    let img = image_crate::load_from_memory_with_format(LOGO_PNG, ImageFormat::Png)
+        .context("png decode")?;
+    let (orig_w, orig_h) = img.dimensions();
+    let target_w_px = (LOGO_TARGET_WIDTH_MM / 25.4 * 300.0).round() as u32;
+    let target_h_px = (orig_h as f32 * target_w_px as f32 / orig_w as f32).round() as u32;
+    let resized = img.resize(target_w_px, target_h_px, FilterType::Lanczos3);
+    let _ = LOGO_CACHE.set(CachedLogo { image: resized, orig_w, orig_h });
+    Ok(LOGO_CACHE.get().expect("just set"))
+}
 
 const COMPANY_NAME: &str = "Xikaku, Inc.";
 const COMPANY_LINES: &[&str] = &[
@@ -190,16 +216,10 @@ pub fn generate(
 // source balloons the PDF to ~1.9 MB, while a 400×134 resize keeps it
 // under 200 KB without visibly degrading the print at 28 mm wide.
 fn draw_logo(layer: &PdfLayerReference, right_mm: f32, top_mm: f32) -> Result<()> {
-    let img = image_crate::load_from_memory_with_format(LOGO_PNG, ImageFormat::Png)
-        .context("png decode")?;
-    // Target ~300 dpi at the on-page width.
-    let target_w_px = (LOGO_TARGET_WIDTH_MM / 25.4 * 300.0).round() as u32;
-    let (orig_w, orig_h) = img.dimensions();
-    let target_h_px = (orig_h as f32 * target_w_px as f32 / orig_w as f32).round() as u32;
-    let resized = img.resize(target_w_px, target_h_px, FilterType::Lanczos3);
+    let cached = cached_logo()?;
     let drawn_w_mm = LOGO_TARGET_WIDTH_MM;
-    let drawn_h_mm = orig_h as f32 * LOGO_TARGET_WIDTH_MM / orig_w as f32;
-    let image = Image::from_dynamic_image(&resized);
+    let drawn_h_mm = cached.orig_h as f32 * LOGO_TARGET_WIDTH_MM / cached.orig_w as f32;
+    let image = Image::from_dynamic_image(&cached.image);
     image.add_to_layer(layer.clone(), ImageTransform {
         translate_x: Some(Mm(right_mm - drawn_w_mm)),
         translate_y: Some(Mm(top_mm - drawn_h_mm)),

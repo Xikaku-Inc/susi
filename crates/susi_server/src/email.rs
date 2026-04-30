@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
@@ -5,17 +7,19 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 /// One inline image embedded in the HTML body via `cid:<id>`. The `id` must
 /// match the `cid:` reference in the HTML (and contain no angle brackets).
+/// `bytes` is `Arc<[u8]>` so cloning the attachment for fan-out (one task per
+/// recipient) is a refcount bump rather than a full byte copy.
 pub struct InlineImage {
     pub content_id: String,
     pub mime_type: String,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
 }
 
 /// An attachment shown in the email's attachments list (e.g. invoice PDF).
 pub struct EmailAttachment {
     pub file_name: String,
     pub mime_type: String,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
 }
 
 #[derive(Clone)]
@@ -255,7 +259,7 @@ impl EmailService {
                 let ct = ContentType::parse(&img.mime_type)
                     .with_context(|| format!("Invalid mime type: {}", img.mime_type))?;
                 related = related.singlepart(
-                    Attachment::new_inline(img.content_id.clone()).body(img.bytes.clone(), ct),
+                    Attachment::new_inline(img.content_id.clone()).body(img.bytes.to_vec(), ct),
                 );
             }
             MultiPart::alternative()
@@ -281,7 +285,7 @@ impl EmailService {
                 let ct = ContentType::parse(&a.mime_type)
                     .with_context(|| format!("Invalid mime type: {}", a.mime_type))?;
                 mixed = mixed.singlepart(
-                    Attachment::new(a.file_name.clone()).body(a.bytes.clone(), ct),
+                    Attachment::new(a.file_name.clone()).body(a.bytes.to_vec(), ct),
                 );
             }
             builder.multipart(mixed)
@@ -293,9 +297,16 @@ impl EmailService {
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }

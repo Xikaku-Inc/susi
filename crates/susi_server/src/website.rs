@@ -5,9 +5,12 @@
 //! `docs`, there's no release concept and no pipeline/user origin split —
 //! all content is hand-authored via the in-browser editor.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, RwLock};
+use std::time::{Duration, Instant};
 
 use axum::{
+    body::Bytes,
     extract::{Multipart, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
@@ -18,7 +21,7 @@ use serde_json::json;
 use susi_core::error::LicenseError;
 
 use crate::docs::{safe_filename};
-use crate::{error_response, require_admin, require_password_changed, validate_principal, AppState, ErrorResponse};
+use crate::{error_response, require_admin_full, validate_principal, AppState, ErrorResponse};
 
 fn assets_dir(state: &AppState) -> std::path::PathBuf {
     std::path::Path::new(&state.data_dir).join("website").join("assets")
@@ -116,7 +119,8 @@ pub async fn handle_get_asset(
     if !path.exists() {
         return Err(error_response(StatusCode::NOT_FOUND, "Asset not found"));
     }
-    let bytes = std::fs::read(&path)
+    let bytes = tokio::fs::read(&path)
+        .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Read: {}", e)))?;
 
     let mut resp = HeaderMap::new();
@@ -149,8 +153,7 @@ pub async fn handle_upsert_page(
     Json(req): Json<UpsertPageRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     safe_slug(&slug)?;
 
     let (id, is_home) = {
@@ -169,6 +172,7 @@ pub async fn handle_upsert_page(
         let is_home = first_default_slug(&pages) == Some(slug.as_str());
         (id, is_home)
     };
+    invalidate_page_cache();
     ping_indexnow(&state, vec![canonical_page_url(&slug, is_home)]);
     Ok(Json(json!({ "id": id, "slug": slug })))
 }
@@ -183,8 +187,7 @@ pub async fn handle_list_page_revisions(
     Path(slug): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     safe_slug(&slug)?;
     let db = state.db.lock().unwrap();
     let rows = db.list_page_revisions(&slug).map_err(db_err)?;
@@ -207,8 +210,7 @@ pub async fn handle_get_page_revision(
     Path((slug, id)): Path<(String, i64)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     safe_slug(&slug)?;
     let db = state.db.lock().unwrap();
     let row = db
@@ -230,8 +232,7 @@ pub async fn handle_restore_page_revision(
     Path((slug, id)): Path<(String, i64)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     safe_slug(&slug)?;
     let mut db = state.db.lock().unwrap();
     let rev = db
@@ -253,6 +254,7 @@ pub async fn handle_restore_page_revision(
     let pages = db.list_website_pages().unwrap_or_default();
     let is_home = first_default_slug(&pages) == Some(slug.as_str());
     drop(db);
+    invalidate_page_cache();
     ping_indexnow(&state, vec![canonical_page_url(&slug, is_home)]);
     Ok(Json(json!({ "id": new_id, "slug": slug, "restored_from": id })))
 }
@@ -266,8 +268,7 @@ pub async fn handle_list_assets_with_usage(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     let db = state.db.lock().unwrap();
     let rows = db.list_website_assets_with_usage().map_err(db_err)?;
     let assets: Vec<_> = rows
@@ -300,8 +301,7 @@ pub async fn handle_rename_asset(
     Json(req): Json<RenameAssetRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     safe_filename(&file_name)?;
     let new_name = req.new_name.trim();
     safe_filename(new_name)?;
@@ -332,6 +332,11 @@ pub async fn handle_rename_asset(
             ));
         }
     }
+    // Asset URLs may appear in any page's body; bust the SSR cache so the
+    // updated filename is reflected on next request.
+    if n_pages > 0 {
+        invalidate_page_cache();
+    }
     Ok(Json(json!({
         "name": new_name,
         "pages_updated": n_pages,
@@ -350,8 +355,7 @@ pub async fn handle_rename_page(
     Json(req): Json<RenamePageRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     let new_slug = req.new_slug.trim();
     if new_slug.is_empty() || new_slug.contains('/') || new_slug.contains('\\') || new_slug.contains('\0') {
         return Err(error_response(StatusCode::BAD_REQUEST, "Invalid slug"));
@@ -363,6 +367,7 @@ pub async fn handle_rename_page(
     };
     match result {
         Ok(true) => {
+            invalidate_page_cache();
             ping_indexnow(
                 &state,
                 vec![
@@ -390,8 +395,7 @@ pub async fn handle_delete_page(
     Path(slug): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     safe_slug(&slug)?;
 
     let removed = {
@@ -401,6 +405,7 @@ pub async fn handle_delete_page(
     if !removed {
         return Err(error_response(StatusCode::NOT_FOUND, "Page not found"));
     }
+    invalidate_page_cache();
     ping_indexnow(&state, vec![canonical_page_url(&slug, false)]);
     Ok(Json(json!({ "status": "OK" })))
 }
@@ -411,8 +416,7 @@ pub async fn handle_upload_asset(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let mut file_name = String::new();
     let mut bytes: Vec<u8> = Vec::new();
@@ -462,8 +466,7 @@ pub async fn handle_delete_asset(
     Path(file_name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     safe_filename(&file_name)?;
 
     let removed = {
@@ -486,7 +489,7 @@ pub async fn handle_delete_asset(
 //   GET /llms.txt          -> auto from website_pages (llms.txt convention)
 // ---------------------------------------------------------------------------
 
-const WEBSITE_HTML: &str = include_str!("website.html");
+pub(crate) const WEBSITE_HTML: &str = include_str!("website.html");
 const SITE_NAME: &str = "Xikaku";
 const SITE_TAGLINE: &str = "Sight beyond Sight";
 const ORG_LEGAL_NAME: &str = "LP-Research Inc.";
@@ -519,11 +522,81 @@ const FAVICON_32_PNG: &[u8] = include_bytes!("assets/xikaku-favicon-32.png");
 const FAVICON_180_PNG: &[u8] = include_bytes!("assets/xikaku-favicon-180.png");
 const FAVICON_ICO: &[u8] = include_bytes!("assets/favicon.ico");
 
-fn cached_image(content_type: &'static str, bytes: &'static [u8]) -> (HeaderMap, Vec<u8>) {
+// SEO blocks that are identical across every page. Build once at startup so
+// the per-request render path doesn't re-`format!` ~1 KB of JSON-LD.
+static SAME_AS_JOINED: LazyLock<String> = LazyLock::new(|| {
+    SOCIAL_LINKS
+        .iter()
+        .map(|u| format!("\"{}\"", html_escape(u)))
+        .collect::<Vec<_>>()
+        .join(",")
+});
+
+static ORG_JSONLD: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{{"@context":"https://schema.org","@type":"Organization","name":"{name}","legalName":"{legal}","url":"{url}","logo":"{logo}","slogan":"{slogan}","email":"{email}","address":{{"@type":"PostalAddress","addressLocality":"{loc}","addressCountry":"{country}"}},"contactPoint":{{"@type":"ContactPoint","contactType":"customer support","email":"{email}","areaServed":["US","CA"]}},"sameAs":[{same_as}]}}"#,
+        name = html_escape(SITE_NAME),
+        legal = html_escape(ORG_LEGAL_NAME),
+        url = html_escape(PUBLIC_BASE),
+        logo = html_escape(LOGO_URL),
+        slogan = html_escape(SITE_TAGLINE),
+        email = html_escape(CONTACT_EMAIL),
+        loc = html_escape(ORG_ADDR_LOCALITY),
+        country = html_escape(ORG_ADDR_COUNTRY),
+        same_as = &*SAME_AS_JOINED,
+    )
+});
+
+// Per-slug rendered HTML cache. The full SSR pipeline (DB reads, two pulldown
+// passes, JSON-LD format!, three replacen over a 100 KB shell) takes hundreds
+// of µs to a few ms per hit; this cache turns 95%+ of public traffic into a
+// hashmap lookup. Bounded TTL covers admin edits without explicit
+// invalidation; explicit invalidation kicks in on writes for immediate effect.
+const PAGE_CACHE_TTL: Duration = Duration::from_secs(300);
+const PAGE_CACHE_MAX: usize = 1024;
+
+struct CachedPage {
+    inserted: Instant,
+    html: Bytes,
+}
+
+static PAGE_CACHE: LazyLock<RwLock<HashMap<String, CachedPage>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn page_cache_get(key: &str) -> Option<Bytes> {
+    let cache = PAGE_CACHE.read().ok()?;
+    let entry = cache.get(key)?;
+    if entry.inserted.elapsed() < PAGE_CACHE_TTL {
+        Some(entry.html.clone())
+    } else {
+        None
+    }
+}
+
+fn page_cache_put(key: String, html: Bytes) {
+    let Ok(mut cache) = PAGE_CACHE.write() else { return };
+    if cache.len() >= PAGE_CACHE_MAX {
+        let now = Instant::now();
+        cache.retain(|_, v| now.duration_since(v.inserted) < PAGE_CACHE_TTL);
+    }
+    cache.insert(key, CachedPage { inserted: Instant::now(), html });
+}
+
+/// Drop every cached SSR page. Called by every admin write that affects
+/// content, schema, or analytics so the next request re-renders fresh.
+pub fn invalidate_page_cache() {
+    if let Ok(mut cache) = PAGE_CACHE.write() {
+        cache.clear();
+    }
+}
+
+// Returns the static byte slice unchanged — axum's IntoResponse for
+// `&'static [u8]` wraps it via `Body::from_static`, so no per-request copy.
+fn cached_image(content_type: &'static str, bytes: &'static [u8]) -> (HeaderMap, &'static [u8]) {
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
     h.insert(header::CACHE_CONTROL, "public, max-age=86400, immutable".parse().unwrap());
-    (h, bytes.to_vec())
+    (h, bytes)
 }
 
 pub async fn handle_logo_png() -> impl IntoResponse { cached_image("image/png", LOGO_PNG) }
@@ -783,24 +856,9 @@ fn render_seo_head(
         format!("{} — {}", page_title, SITE_NAME)
     };
 
-    // Organization (always emitted, identical across pages).
-    let same_as = SOCIAL_LINKS
-        .iter()
-        .map(|u| format!("\"{}\"", html_escape(u)))
-        .collect::<Vec<_>>()
-        .join(",");
-    let org_jsonld = format!(
-        r#"{{"@context":"https://schema.org","@type":"Organization","name":"{name}","legalName":"{legal}","url":"{url}","logo":"{logo}","slogan":"{slogan}","email":"{email}","address":{{"@type":"PostalAddress","addressLocality":"{loc}","addressCountry":"{country}"}},"contactPoint":{{"@type":"ContactPoint","contactType":"customer support","email":"{email}","areaServed":["US","CA"]}},"sameAs":[{same_as}]}}"#,
-        name = html_escape(SITE_NAME),
-        legal = html_escape(ORG_LEGAL_NAME),
-        url = html_escape(PUBLIC_BASE),
-        logo = html_escape(LOGO_URL),
-        slogan = html_escape(SITE_TAGLINE),
-        email = html_escape(CONTACT_EMAIL),
-        loc = html_escape(ORG_ADDR_LOCALITY),
-        country = html_escape(ORG_ADDR_COUNTRY),
-        same_as = same_as,
-    );
+    // Organization JSON-LD is identical across every page — built once at
+    // module init by `ORG_JSONLD: LazyLock<String>`.
+    let org_jsonld: &str = &ORG_JSONLD;
 
     // Per-page schema: WebSite (with sitelinks search action stub) for the
     // home page, WebPage for everything else. This matches what Google's
@@ -940,7 +998,16 @@ fn render_website(
     state: &Arc<AppState>,
     _headers: &HeaderMap,
     requested_slug: Option<String>,
-) -> (HeaderMap, String) {
+) -> (HeaderMap, Bytes) {
+    // Build the cache key first so we can short-circuit on a hit. Use the raw
+    // requested slug (None → "" for the home shell). When the slug resolves to
+    // home via `first_default_slug`, the cache still keys on what the client
+    // asked for; this is correct because invalidation is global and TTL is short.
+    let cache_key = requested_slug.clone().unwrap_or_default();
+    if let Some(cached) = page_cache_get(&cache_key) {
+        return (build_html_headers(), cached);
+    }
+
     let (pages, products) = {
         let db = state.db.lock().unwrap();
         (
@@ -992,15 +1059,20 @@ fn render_website(
     };
 
     let analytics = analytics_head(state);
-    let html = WEBSITE_HTML
+    let html: Bytes = WEBSITE_HTML
         .replacen("<!--SEO_HEAD-->", &injected, 1)
         .replacen("<!--ANALYTICS-->", &analytics, 1)
-        .replacen("<!--BODY_CONTENT-->", &body_html, 1);
+        .replacen("<!--BODY_CONTENT-->", &body_html, 1)
+        .into();
+    page_cache_put(cache_key, html.clone());
+    (build_html_headers(), html)
+}
 
+fn build_html_headers() -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
     h.insert(header::CACHE_CONTROL, "public, max-age=60".parse().unwrap());
-    (h, html)
+    h
 }
 
 pub const SETTING_GOOGLE_ANALYTICS_ID: &str = "google_analytics_id";
@@ -1157,8 +1229,7 @@ pub async fn handle_admin_get_site_settings(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let pairs = {
         let db = state.db.lock().unwrap();
         db.list_site_settings().map_err(db_err)?
@@ -1185,8 +1256,7 @@ pub async fn handle_admin_put_site_settings(
     Json(req): Json<UpdateSiteSettingsRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     for (k, v) in &req.fields {
         if !KNOWN_SITE_SETTING_KEYS.contains(&k.as_str()) {
             return Err(error_response(StatusCode::BAD_REQUEST, &format!("Unknown setting: {}", k)));
@@ -1201,6 +1271,7 @@ pub async fn handle_admin_put_site_settings(
         let db = state.db.lock().unwrap();
         db.set_site_setting(k, trimmed).map_err(db_err)?;
     }
+    invalidate_page_cache();
     Ok(Json(json!({ "status": "OK" })))
 }
 

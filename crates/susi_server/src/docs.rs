@@ -138,8 +138,7 @@ fn release_writer_check_or_admin_create(
     principal: &Principal,
     tag: &str,
 ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
-    crate::require_password_changed(state, principal)?;
-    crate::require_admin(state, principal)?;
+    crate::require_admin_full(state, principal)?;
     let db = state.db.lock().unwrap();
     let scoped_ws = db
         .get_release_workspace_id(tag)
@@ -307,7 +306,10 @@ pub async fn handle_get_doc_asset(
     if !path.exists() {
         return Err(error_response(StatusCode::NOT_FOUND, "Asset not found"));
     }
-    let bytes = std::fs::read(&path)
+    // Async read so the disk I/O doesn't block a runtime worker. Doc assets
+    // are typically small images, so buffering into a Vec is fine.
+    let bytes = tokio::fs::read(&path)
+        .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Read: {}", e)))?;
 
     let mut resp = HeaderMap::new();

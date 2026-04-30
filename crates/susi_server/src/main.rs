@@ -7,6 +7,7 @@ mod contact;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -175,6 +176,14 @@ const CHECKOUT_MAX_ATTEMPTS: usize = 10;
 const WEBHOOK_WINDOW: StdDuration = StdDuration::from_secs(60);
 const WEBHOOK_MAX_ATTEMPTS: usize = 300;
 
+// How often we'll walk the rate-limit map to drop empty/expired entries.
+// Cleanup is O(map.len()) so under burst traffic the previous trigger
+// (`map.len() > 4096`) ran on every subsequent request — turning a cheap
+// per-request check into a full scan under the shared mutex. Gating on
+// elapsed seconds amortises that work to once per CLEANUP_PERIOD regardless
+// of map size.
+const RATE_LIMIT_CLEANUP_PERIOD_SECS: u64 = 60;
+
 fn check_ip_rate_limit(
     map_lock: &Mutex<HashMap<IpAddr, Vec<Instant>>>,
     ip: IpAddr,
@@ -183,6 +192,11 @@ fn check_ip_rate_limit(
     label: &str,
     user_message: &str,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    // One static cleanup deadline shared across all rate-limit maps. The
+    // maps are all bounded by IP-set size and they all have ≤60 s windows;
+    // a single timer keeps the bookkeeping trivial.
+    static NEXT_CLEANUP_UNIX_SECS: AtomicU64 = AtomicU64::new(0);
+
     let mut map = map_lock.lock().unwrap();
     let now = Instant::now();
     let entry = map.entry(ip).or_default();
@@ -192,11 +206,31 @@ fn check_ip_rate_limit(
         return Err(error_response(StatusCode::TOO_MANY_REQUESTS, user_message));
     }
     entry.push(now);
-    if map.len() > 4096 {
-        map.retain(|_, v| {
-            v.retain(|t| now.duration_since(*t) < window);
-            !v.is_empty()
-        });
+
+    // Periodic GC. Use wall-clock seconds via SystemTime so the deadline is a
+    // plain integer (Instant doesn't fit in an AtomicU64).
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let deadline = NEXT_CLEANUP_UNIX_SECS.load(Ordering::Relaxed);
+    if now_unix >= deadline {
+        // Race-free: only the thread that successfully advances the deadline
+        // performs the sweep. Late arrivals see the new deadline and skip.
+        if NEXT_CLEANUP_UNIX_SECS
+            .compare_exchange(
+                deadline,
+                now_unix + RATE_LIMIT_CLEANUP_PERIOD_SECS,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            map.retain(|_, v| {
+                v.retain(|t| now.duration_since(*t) < window);
+                !v.is_empty()
+            });
+        }
     }
     Ok(())
 }
@@ -503,6 +537,67 @@ pub(crate) struct Principal {
 
 const API_TOKEN_PREFIX: &str = "susi_pat_";
 
+// Short TTL on the auth-hot-path cache. Long enough to absorb polling clients
+// (cron jobs, dashboards) that reuse the same bearer many times per minute;
+// short enough that an admin's revoke takes effect before any human notices.
+const API_TOKEN_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
+const API_TOKEN_CACHE_MAX: usize = 4096;
+
+struct CachedToken {
+    inserted: Instant,
+    username: String,
+}
+
+static API_TOKEN_CACHE: std::sync::LazyLock<std::sync::RwLock<HashMap<String, CachedToken>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+fn api_token_cache_get(hash: &str) -> Option<String> {
+    let cache = API_TOKEN_CACHE.read().ok()?;
+    let entry = cache.get(hash)?;
+    if entry.inserted.elapsed() < API_TOKEN_CACHE_TTL {
+        Some(entry.username.clone())
+    } else {
+        None
+    }
+}
+
+fn api_token_cache_put(hash: String, username: String) {
+    let Ok(mut cache) = API_TOKEN_CACHE.write() else { return };
+    if cache.len() >= API_TOKEN_CACHE_MAX {
+        // Drop expired entries when the bound is hit; if everything is still
+        // fresh, clear half the map at random (HashMap iteration order) so we
+        // bound the worst case to O(N) once per cap miss.
+        let now = Instant::now();
+        cache.retain(|_, v| now.duration_since(v.inserted) < API_TOKEN_CACHE_TTL);
+        if cache.len() >= API_TOKEN_CACHE_MAX {
+            let drop_n = cache.len() / 2;
+            let keys: Vec<String> = cache.keys().take(drop_n).cloned().collect();
+            for k in keys {
+                cache.remove(&k);
+            }
+        }
+    }
+    cache.insert(hash, CachedToken { inserted: Instant::now(), username });
+}
+
+/// Drop a single token from the auth cache (called when revoked so the bearer
+/// stops working immediately, not after the TTL).
+#[allow(dead_code)]
+fn api_token_cache_invalidate(hash: &str) {
+    if let Ok(mut cache) = API_TOKEN_CACHE.write() {
+        cache.remove(hash);
+    }
+}
+
+/// Drop every cached token. Called by revoke handlers — we don't store the
+/// raw hash on the row and revokes are rare, so a global flush is simpler
+/// than mapping `id → hash`. Cache is bounded to API_TOKEN_CACHE_MAX entries.
+fn api_token_cache_clear() {
+    if let Ok(mut cache) = API_TOKEN_CACHE.write() {
+        cache.clear();
+    }
+}
+
 /// Verify the Authorization header and resolve to a Principal. Accepts either:
 ///   - Bearer <JWT>      → AuthSource::Jwt
 ///   - Bearer susi_pat_… → AuthSource::ApiToken
@@ -521,9 +616,18 @@ pub(crate) fn validate_principal(
 
     if token.starts_with(API_TOKEN_PREFIX) {
         let token_hash = hash_token(token);
+
+        // Hot-path cache: most authenticated polling clients reuse the same
+        // bearer many times per minute. Skip the DB hit + lock for cache hits
+        // within `API_TOKEN_CACHE_TTL`. Revocation lag is bounded by the TTL.
+        if let Some(username) = api_token_cache_get(&token_hash) {
+            return Ok(Principal { username, source: AuthSource::ApiToken });
+        }
+
+        // Single round-trip: validate the hash AND bump last_used_at.
         let row = {
             let db = state.db.lock().unwrap();
-            db.find_api_token_by_hash(&token_hash)
+            db.find_and_touch_api_token(&token_hash)
                 .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         };
         let Some(row) = row else {
@@ -532,16 +636,49 @@ pub(crate) fn validate_principal(
         if row.revoked {
             return Err(error_response(StatusCode::UNAUTHORIZED, "API token revoked"));
         }
-        // Best-effort touch — auth must not fail on a transient DB hiccup here.
-        {
-            let db = state.db.lock().unwrap();
-            let _ = db.touch_api_token_used(row.id);
-        }
+        api_token_cache_put(token_hash, row.username.clone());
         return Ok(Principal { username: row.username, source: AuthSource::ApiToken });
     }
 
     let claims = validate_jwt(headers, &state.jwt_secret)?;
     Ok(Principal { username: claims.sub, source: AuthSource::Jwt })
+}
+
+/// Combined password-changed + admin-role + admin-2FA gate. Uses one DB
+/// round-trip and one mutex cycle instead of the three the legacy
+/// `require_password_changed` + `require_admin` pair did. Use this for any
+/// handler that ends up calling both helpers back-to-back (the typical admin
+/// case) — the old helpers stay around for the few sites that need only one.
+pub(crate) fn require_admin_full(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    // API tokens skip both the password-change gate (UI-only) and the
+    // TOTP requirement (the bearer is itself a strong factor).
+    let row = {
+        let db = state.db.lock().unwrap();
+        db.get_user_admin_check(&principal.username)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+    let Some((role, must_change, totp_enabled)) = row else {
+        return Err(error_response(StatusCode::FORBIDDEN, "Admin access required"));
+    };
+    if principal.source == AuthSource::Jwt && must_change {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Password change required before accessing admin features",
+        ));
+    }
+    if role != "admin" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Admin access required"));
+    }
+    if principal.source == AuthSource::Jwt && !totp_enabled {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Admin accounts must enable two-factor authentication before performing this action",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn require_password_changed(
@@ -564,31 +701,6 @@ pub(crate) fn require_password_changed(
     Ok(())
 }
 
-pub(crate) fn require_admin(
-    state: &AppState,
-    principal: &Principal,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let db = state.db.lock().unwrap();
-    let role = db.get_user_role(&principal.username).unwrap_or_default();
-    if role != "admin" {
-        return Err(error_response(StatusCode::FORBIDDEN, "Admin access required"));
-    }
-    // 2FA is only enforced for interactive (JWT) sessions. API tokens are
-    // themselves a strong factor — adding TOTP would mean storing a TOTP seed
-    // in CI alongside the bearer, which raises attack surface without raising
-    // the bar.
-    if principal.source == AuthSource::Jwt {
-        let totp_enabled = db.user_totp_enabled(&principal.username).unwrap_or(false);
-        if !totp_enabled {
-            return Err(error_response(
-                StatusCode::FORBIDDEN,
-                "Admin accounts must enable two-factor authentication before performing this action",
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Check if a principal is a site admin (without enforcing TOTP).
 fn is_site_admin(state: &AppState, principal: &Principal) -> bool {
     let db = state.db.lock().unwrap();
@@ -606,8 +718,7 @@ pub(crate) fn release_writer_check(
     principal: &Principal,
     tag: &str,
 ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
-    require_password_changed(state, principal)?;
-    require_admin(state, principal)?;
+    require_admin_full(state, principal)?;
     let scoped_ws = {
         let db = state.db.lock().unwrap();
         db.get_release_workspace_id(tag)
@@ -648,23 +759,37 @@ pub(crate) fn release_reader_check(
     Ok(Some(ws_id))
 }
 
-fn hash_password(password: &str) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    let salt = SaltString::generate(&mut rand::thread_rng());
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|h| h.to_string())
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+// Argon2 hash + verify are CPU-bound and take ~50–100 ms per call. Run them on
+// a `spawn_blocking` worker so they don't stall a Tokio runtime worker thread
+// (which would freeze every other handler scheduled on it). Callers must await.
+async fn hash_password(password: &str) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let owned = password.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate(&mut rand::thread_rng());
+        Argon2::default()
+            .hash_password(owned.as_bytes(), &salt)
+            .map(|h| h.to_string())
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+    })
+    .await
+    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
 }
 
-fn verify_password(
+async fn verify_password(
     password: &str,
     hash: &str,
 ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
-    let parsed = PasswordHash::new(hash)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    Ok(Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok())
+    let pw = password.to_owned();
+    let hash = hash.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let parsed = PasswordHash::new(&hash)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        Ok(Argon2::default()
+            .verify_password(pw.as_bytes(), &parsed)
+            .is_ok())
+    })
+    .await
+    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
 }
 
 // ---------------------------------------------------------------------------
@@ -723,23 +848,25 @@ async fn handle_login(
     let ip = client_ip(peer, &headers);
     check_login_rate_limit(&state, ip)?;
 
-    // Phase 1 — password check.
-    let (must_change, role, totp_enabled, user_email, device_known) = {
+    // Phase 1 — password check. Pull every DB row we need under one lock, drop
+    // the lock, then run Argon2 verify off-thread so the ~50 ms CPU spend
+    // doesn't serialise every other request behind us.
+    let (hash, must_change, role, totp_enabled, user_email, device_known) = {
         let db = state.db.lock().unwrap();
         let hash = db
             .get_user_password_hash(&req.username)
             .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"))?;
-        if !verify_password(&req.password, &hash)? {
-            return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"));
-        }
         let must_change = db.user_must_change_password(&req.username).unwrap_or(false);
         let role = db.get_user_role(&req.username).unwrap_or_else(|_| "user".into());
         let totp_enabled = db.user_totp_enabled(&req.username).unwrap_or(false);
         let email = db.get_user_email(&req.username).ok().flatten();
         let device_known = !req.device_fp.is_empty()
             && db.is_device_known(&req.username, &req.device_fp).unwrap_or(false);
-        (must_change, role, totp_enabled, email, device_known)
+        (hash, must_change, role, totp_enabled, email, device_known)
     };
+    if !verify_password(&req.password, &hash).await? {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"));
+    }
 
     // Phase 2 — decide what the new-device gate demands.
     //
@@ -1078,18 +1205,22 @@ async fn handle_change_password(
         return Err(error_response(StatusCode::BAD_REQUEST, "Password must be at least 8 characters"));
     }
 
-    let db = state.db.lock().unwrap();
-    let hash = db
-        .get_user_password_hash(&principal.username)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let hash = {
+        let db = state.db.lock().unwrap();
+        db.get_user_password_hash(&principal.username)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
 
-    if !verify_password(&req.current_password, &hash)? {
+    if !verify_password(&req.current_password, &hash).await? {
         return Err(error_response(StatusCode::UNAUTHORIZED, "Current password is incorrect"));
     }
 
-    let new_hash = hash_password(&req.new_password)?;
-    db.update_user_password(&principal.username, &new_hash)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let new_hash = hash_password(&req.new_password).await?;
+    {
+        let db = state.db.lock().unwrap();
+        db.update_user_password(&principal.username, &new_hash)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    }
 
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
@@ -1206,7 +1337,7 @@ async fn handle_reset_password_submit(
         return Err(error_response(StatusCode::BAD_REQUEST, "Password must be at least 8 characters"));
     }
     let token_hash = hash_token(&req.token);
-    let new_hash = hash_password(&req.new_password)?;
+    let new_hash = hash_password(&req.new_password).await?;
 
     let db = state.db.lock().unwrap();
     let username = db
@@ -1352,17 +1483,19 @@ async fn handle_regenerate_backup_codes(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
 
-    {
+    let (hash, totp_enabled) = {
         let db = state.db.lock().unwrap();
         let hash = db
             .get_user_password_hash(&principal.username)
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-        if !verify_password(&req.current_password, &hash)? {
-            return Err(error_response(StatusCode::UNAUTHORIZED, "Password is incorrect"));
-        }
-        if !db.user_totp_enabled(&principal.username).unwrap_or(false) {
-            return Err(error_response(StatusCode::BAD_REQUEST, "Enable 2FA first"));
-        }
+        let totp_enabled = db.user_totp_enabled(&principal.username).unwrap_or(false);
+        (hash, totp_enabled)
+    };
+    if !verify_password(&req.current_password, &hash).await? {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "Password is incorrect"));
+    }
+    if !totp_enabled {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Enable 2FA first"));
     }
 
     let raw_codes = generate_backup_codes(8);
@@ -1403,59 +1536,62 @@ async fn handle_activate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ActivateRequest>,
 ) -> Result<Json<susi_core::SignedLicense>, (StatusCode, Json<ErrorResponse>)> {
-    let db = state.db.lock().unwrap();
+    // Hold the lock only for the DB-bound section; release before the RSA
+    // sign so the heartbeat path doesn't serialise every other request.
+    let license = {
+        let db = state.db.lock().unwrap();
 
-    let license = db
-        .get_license_by_key(&req.license_key)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "License key not found"))?;
+        let license = db
+            .get_license_by_key(&req.license_key)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "License key not found"))?;
 
-    if license.revoked {
-        return Err(error_response(StatusCode::FORBIDDEN, "License has been revoked"));
-    }
+        if license.revoked {
+            return Err(error_response(StatusCode::FORBIDDEN, "License has been revoked"));
+        }
 
-    if license.is_expired() {
-        return Err(error_response(StatusCode::FORBIDDEN, "License has expired"));
-    }
+        if license.is_expired() {
+            return Err(error_response(StatusCode::FORBIDDEN, "License has expired"));
+        }
 
-    // Block auto-reactivation if this machine was removed by an admin within
-    // the tombstone window. Without this, a running client re-adds itself on
-    // the next startup and the admin's removal effectively never sticks.
-    if let Some(expires_at) = db
-        .machine_tombstone_expires_at(&license.id, &req.machine_code)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
-    {
-        let remaining = (expires_at - Utc::now()).num_minutes().max(0);
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            &format!(
-                "Machine was removed by an administrator; re-activation is blocked for {} more minutes",
-                remaining
-            ),
-        ));
-    }
+        // Block auto-reactivation if this machine was removed by an admin within
+        // the tombstone window. Without this, a running client re-adds itself on
+        // the next startup and the admin's removal effectively never sticks.
+        if let Some(expires_at) = db
+            .machine_tombstone_expires_at(&license.id, &req.machine_code)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        {
+            let remaining = (expires_at - Utc::now()).num_minutes().max(0);
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "Machine was removed by an administrator; re-activation is blocked for {} more minutes",
+                    remaining
+                ),
+            ));
+        }
 
-    if !license.is_machine_activated(&req.machine_code) && !license.can_add_machine() {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            &format!("Machine limit reached (max {})", license.max_machines),
-        ));
-    }
+        if !license.is_machine_activated(&req.machine_code) && !license.can_add_machine() {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                &format!("Machine limit reached (max {})", license.max_machines),
+            ));
+        }
 
-    let name = if req.friendly_name.is_empty() {
-        "Unknown".to_string()
-    } else {
-        req.friendly_name.clone()
+        let name = if req.friendly_name.is_empty() {
+            "Unknown".to_string()
+        } else {
+            req.friendly_name.clone()
+        };
+
+        let lease_expires = compute_lease_expires(&license);
+        db.add_machine_activation(&license.id, &req.machine_code, &name, lease_expires)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+        db.get_license_by_key(&req.license_key)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .unwrap()
     };
-
-    let lease_expires = compute_lease_expires(&license);
-    db.add_machine_activation(&license.id, &req.machine_code, &name, lease_expires)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-
-    let license = db
-        .get_license_by_key(&req.license_key)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
-        .unwrap();
 
     let payload = license.to_payload_for(Some(&req.machine_code));
     let signed = sign_license(&state.private_key, &payload)
@@ -1468,42 +1604,43 @@ async fn handle_verify(
     State(state): State<Arc<AppState>>,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Json<susi_core::SignedLicense>, (StatusCode, Json<ErrorResponse>)> {
-    let db = state.db.lock().unwrap();
+    let license = {
+        let db = state.db.lock().unwrap();
 
-    let license = db
-        .get_license_by_key(&req.license_key)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "License key not found"))?;
+        let license = db
+            .get_license_by_key(&req.license_key)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "License key not found"))?;
 
-    if license.revoked {
-        return Err(error_response(StatusCode::FORBIDDEN, "License has been revoked"));
-    }
+        if license.revoked {
+            return Err(error_response(StatusCode::FORBIDDEN, "License has been revoked"));
+        }
 
-    if license.is_expired() {
-        return Err(error_response(StatusCode::FORBIDDEN, "License has expired"));
-    }
+        if license.is_expired() {
+            return Err(error_response(StatusCode::FORBIDDEN, "License has expired"));
+        }
 
-    if !license.is_machine_activated(&req.machine_code) {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "Machine not authorized for this license",
-        ));
-    }
+        if !license.is_machine_activated(&req.machine_code) {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "Machine not authorized for this license",
+            ));
+        }
 
-    // Renew the lease on verify (acts as heartbeat)
-    if license.uses_leases() {
-        let lease_expires = compute_lease_expires(&license);
-        let activation = license.machines.iter().find(|m| m.machine_code == req.machine_code);
-        let name = activation.map(|a| a.friendly_name.as_str()).unwrap_or("Unknown");
-        db.add_machine_activation(&license.id, &req.machine_code, name, lease_expires)
-            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    }
+        // Renew the lease on verify (acts as heartbeat)
+        if license.uses_leases() {
+            let lease_expires = compute_lease_expires(&license);
+            let activation = license.machines.iter().find(|m| m.machine_code == req.machine_code);
+            let name = activation.map(|a| a.friendly_name.as_str()).unwrap_or("Unknown");
+            db.add_machine_activation(&license.id, &req.machine_code, name, lease_expires)
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        }
 
-    // Re-fetch to get updated lease
-    let license = db
-        .get_license_by_key(&req.license_key)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
-        .unwrap();
+        // Re-fetch to get updated lease.
+        db.get_license_by_key(&req.license_key)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .unwrap()
+    };
 
     let payload = license.to_payload_for(Some(&req.machine_code));
     let signed = sign_license(&state.private_key, &payload)
@@ -1595,8 +1732,7 @@ async fn handle_list_licenses(
     headers: HeaderMap,
 ) -> Result<Json<Vec<LicenseSummary>>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let licenses = db
@@ -1613,8 +1749,7 @@ async fn handle_get_license(
     Path(key): Path<String>,
 ) -> Result<Json<LicenseSummary>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let license = db
@@ -1631,8 +1766,7 @@ async fn handle_create_license(
     Json(req): Json<CreateLicenseRequest>,
 ) -> Result<(StatusCode, Json<LicenseSummary>), (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let expires_dt = if req.perpetual {
         None
@@ -1673,8 +1807,7 @@ async fn handle_revoke_license(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let revoked = db
@@ -1694,8 +1827,7 @@ async fn handle_delete_license(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let deleted = db
@@ -1716,8 +1848,7 @@ async fn handle_update_license(
     Json(req): Json<UpdateLicenseRequest>,
 ) -> Result<Json<LicenseSummary>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let license = db
@@ -1760,8 +1891,7 @@ async fn handle_export_license(
     Json(req): Json<ExportRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let license = db
@@ -1826,8 +1956,7 @@ async fn handle_deactivate_machine(
     Path((key, machine_code)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let license = db
@@ -1858,8 +1987,7 @@ async fn handle_clear_machine_tombstone(
     Path((key, machine_code)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let license = db
@@ -1882,8 +2010,7 @@ async fn handle_list_users(
     headers: HeaderMap,
 ) -> Result<Json<Vec<susi_core::db::UserInfo>>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     let db = state.db.lock().unwrap();
     let users = db
         .list_users()
@@ -1910,8 +2037,7 @@ async fn handle_create_user(
     Json(req): Json<CreateUserRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let username = req.username.trim();
     if username.is_empty() || username.len() > 64 {
@@ -1926,7 +2052,7 @@ async fn handle_create_user(
     let email = normalize_email(&req.email)?
         .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "Email is required"))?;
 
-    let pw_hash = hash_password(&req.password)?;
+    let pw_hash = hash_password(&req.password).await?;
     let db = state.db.lock().unwrap();
     db.create_user(username, &pw_hash, &req.role)
         .map_err(|e| error_response(StatusCode::CONFLICT, &e.to_string()))?;
@@ -1947,8 +2073,7 @@ async fn handle_delete_user(
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     if principal.username == username {
         return Err(error_response(StatusCode::BAD_REQUEST, "Cannot delete your own account"));
@@ -1973,8 +2098,7 @@ async fn handle_rename_user(
     Json(req): Json<RenameUserRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let new = req.new_username.trim().to_string();
     if new.is_empty() {
@@ -2006,14 +2130,13 @@ async fn handle_reset_user_password(
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     if req.new_password.len() < 8 {
         return Err(error_response(StatusCode::BAD_REQUEST, "Password must be at least 8 characters"));
     }
 
-    let pw_hash = hash_password(&req.new_password)?;
+    let pw_hash = hash_password(&req.new_password).await?;
     let db = state.db.lock().unwrap();
     db.reset_user_password(&username, &pw_hash)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
@@ -2107,12 +2230,15 @@ async fn handle_revoke_my_api_token(
     if owner != principal.username {
         return Err(error_response(StatusCode::FORBIDDEN, "Token belongs to another user"));
     }
-    let db = state.db.lock().unwrap();
-    let revoked = db.revoke_api_token(id)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let revoked = {
+        let db = state.db.lock().unwrap();
+        db.revoke_api_token(id)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
     if !revoked {
         return Err(error_response(StatusCode::CONFLICT, "Token already revoked"));
     }
+    api_token_cache_clear();
     log::info!("API token id={} revoked by {}", id, principal.username);
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
@@ -2122,8 +2248,7 @@ async fn handle_list_all_api_tokens(
     headers: HeaderMap,
 ) -> Result<Json<Vec<susi_core::db::ApiTokenInfo>>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
     let db = state.db.lock().unwrap();
     let rows = db
         .list_all_api_tokens()
@@ -2137,14 +2262,16 @@ async fn handle_revoke_any_api_token(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
-    let db = state.db.lock().unwrap();
-    let revoked = db.revoke_api_token(id)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    require_admin_full(&state, &principal)?;
+    let revoked = {
+        let db = state.db.lock().unwrap();
+        db.revoke_api_token(id)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
     if !revoked {
         return Err(error_response(StatusCode::CONFLICT, "Token already revoked or not found"));
     }
+    api_token_cache_clear();
     log::info!("API token id={} revoked by admin {}", id, principal.username);
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
@@ -2196,8 +2323,7 @@ async fn handle_set_user_email(
     Json(req): Json<SetEmailRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let normalized = match req.email.as_deref() {
         Some(s) => normalize_email(s)?,
@@ -2287,14 +2413,20 @@ async fn handle_get_releases(
         validate_principal(&headers, &state)?;
     }
 
-    let db = state.db.lock().unwrap();
-    let rows = db.list_releases()
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let (rows, mut assets_by_id) = {
+        let db = state.db.lock().unwrap();
+        let rows = db
+            .list_releases()
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        let ids: Vec<i64> = rows.iter().filter(|r| r.6.is_none()).map(|r| r.0).collect();
+        let assets_by_id = db.get_assets_for_releases(&ids).unwrap_or_default();
+        (rows, assets_by_id)
+    };
 
     let mut releases = Vec::new();
     for (id, tag, name, body, prerelease, created_at, workspace_id) in &rows {
         if workspace_id.is_some() { continue; }
-        let assets = db.get_release_assets(*id).unwrap_or_default();
+        let assets = assets_by_id.remove(id).unwrap_or_default();
         releases.push(serde_json::json!({
             "tag": tag,
             "name": name,
@@ -2365,7 +2497,15 @@ async fn handle_download_asset(
         return Err(error_response(StatusCode::BAD_REQUEST, "Invalid asset path"));
     }
 
-    let bytes = std::fs::read(&canonical)
+    // Stream the file body so we don't fully buffer release artifacts (which
+    // can be hundreds of MiB) into memory before responding. Open via
+    // tokio::fs so the open syscall doesn't block a runtime worker either.
+    let file = tokio::fs::File::open(&canonical)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Read error"))?;
+    let metadata = file
+        .metadata()
+        .await
         .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "Read error"))?;
 
     let mut resp_headers = HeaderMap::new();
@@ -2374,9 +2514,11 @@ async fn handle_download_asset(
         header::CONTENT_DISPOSITION,
         format!("attachment; filename=\"{}\"", asset_name).parse().unwrap(),
     );
-    resp_headers.insert(header::CONTENT_LENGTH, bytes.len().into());
+    resp_headers.insert(header::CONTENT_LENGTH, metadata.len().into());
 
-    Ok((resp_headers, bytes))
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+    Ok((resp_headers, body))
 }
 
 /// List releases — admin view (JWT)
@@ -2385,16 +2527,21 @@ async fn handle_list_releases_admin(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
-    let db = state.db.lock().unwrap();
-    let rows = db.list_releases()
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let (rows, mut assets_by_id) = {
+        let db = state.db.lock().unwrap();
+        let rows = db
+            .list_releases()
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let assets_by_id = db.get_assets_for_releases(&ids).unwrap_or_default();
+        (rows, assets_by_id)
+    };
 
-    let mut releases = Vec::new();
+    let mut releases = Vec::with_capacity(rows.len());
     for (id, tag, name, body, prerelease, created_at, workspace_id) in &rows {
-        let assets = db.get_release_assets(*id).unwrap_or_default();
+        let assets = assets_by_id.remove(id).unwrap_or_default();
         releases.push(serde_json::json!({
             "tag": tag,
             "name": name,
@@ -2419,8 +2566,7 @@ async fn handle_upload_release(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let mut tag = String::new();
     let mut name = String::new();
@@ -2550,8 +2696,7 @@ async fn handle_update_release(
     Json(req): Json<UpdateReleaseRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     let release_id = db
@@ -2583,8 +2728,7 @@ async fn handle_move_release(
     Json(req): Json<MoveReleaseRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let target = req
         .workspace_id
@@ -2624,8 +2768,7 @@ async fn handle_delete_release(
     Path(tag): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     if !db.delete_release(&tag)
@@ -2706,8 +2849,7 @@ async fn handle_create_workspace(
     Json(req): Json<CreateWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     if req.name.is_empty() {
         return Err(error_response(StatusCode::BAD_REQUEST, "Workspace name is required"));
@@ -2837,8 +2979,7 @@ async fn handle_delete_workspace(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     db.delete_workspace(&id)
@@ -2859,8 +3000,7 @@ async fn handle_add_workspace_member(
     Json(req): Json<AddMemberRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
 
@@ -2884,8 +3024,7 @@ async fn handle_remove_workspace_member(
     Path((workspace_id, username)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let db = state.db.lock().unwrap();
     db.remove_workspace_member(&workspace_id, &username)
@@ -3071,17 +3210,23 @@ async fn handle_workspace_releases(
     let principal = validate_principal(&headers, &state)?;
     require_password_changed(&state, &principal)?;
 
-    let db = state.db.lock().unwrap();
-    db.get_workspace_member_role(&workspace_id, &principal.username)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
-        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    let (rows, mut assets_by_id) = {
+        let db = state.db.lock().unwrap();
+        db.get_workspace_member_role(&workspace_id, &principal.username)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
 
-    let rows = db.list_releases_for_workspace(&workspace_id)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        let rows = db
+            .list_releases_for_workspace(&workspace_id)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let assets_by_id = db.get_assets_for_releases(&ids).unwrap_or_default();
+        (rows, assets_by_id)
+    };
 
     let mut releases = Vec::new();
     for (id, tag, name, body, prerelease, created_at) in &rows {
-        let assets = db.get_release_assets(*id).unwrap_or_default();
+        let assets = assets_by_id.remove(id).unwrap_or_default();
         releases.push(serde_json::json!({
             "tag": tag,
             "name": name,
@@ -3148,8 +3293,7 @@ async fn handle_create_workspace_doc_release(
     Json(req): Json<CreateWorkspaceDocReleaseRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &principal)?;
-    require_admin(&state, &principal)?;
+    require_admin_full(&state, &principal)?;
 
     let tag = req.tag.trim().to_string();
     docs::safe_tag(&tag)?;
@@ -3293,6 +3437,7 @@ async fn main() -> Result<()> {
     let db = LicenseDb::open(&cli.db).context("Failed to open database")?;
 
     let default_hash = hash_password("changeme")
+        .await
         .map_err(|_| anyhow::anyhow!("Failed to hash default password"))?;
     if db.seed_admin(&default_hash).context("Failed to seed admin")? {
         log::info!("Default admin user created (password: changeme)");
@@ -3402,6 +3547,27 @@ async fn main() -> Result<()> {
         turnstile_site_key: cli.turnstile_site_key,
         http,
     });
+
+    // Periodic lease cleanup. Replaces the per-read DELETE that ran inside
+    // every `get_license_by_key` call: under load, every heartbeat issued a
+    // DELETE on the licenses table competing for the global write lock.
+    {
+        let state_bg = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(StdDuration::from_secs(300));
+            tick.tick().await; // skip immediate fire
+            loop {
+                tick.tick().await;
+                let removed = {
+                    let db = state_bg.db.lock().unwrap();
+                    db.cleanup_all_expired_leases().unwrap_or(0)
+                };
+                if removed > 0 {
+                    log::info!("Lease cleanup: removed {} expired activations", removed);
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         // Dashboard

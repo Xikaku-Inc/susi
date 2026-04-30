@@ -10,7 +10,7 @@
 //! payment, computes tax, and redirects to success_url / cancel_url.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::{
     body::Bytes,
@@ -27,8 +27,8 @@ use susi_core::error::LicenseError;
 use crate::email::{EmailAttachment, InlineImage};
 use crate::invoice_pdf;
 use crate::{
-    check_checkout_rate_limit, check_webhook_rate_limit, client_ip, error_response, require_admin,
-    require_password_changed, validate_principal, AppState, ErrorResponse,
+    check_checkout_rate_limit, check_webhook_rate_limit, client_ip, error_response,
+    require_admin_full, validate_principal, AppState, ErrorResponse,
 };
 
 /// Brand logo embedded in the binary so it ships with every customer email
@@ -37,11 +37,15 @@ use crate::{
 const LOGO_PNG: &[u8] = include_bytes!("assets/xikaku-logo.png");
 const LOGO_CID: &str = "xikaku-logo";
 
+// Wrap the embedded PNG once into an `Arc<[u8]>`. Each `logo_inline_image()`
+// call then bumps the refcount instead of copying ~30 KB of bytes.
+static LOGO_PNG_ARC: LazyLock<Arc<[u8]>> = LazyLock::new(|| Arc::from(LOGO_PNG));
+
 fn logo_inline_image() -> InlineImage {
     InlineImage {
         content_id: LOGO_CID.into(),
         mime_type: "image/png".into(),
-        bytes: LOGO_PNG.to_vec(),
+        bytes: Arc::clone(&LOGO_PNG_ARC),
     }
 }
 
@@ -227,41 +231,51 @@ pub async fn handle_create_checkout_session(
         }
     }
 
+    // Validate every cart item before touching the DB so a single bad SKU
+    // doesn't make us pay for a query.
+    for item in &req.items {
+        if item.qty <= 0 || item.qty > 1000 {
+            return Err(error_response(StatusCode::BAD_REQUEST, "Invalid quantity"));
+        }
+        // Mirror admin validate_sku — bound length and character set so a
+        // pathological client can't waste a DB lookup with megabyte SKUs.
+        if item.sku.is_empty()
+            || item.sku.len() > 64
+            || !item.sku.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(error_response(StatusCode::BAD_REQUEST, "Invalid SKU"));
+        }
+    }
+
+    // Single batch lookup instead of one round-trip per cart line. Releases
+    // the DB lock before the Stripe HTTP call below — that call is 100–500 ms
+    // and previously held every other handler off the connection.
+    let skus: Vec<String> = req.items.iter().map(|i| i.sku.clone()).collect();
+    let products = {
+        let db = state.db.lock().unwrap();
+        db.get_products_by_skus(&skus).map_err(db_err)?
+    };
+
     // Look up each SKU, never trust client-supplied price.
     let mut resolved: Vec<(String, String, i64, String, String, i64)> = Vec::with_capacity(req.items.len()); // sku, title, price_cents, currency, tax_code, qty
     let mut cart_currency: Option<String> = None;
-    {
-        let db = state.db.lock().unwrap();
-        for item in &req.items {
-            if item.qty <= 0 || item.qty > 1000 {
-                return Err(error_response(StatusCode::BAD_REQUEST, "Invalid quantity"));
-            }
-            // Mirror admin validate_sku — bound length and character set so a
-            // pathological client can't waste a DB lookup with megabyte SKUs.
-            if item.sku.is_empty()
-                || item.sku.len() > 64
-                || !item.sku.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                return Err(error_response(StatusCode::BAD_REQUEST, "Invalid SKU"));
-            }
-            let row = db
-                .get_product(&item.sku)
-                .map_err(db_err)?
-                .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, &format!("Unknown SKU: {}", item.sku)))?;
-            let (sku, title, _desc, price_cents, currency, _img, tax_code, active, _ord, _upd) = row;
-            if !active {
-                return Err(error_response(StatusCode::BAD_REQUEST, &format!("Product is unavailable: {}", sku)));
-            }
-            match &cart_currency {
-                None => cart_currency = Some(currency.clone()),
-                Some(c) if c.eq_ignore_ascii_case(&currency) => {}
-                Some(c) => return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("Mixed currencies in cart: {} vs {}", c, currency),
-                )),
-            }
-            resolved.push((sku, title, price_cents, currency, tax_code, item.qty));
+    for item in &req.items {
+        let row = products
+            .get(&item.sku)
+            .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, &format!("Unknown SKU: {}", item.sku)))?;
+        let (sku, title, _desc, price_cents, currency, _img, tax_code, active, _ord, _upd) = row;
+        if !*active {
+            return Err(error_response(StatusCode::BAD_REQUEST, &format!("Product is unavailable: {}", sku)));
         }
+        match &cart_currency {
+            None => cart_currency = Some(currency.clone()),
+            Some(c) if c.eq_ignore_ascii_case(currency) => {}
+            Some(c) => return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Mixed currencies in cart: {} vs {}", c, currency),
+            )),
+        }
+        resolved.push((sku.clone(), title.clone(), *price_cents, currency.clone(), tax_code.clone(), item.qty));
     }
     let cart_currency = cart_currency.unwrap_or_else(|| "usd".to_string());
 
@@ -540,7 +554,7 @@ pub async fn handle_stripe_webhook(
             Some(EmailAttachment {
                 file_name: fname,
                 mime_type: "application/pdf".into(),
-                bytes: pdf_bytes,
+                bytes: Arc::<[u8]>::from(pdf_bytes.into_boxed_slice()),
             })
         };
 
@@ -556,10 +570,11 @@ pub async fn handle_stripe_webhook(
                     let to = to.clone();
                     let subject = subject.clone();
                     let body = body.clone();
+                    // Refcount-bump clone — `bytes: Arc<[u8]>`, no PDF copy.
                     let attach = pdf_attachment.as_ref().map(|a| EmailAttachment {
                         file_name: a.file_name.clone(),
                         mime_type: a.mime_type.clone(),
-                        bytes: a.bytes.clone(),
+                        bytes: Arc::clone(&a.bytes),
                     });
                     tokio::spawn(async move {
                         let attachments: Vec<EmailAttachment> = attach.into_iter().collect();
@@ -1091,8 +1106,7 @@ pub async fn handle_admin_list_products(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let rows = {
         let db = state.db.lock().unwrap();
         db.list_products(false).map_err(db_err)?
@@ -1140,8 +1154,7 @@ pub async fn handle_upsert_product(
     Json(req): Json<UpsertProductRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     validate_sku(&sku)?;
     if req.title.trim().is_empty() {
         return Err(error_response(StatusCode::BAD_REQUEST, "Title is required"));
@@ -1172,6 +1185,7 @@ pub async fn handle_upsert_product(
         )
         .map_err(db_err)?;
     }
+    crate::website::invalidate_page_cache();
     Ok(Json(json!({ "sku": sku })))
 }
 
@@ -1181,8 +1195,7 @@ pub async fn handle_delete_product(
     Path(sku): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     validate_sku(&sku)?;
     let removed = {
         let db = state.db.lock().unwrap();
@@ -1191,6 +1204,7 @@ pub async fn handle_delete_product(
     if !removed {
         return Err(error_response(StatusCode::NOT_FOUND, "Product not found"));
     }
+    crate::website::invalidate_page_cache();
     Ok(Json(json!({ "status": "OK" })))
 }
 
@@ -1199,8 +1213,7 @@ pub async fn handle_list_shipping_rates_admin(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let rows = {
         let db = state.db.lock().unwrap();
         db.list_shipping_rates(false).map_err(db_err)?
@@ -1259,8 +1272,7 @@ pub async fn handle_create_shipping_rate(
     Json(req): Json<ShippingRateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let regions_json = validate_rate_body(&req)?;
     let id = {
         let db = state.db.lock().unwrap();
@@ -1285,8 +1297,7 @@ pub async fn handle_update_shipping_rate(
     Json(req): Json<ShippingRateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let regions_json = validate_rate_body(&req)?;
     let ok = {
         let db = state.db.lock().unwrap();
@@ -1314,8 +1325,7 @@ pub async fn handle_delete_shipping_rate(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let removed = {
         let db = state.db.lock().unwrap();
         db.delete_shipping_rate(id).map_err(db_err)?
@@ -1399,8 +1409,7 @@ pub async fn handle_admin_list_orders(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let status = q.get("status").map(|s| s.as_str());
     let rows = {
         let db = state.db.lock().unwrap();
@@ -1416,8 +1425,7 @@ pub async fn handle_admin_get_order(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let row = {
         let db = state.db.lock().unwrap();
         db.get_order(id).map_err(db_err)?
@@ -1441,8 +1449,7 @@ pub async fn handle_admin_mark_shipped(
     Json(req): Json<ShipOrderRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let carrier = req.carrier.trim();
     let tracking = req.tracking_number.trim();
     if carrier.is_empty() || tracking.is_empty() {
@@ -1487,8 +1494,7 @@ pub async fn handle_admin_update_order_notes(
     Json(req): Json<UpdateOrderNotesRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let ok = {
         let db = state.db.lock().unwrap();
         db.update_order_notes(id, &req.notes).map_err(db_err)?
@@ -1604,8 +1610,7 @@ pub async fn handle_admin_get_settings(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
     let pairs = {
         let db = state.db.lock().unwrap();
         db.list_shop_settings().map_err(db_err)?
@@ -1638,8 +1643,7 @@ pub async fn handle_admin_put_settings(
     Json(req): Json<UpdateSettingsRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let p = validate_principal(&headers, &state)?;
-    require_password_changed(&state, &p)?;
-    require_admin(&state, &p)?;
+    require_admin_full(&state, &p)?;
 
     // Normalize known fields before storing.
     for (k, v) in &req.fields {
@@ -1679,15 +1683,13 @@ pub async fn handle_admin_put_settings(
 // detects a `/shop` path and renders product views into the content area.
 // ---------------------------------------------------------------------------
 
-const WEBSITE_HTML: &str = include_str!("website.html");
-
 pub async fn handle_shop_page(State(state): State<Arc<AppState>>) -> axum::response::Html<String> {
     let head = "<title>Shop — Xikaku</title>\n\
                 <meta name=\"description\" content=\"Order Xikaku IMU and inertial sensors directly. Shipped from our Los Angeles office.\">\n\
                 <meta property=\"og:title\" content=\"Shop — Xikaku\">\n\
                 <meta property=\"og:type\" content=\"website\">\n";
     let analytics = crate::website::analytics_head(&state);
-    let html = WEBSITE_HTML
+    let html = crate::website::WEBSITE_HTML
         .replacen("<!--SEO_HEAD-->", head, 1)
         .replacen("<!--ANALYTICS-->", &analytics, 1)
         .replacen("<!--BODY_CONTENT-->", "<div class=\"empty-state\">Loading…</div>", 1);
