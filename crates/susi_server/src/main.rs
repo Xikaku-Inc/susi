@@ -3427,6 +3427,9 @@ async fn main() -> Result<()> {
         .route("/robots.txt", get(website::handle_robots_txt))
         .route("/sitemap.xml", get(website::handle_sitemap_xml))
         .route("/llms.txt", get(website::handle_llms_txt))
+        // IndexNow key file — Bing/Yandex/etc. fetch this to verify ownership
+        // before accepting our URL update notifications.
+        .route("/indexnow/{filename}", get(website::handle_indexnow_key_file))
         // Health
         .route("/health", get(handle_health))
         // Available license features

@@ -153,9 +153,9 @@ pub async fn handle_upsert_page(
     require_admin(&state, &principal)?;
     safe_slug(&slug)?;
 
-    let id = {
+    let (id, is_home) = {
         let mut db = state.db.lock().unwrap();
-        db.upsert_website_page(
+        let id = db.upsert_website_page(
             &slug,
             &req.title,
             &req.body_md,
@@ -164,8 +164,12 @@ pub async fn handle_upsert_page(
             &req.meta_description,
             Some(&principal.username),
         )
-        .map_err(db_err)?
+        .map_err(db_err)?;
+        let pages = db.list_website_pages().unwrap_or_default();
+        let is_home = first_default_slug(&pages) == Some(slug.as_str());
+        (id, is_home)
     };
+    ping_indexnow(&state, vec![canonical_page_url(&slug, is_home)]);
     Ok(Json(json!({ "id": id, "slug": slug })))
 }
 
@@ -246,6 +250,10 @@ pub async fn handle_restore_page_revision(
         &existing_meta,
         Some(&principal.username),
     ).map_err(db_err)?;
+    let pages = db.list_website_pages().unwrap_or_default();
+    let is_home = first_default_slug(&pages) == Some(slug.as_str());
+    drop(db);
+    ping_indexnow(&state, vec![canonical_page_url(&slug, is_home)]);
     Ok(Json(json!({ "id": new_id, "slug": slug, "restored_from": id })))
 }
 
@@ -349,9 +357,21 @@ pub async fn handle_rename_page(
         return Err(error_response(StatusCode::BAD_REQUEST, "Invalid slug"));
     }
 
-    let mut db = state.db.lock().unwrap();
-    match db.rename_website_page(&slug, new_slug) {
-        Ok(true) => Ok(Json(json!({ "slug": new_slug }))),
+    let result = {
+        let mut db = state.db.lock().unwrap();
+        db.rename_website_page(&slug, new_slug)
+    };
+    match result {
+        Ok(true) => {
+            ping_indexnow(
+                &state,
+                vec![
+                    canonical_page_url(&slug, false),
+                    canonical_page_url(new_slug, false),
+                ],
+            );
+            Ok(Json(json!({ "slug": new_slug })))
+        }
         Ok(false) => Err(error_response(StatusCode::NOT_FOUND, "Page not found")),
         Err(e) => {
             let msg = format!("{}", e);
@@ -374,11 +394,14 @@ pub async fn handle_delete_page(
     require_admin(&state, &principal)?;
     safe_slug(&slug)?;
 
-    let db = state.db.lock().unwrap();
-    let removed = db.delete_website_page(&slug).map_err(db_err)?;
+    let removed = {
+        let db = state.db.lock().unwrap();
+        db.delete_website_page(&slug).map_err(db_err)?
+    };
     if !removed {
         return Err(error_response(StatusCode::NOT_FOUND, "Page not found"));
     }
+    ping_indexnow(&state, vec![canonical_page_url(&slug, false)]);
     Ok(Json(json!({ "status": "OK" })))
 }
 
@@ -1179,6 +1202,99 @@ pub async fn handle_admin_put_site_settings(
         db.set_site_setting(k, trimmed).map_err(db_err)?;
     }
     Ok(Json(json!({ "status": "OK" })))
+}
+
+// ---------------------------------------------------------------------------
+// IndexNow — push page changes to Bing/Yandex/Naver/Seznam (Google opts out).
+//
+// Spec: https://www.indexnow.org/documentation
+// We generate a 32-hex-char key on first use, persist it in site_settings,
+// and serve the verification file at /indexnow/{key}.txt. Page mutations
+// (upsert / rename / delete / restore) fire-and-forget POST to the IndexNow
+// endpoint so the admin response isn't blocked by network latency.
+// ---------------------------------------------------------------------------
+
+pub const SETTING_INDEXNOW_KEY: &str = "indexnow_key";
+const INDEXNOW_ENDPOINT: &str = "https://api.indexnow.org/indexnow";
+
+fn generate_indexnow_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Fetch the configured IndexNow key, lazily creating one the first time.
+fn get_or_create_indexnow_key(state: &Arc<AppState>) -> Option<String> {
+    let existing = {
+        let db = state.db.lock().unwrap();
+        db.get_site_setting(SETTING_INDEXNOW_KEY).ok().flatten()
+    };
+    if let Some(k) = existing.filter(|k| !k.is_empty()) {
+        return Some(k);
+    }
+    let key = generate_indexnow_key();
+    let db = state.db.lock().unwrap();
+    db.set_site_setting(SETTING_INDEXNOW_KEY, &key).ok()?;
+    Some(key)
+}
+
+pub async fn handle_indexnow_key_file(
+    State(state): State<Arc<AppState>>,
+    Path(filename): Path<String>,
+) -> impl IntoResponse {
+    let Some(key) = get_or_create_indexnow_key(&state) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "key unavailable").into_response();
+    };
+    let expected = format!("{}.txt", key);
+    if filename != expected {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let mut h = HeaderMap::new();
+    h.insert(header::CONTENT_TYPE, "text/plain; charset=utf-8".parse().unwrap());
+    h.insert(header::CACHE_CONTROL, "public, max-age=86400".parse().unwrap());
+    (h, key).into_response()
+}
+
+/// Fire an async IndexNow notification for the given URLs. Returns immediately;
+/// the network request runs in a background task. Silently no-ops when there's
+/// no key (e.g., DB error during bootstrap).
+pub fn ping_indexnow(state: &Arc<AppState>, urls: Vec<String>) {
+    if urls.is_empty() { return; }
+    let Some(key) = get_or_create_indexnow_key(state) else { return };
+    let host = PUBLIC_BASE
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let key_location = format!("{}/indexnow/{}.txt", PUBLIC_BASE, key);
+    let body = serde_json::to_string(&json!({
+        "host": host,
+        "key": key,
+        "keyLocation": key_location,
+        "urlList": urls,
+    })).unwrap_or_default();
+    let http = state.http.clone();
+    tokio::spawn(async move {
+        let res = http
+            .post(INDEXNOW_ENDPOINT)
+            .header("Content-Type", "application/json; charset=utf-8")
+            .body(body)
+            .send()
+            .await;
+        match res {
+            Ok(r) => {
+                let status = r.status();
+                if !status.is_success() {
+                    let body = r.text().await.unwrap_or_default();
+                    log::warn!("IndexNow non-2xx: {} body={}", status, body);
+                } else {
+                    log::info!("IndexNow accepted (status={})", status);
+                }
+            }
+            Err(e) => log::warn!("IndexNow request failed: {}", e),
+        }
+    });
 }
 
 #[cfg(test)]
