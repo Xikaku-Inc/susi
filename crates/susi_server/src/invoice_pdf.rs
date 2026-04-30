@@ -358,9 +358,9 @@ mod tests {
         ];
         let invoice = json!({"number": "9VRGWXU6-0001", "created": 1745625600i64});
         let bytes = generate(&event, &line_items, &invoice, Some(7)).expect("generate");
-        let out = "C:/tmp/sample-invoice.pdf";
-        std::fs::write(out, &bytes).unwrap();
-        eprintln!("wrote {} ({} bytes)", out, bytes.len());
+        let out = std::env::temp_dir().join("sample-invoice.pdf");
+        std::fs::write(&out, &bytes).unwrap();
+        eprintln!("wrote {} ({} bytes)", out.display(), bytes.len());
     }
 }
 
