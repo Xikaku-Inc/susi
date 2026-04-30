@@ -3348,17 +3348,26 @@ async function showWsDetail(id) {
         }
         if (showMemberMgmt) {
             const memberNames = new Set(members.map(m => m.username));
+            const sel = document.getElementById('wsNewMember');
             try {
                 const uResp = await fetch(API + '/auth/users', { headers: authHeaders() });
-                if (uResp.ok) {
+                if (!uResp.ok) {
+                    sel.innerHTML = '<option value="">Failed to load users (HTTP ' + uResp.status + ')</option>';
+                } else {
                     const allUsers = await uResp.json();
-                    const sel = document.getElementById('wsNewMember');
-                    sel.innerHTML = '<option value="">Select user...</option>' +
-                        allUsers.filter(u => !memberNames.has(u.username))
-                            .map(u => '<option value="' + esc(u.username) + '">' + esc(u.username) + '</option>')
-                            .join('');
+                    const candidates = allUsers.filter(u => !memberNames.has(u.username));
+                    if (candidates.length === 0) {
+                        sel.innerHTML = '<option value="">No other users — add one via Actions → Users</option>';
+                    } else {
+                        sel.innerHTML = '<option value="">Select user...</option>' +
+                            candidates
+                                .map(u => '<option value="' + esc(u.username) + '">' + esc(u.username) + '</option>')
+                                .join('');
+                    }
                 }
-            } catch (_) {}
+            } catch (e) {
+                sel.innerHTML = '<option value="">Failed to load users: ' + esc(e.message) + '</option>';
+            }
         }
 
         // Only site admins create doc releases or upload software, even into
