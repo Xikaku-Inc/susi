@@ -738,29 +738,113 @@ fn first_image_url(body_md: &str) -> Option<String> {
     None
 }
 
-/// Strip pandoc-style attribute spans (`{width=400px .class}`) that follow
-/// an image close `)`. The site's markdown was authored with pandoc syntax
-/// pulldown-cmark doesn't understand, so without this they'd render as
-/// literal text in the SSR body.
-fn strip_pandoc_attrs(body_md: &str) -> String {
+/// Rewrite pandoc-style image attribute spans (`![alt](url){width=Npx .class}`)
+/// into raw HTML `<img>` tags so the attributes survive into the SSR body.
+/// pulldown-cmark doesn't understand pandoc syntax; without this the `{...}`
+/// either rendered as literal text or (when only stripped) dropped classes
+/// like `.logo-light`/`.logo-dark` that the page CSS uses to pick the right
+/// asset for the active theme — causing both logos to flash on load.
+fn rewrite_pandoc_image_attrs(body_md: &str) -> String {
     let bytes = body_md.as_bytes();
     let mut out = String::with_capacity(body_md.len());
     let mut i = 0;
     while i < bytes.len() {
-        let c = bytes[i];
-        out.push(c as char);
-        // Detect an image-close `)` followed by `{...}` (no nested braces).
-        if c == b')' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some(end_off) = bytes[i + 2..].iter().position(|&b| b == b'}' || b == b'\n') {
-                if bytes[i + 2 + end_off] == b'}' {
-                    i += 2 + end_off + 1;
-                    continue;
-                }
+        if bytes[i] == b'!'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'['
+            && (i == 0 || bytes[i - 1] != b'\\')
+        {
+            if let Some((consumed, replacement)) = try_rewrite_image_at(&body_md[i..]) {
+                out.push_str(&replacement);
+                i += consumed;
+                continue;
             }
         }
+        out.push(bytes[i] as char);
         i += 1;
     }
     out
+}
+
+/// Try to parse `![alt](url){attrs}?` starting at the beginning of `s`.
+/// Returns (bytes consumed, replacement string) when matched, else None.
+/// When no `{attrs}` follows (or no recognized attrs are present) the
+/// original markdown image syntax is preserved so pulldown-cmark renders
+/// it normally.
+fn try_rewrite_image_at(s: &str) -> Option<(usize, String)> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 5 || bytes[0] != b'!' || bytes[1] != b'[' {
+        return None;
+    }
+    let alt_end = bytes[2..].iter().position(|&b| b == b']' || b == b'\n')?;
+    if bytes[2 + alt_end] != b']' {
+        return None;
+    }
+    let after_alt = 2 + alt_end + 1;
+    if after_alt >= bytes.len() || bytes[after_alt] != b'(' {
+        return None;
+    }
+    let url_start = after_alt + 1;
+    let url_end_off = bytes[url_start..]
+        .iter()
+        .position(|&b| b == b')' || b == b'\n')?;
+    if bytes[url_start + url_end_off] != b')' {
+        return None;
+    }
+    let alt = &s[2..2 + alt_end];
+    let url = &s[url_start..url_start + url_end_off];
+    let mut consumed = url_start + url_end_off + 1;
+
+    if consumed >= bytes.len() || bytes[consumed] != b'{' {
+        return None;
+    }
+    let attrs_off = bytes[consumed + 1..]
+        .iter()
+        .position(|&b| b == b'}' || b == b'\n')?;
+    if bytes[consumed + 1 + attrs_off] != b'}' {
+        return None;
+    }
+    let attrs = &s[consumed + 1..consumed + 1 + attrs_off];
+    consumed += 1 + attrs_off + 1;
+
+    let mut classes: Vec<&str> = Vec::new();
+    let mut width: Option<&str> = None;
+    let mut height: Option<&str> = None;
+    for tok in attrs.split_whitespace() {
+        if let Some(c) = tok.strip_prefix('.') {
+            if !c.is_empty()
+                && c.chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            {
+                classes.push(c);
+            }
+        } else if let Some(v) = tok.strip_prefix("width=") {
+            width = Some(v.trim_matches('"'));
+        } else if let Some(v) = tok.strip_prefix("height=") {
+            height = Some(v.trim_matches('"'));
+        }
+    }
+
+    if classes.is_empty() && width.is_none() && height.is_none() {
+        return Some((consumed, format!("![{}]({})", alt, url)));
+    }
+
+    let mut html = format!(
+        r#"<img alt="{}" src="{}""#,
+        html_escape(alt),
+        html_escape(url),
+    );
+    if let Some(w) = width {
+        html.push_str(&format!(r#" width="{}""#, html_escape(w)));
+    }
+    if let Some(h) = height {
+        html.push_str(&format!(r#" height="{}""#, html_escape(h)));
+    }
+    if !classes.is_empty() {
+        html.push_str(&format!(r#" class="{}""#, html_escape(&classes.join(" "))));
+    }
+    html.push('>');
+    Some((consumed, html))
 }
 
 /// Render markdown body into HTML for SSR injection. Pages are admin-edited
@@ -769,7 +853,7 @@ fn strip_pandoc_attrs(body_md: &str) -> String {
 /// page CSS handles image sizing.
 fn render_body_html(body_md: &str) -> String {
     use pulldown_cmark::{html, Options, Parser};
-    let cleaned = strip_pandoc_attrs(body_md);
+    let cleaned = rewrite_pandoc_image_attrs(body_md);
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_FOOTNOTES);
@@ -1435,18 +1519,39 @@ mod tests {
     }
 
     #[test]
-    fn strip_pandoc_attrs_removes_image_attrs() {
+    fn rewrite_pandoc_image_attrs_emits_class_and_width() {
         let md = "![logo](/static/logo.png){width=400px .logo-dark}\n\nText.";
-        let cleaned = strip_pandoc_attrs(md);
+        let cleaned = rewrite_pandoc_image_attrs(md);
         assert!(!cleaned.contains("{width"), "got: {}", cleaned);
-        assert!(cleaned.contains("![logo](/static/logo.png)"));
+        assert!(cleaned.contains(r#"<img alt="logo" src="/static/logo.png" width="400px" class="logo-dark">"#));
         assert!(cleaned.contains("Text."));
     }
 
     #[test]
-    fn strip_pandoc_attrs_leaves_normal_text_intact() {
+    fn rewrite_pandoc_image_attrs_preserves_classes_in_ssr_html() {
+        let md = "![Xikaku](/static/logo-dark.png){width=400px .logo-dark} ![Xikaku](/static/logo.png){width=400px .logo-light}";
+        let html = render_body_html(md);
+        assert!(html.contains(r#"class="logo-dark""#), "got: {}", html);
+        assert!(html.contains(r#"class="logo-light""#), "got: {}", html);
+    }
+
+    #[test]
+    fn rewrite_pandoc_image_attrs_keeps_plain_image_markdown() {
+        let md = "![alt](/img.png) and more text";
+        assert_eq!(rewrite_pandoc_image_attrs(md), md);
+    }
+
+    #[test]
+    fn rewrite_pandoc_image_attrs_strips_unrecognized_attrs() {
+        let md = "![alt](/img.png){foo=bar} text";
+        let cleaned = rewrite_pandoc_image_attrs(md);
+        assert_eq!(cleaned, "![alt](/img.png) text");
+    }
+
+    #[test]
+    fn rewrite_pandoc_image_attrs_leaves_normal_text_intact() {
         let md = "Use the `{config}` field to configure.";
-        assert_eq!(strip_pandoc_attrs(md), md);
+        assert_eq!(rewrite_pandoc_image_attrs(md), md);
     }
 
     #[test]
