@@ -419,15 +419,15 @@ The check is performed by the client library at license-verification time using 
 
 ### Per-license control
 
-New licenses have `require_signed_binary: true` by default. Use `--no-require-signed-binary` to opt out:
+New licenses have `require_signed_binary: false` by default. Use `--require-signed-binary` to opt in:
 
 ```bash
-# Default: binary signature required
+# Default: no binary signature check
 susi-admin create --customer "Acme Corp" --days 365 --features "pro"
 
-# Opt out: no signature check (e.g. for development builds or air-gapped deployments)
+# Opt in: binary signature required
 susi-admin create --customer "Acme Corp" --days 365 --features "pro" \
-  --no-require-signed-binary
+  --require-signed-binary
 ```
 
 Old license files that pre-date this feature have no `require_signed_binary` field; they are treated as `false` (backward compatible).
