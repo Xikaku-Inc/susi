@@ -3049,17 +3049,20 @@ async function loadReleases() {
 async function downloadAsset(event, tag, assetName) {
     event.preventDefault();
     try {
-        const resp = await fetch(API + '/updates/download/' + encodeURIComponent(tag) + '/' + encodeURIComponent(assetName), {
+        const resp = await fetch(API + '/updates/download-ticket', {
+            method: 'POST',
             headers: authHeaders(),
+            body: JSON.stringify({ tag: tag, asset: assetName }),
         });
         if (!resp.ok) { toast('Download failed', 'error'); return; }
-        const blob = await resp.blob();
-        const url = URL.createObjectURL(blob);
+        const { ticket } = await resp.json();
+        const url = API + '/updates/download/' + encodeURIComponent(tag) + '/' + encodeURIComponent(assetName) + '?ticket=' + encodeURIComponent(ticket);
         const a = document.createElement('a');
         a.href = url;
         a.download = assetName;
+        document.body.appendChild(a);
         a.click();
-        URL.revokeObjectURL(url);
+        a.remove();
     } catch (e) {
         toast('Download failed', 'error');
     }

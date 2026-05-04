@@ -657,7 +657,8 @@ Upload signed binaries (installers, archives, etc.) and let licensed clients fet
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
 | `GET` | `/api/v1/updates/releases` | License key | List releases the caller can download |
-| `GET` | `/api/v1/updates/download/{tag}/{asset}` | License key | Download a release asset |
+| `GET` | `/api/v1/updates/download/{tag}/{asset}` | License key, JWT, or `?ticket=` | Stream a release asset to the caller |
+| `POST` | `/api/v1/updates/download-ticket` | License key or JWT | Mint a 60 s single-asset ticket for the download URL |
 | `GET` | `/api/v1/releases` | JWT | List all releases (admin view) |
 | `POST` | `/api/v1/releases` | JWT | Upload a new release (multipart, up to 500 MB) |
 | `PUT` / `DELETE` | `/api/v1/releases/{tag}` | JWT | Update metadata / delete |

@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use argon2::{self, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::SaltString;
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -322,6 +322,22 @@ struct Claims {
     exp: i64,
 }
 
+/// Short-lived, single-asset download ticket. Lets the dashboard trigger a
+/// native browser download via plain `<a href>` (which can't carry an
+/// Authorization header) without exposing the user's session JWT in the URL.
+/// The `aud` claim makes it impossible to mistake an auth JWT for a ticket.
+#[derive(Debug, Serialize, Deserialize)]
+struct DownloadTicketClaims {
+    sub: String,
+    tag: String,
+    asset: String,
+    aud: String,
+    exp: i64,
+}
+
+const DOWNLOAD_TICKET_AUDIENCE: &str = "release-download";
+const DOWNLOAD_TICKET_TTL_SECS: i64 = 60;
+
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
@@ -494,6 +510,40 @@ fn create_jwt(secret: &[u8; 32], username: &str) -> Result<String, (StatusCode, 
     };
     encode(&Header::default(), &claims, &EncodingKey::from_secret(secret))
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+}
+
+fn mint_download_ticket(
+    secret: &[u8; 32],
+    sub: &str,
+    tag: &str,
+    asset: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let claims = DownloadTicketClaims {
+        sub: sub.into(),
+        tag: tag.into(),
+        asset: asset.into(),
+        aud: DOWNLOAD_TICKET_AUDIENCE.into(),
+        exp: Utc::now().timestamp() + DOWNLOAD_TICKET_TTL_SECS,
+    };
+    encode(&Header::default(), &claims, &EncodingKey::from_secret(secret))
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+}
+
+fn validate_download_ticket(
+    secret: &[u8; 32],
+    token: &str,
+    expected_tag: &str,
+    expected_asset: &str,
+) -> Result<DownloadTicketClaims, (StatusCode, Json<ErrorResponse>)> {
+    let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.set_audience(&[DOWNLOAD_TICKET_AUDIENCE]);
+    let claims = decode::<DownloadTicketClaims>(token, &DecodingKey::from_secret(secret), &validation)
+        .map(|d| d.claims)
+        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "Invalid or expired download ticket"))?;
+    if claims.tag != expected_tag || claims.asset != expected_asset {
+        return Err(error_response(StatusCode::FORBIDDEN, "Ticket does not match requested asset"));
+    }
+    Ok(claims)
 }
 
 fn validate_jwt(
@@ -2443,24 +2493,24 @@ async fn handle_get_releases(
     Ok(Json(serde_json::json!({ "releases": releases })))
 }
 
-/// Download a release asset — available to licensed clients or logged-in users
-async fn handle_download_asset(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((tag, asset_name)): Path<(String, String)>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // Allow either license key or bearer auth (JWT or API token)
-    let license_ok = validate_license_key(&state, &headers).is_ok();
-    let principal_opt = validate_principal(&headers, &state).ok();
+/// Verify the caller is allowed to download `tag`. Returns the principal
+/// username if authentication used a bearer token, or `"license"` if it used a
+/// license key. Encapsulates the license/principal + workspace membership
+/// rules shared by the download endpoint and the ticket mint endpoint.
+fn authorize_release_download(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    tag: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let license_ok = validate_license_key(state, headers).is_ok();
+    let principal_opt = validate_principal(headers, state).ok();
     if !license_ok && principal_opt.is_none() {
         return Err(error_response(StatusCode::UNAUTHORIZED, "Authentication required"));
     }
 
-    // Workspace-scoped releases are only downloadable by site admins or members
-    // of that workspace. License-only and non-member bearer tokens are denied.
     let scoped_ws = {
         let db = state.db.lock().unwrap();
-        db.get_release_workspace_id(&tag)
+        db.get_release_workspace_id(tag)
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
             .flatten()
     };
@@ -2478,6 +2528,54 @@ async fn handle_download_asset(
                 return Err(error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"));
             }
         }
+    }
+
+    Ok(principal_opt
+        .map(|p| p.username)
+        .unwrap_or_else(|| "license".into()))
+}
+
+#[derive(Deserialize)]
+struct DownloadTicketRequest {
+    tag: String,
+    asset: String,
+}
+
+/// Mint a short-lived, single-asset ticket the browser can include as a query
+/// parameter on the download URL — needed because `<a href>` clicks can't
+/// attach Authorization headers, but only `<a href>`-style navigation hands
+/// the response off to the browser's native download UI.
+async fn handle_mint_download_ticket(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DownloadTicketRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let safe_tag = docs::safe_tag(&body.tag)?;
+    let safe_asset = docs::safe_filename(&body.asset)?;
+    let sub = authorize_release_download(&state, &headers, &safe_tag)?;
+    let ticket = mint_download_ticket(&state.jwt_secret, &sub, &safe_tag, &safe_asset)?;
+    Ok(Json(serde_json::json!({
+        "ticket": ticket,
+        "expires_in": DOWNLOAD_TICKET_TTL_SECS,
+    })))
+}
+
+#[derive(Deserialize)]
+struct DownloadQuery {
+    #[serde(default)]
+    ticket: Option<String>,
+}
+
+async fn handle_download_asset(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((tag, asset_name)): Path<(String, String)>,
+    Query(q): Query<DownloadQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(ref ticket) = q.ticket {
+        validate_download_ticket(&state.jwt_secret, ticket, &tag, &asset_name)?;
+    } else {
+        authorize_release_download(&state, &headers, &tag)?;
     }
 
     // Reject traversal / empty / nul before building the path, and confirm the
@@ -3649,6 +3747,7 @@ async fn main() -> Result<()> {
         // Releases — client endpoints (license-key protected)
         .route("/api/v1/updates/releases", get(handle_get_releases))
         .route("/api/v1/updates/download/{tag}/{asset}", get(handle_download_asset))
+        .route("/api/v1/updates/download-ticket", post(handle_mint_download_ticket))
         // Releases — admin endpoints (JWT protected)
         .route("/api/v1/releases", get(handle_list_releases_admin))
         .merge(
