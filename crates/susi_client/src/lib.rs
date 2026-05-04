@@ -924,6 +924,7 @@ mod tests {
             features: vec![],
             machine_codes: vec![],
             lease_expires: Some(Utc::now() + Duration::hours(168)),
+            require_signed_binary: false
         };
         let signed = sign_license(&private, &payload).unwrap();
         let body = serde_json::to_string(&signed).unwrap();

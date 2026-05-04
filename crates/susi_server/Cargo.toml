@@ -44,3 +44,4 @@ susi_client = { path = "../susi_client" }
 susi_core = { path = "../susi_core" }
 reqwest = { workspace = true }
 tempfile = "3"
+totp-rs = { version = "5", features = ["gen_secret"] }

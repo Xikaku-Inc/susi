@@ -81,6 +81,7 @@ use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use susi_client::{binary_signing, LicenseClient, LicenseStatus};
 use susi_core::crypto::{generate_keypair, private_key_to_pem, public_key_to_pem};
+use totp_rs::{Algorithm, Secret, TOTP};
 
 // ---------------------------------------------------------------------------
 // TestServer harness
@@ -196,6 +197,40 @@ impl TestServer {
             resp.text().unwrap_or_default()
         );
 
+        // Set up 2FA (required before admin endpoints accept requests).
+        let resp = client
+            .post(format!("{}/auth/setup-2fa", self.api_url))
+            .bearer_auth(&token)
+            .send()
+            .expect("setup-2fa");
+        assert!(
+            resp.status().is_success(),
+            "setup-2fa failed: {}",
+            resp.text().unwrap_or_default()
+        );
+        let secret_b32 = resp.json::<Value>().expect("setup-2fa json")["secret"]
+            .as_str()
+            .expect("secret field")
+            .to_string();
+
+        let secret_bytes = Secret::Encoded(secret_b32).to_bytes().expect("decode secret");
+        let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes,
+            Some("Susi License Server".into()), "admin".into())
+            .expect("totp");
+        let totp_code = totp.generate_current().expect("generate totp");
+
+        let resp = client
+            .post(format!("{}/auth/verify-2fa", self.api_url))
+            .bearer_auth(&token)
+            .json(&json!({"totp_code": totp_code}))
+            .send()
+            .expect("verify-2fa");
+        assert!(
+            resp.status().is_success(),
+            "verify-2fa failed: {}",
+            resp.text().unwrap_or_default()
+        );
+
         token
     }
 
@@ -246,7 +281,7 @@ fn free_port() -> u16 {
 // ---------------------------------------------------------------------------
 
 /// Full happy-path: activate a `require_signed_binary=false` license via the
-/// server, then verify it locally through [`LicenseClient::verify_and_refresh`].
+/// server, then verify it locally through [`LicenseClient::activate`].
 ///
 /// This is the baseline test that must pass on every machine without any
 /// certificate setup.
@@ -260,14 +295,14 @@ fn test_activate_and_refresh_unsigned_ok() {
     let client = LicenseClient::with_server(&server.public_key_pem, server.api_url.clone())
         .expect("LicenseClient");
 
-    let status = client.verify_and_refresh(&license_path, &license_key, None);
+    let status = client.activate(&license_path, &license_key, None);
     assert!(status.is_valid(), "expected Valid, got: {:?}", status);
     assert!(status.has_feature("imu_optical_fusion"));
     assert!(!status.has_feature("vehicular_fusion"));
 }
 
-/// Calling [`LicenseClient::verify_and_refresh`] a second time contacts the
-/// server again to renew the lease.  Both calls must return `Valid`.
+/// Calling [`LicenseClient::verify_and_refresh`] after [`LicenseClient::activate`]
+/// to renew the lease.  Both calls must return `Valid`.
 #[test]
 fn test_lease_renewal_via_server() {
     let server = TestServer::start();
@@ -278,7 +313,7 @@ fn test_lease_renewal_via_server() {
     let client = LicenseClient::with_server(&server.public_key_pem, server.api_url.clone())
         .expect("LicenseClient");
 
-    let status = client.verify_and_refresh(&license_path, &license_key, None);
+    let status = client.activate(&license_path, &license_key, None);
     assert!(status.is_valid(), "first check: {:?}", status);
 
     let status = client.verify_and_refresh(&license_path, &license_key, None);
@@ -334,6 +369,17 @@ fn test_fallback_to_cached_file() {
         .json(&json!({"current_password": "changeme", "new_password": "testpassword1"}))
         .send().unwrap();
 
+    let resp = http.post(format!("{}/auth/setup-2fa", api_url))
+        .bearer_auth(&token).send().unwrap();
+    let secret_b32 = resp.json::<Value>().unwrap()["secret"].as_str().unwrap().to_string();
+    let secret_bytes = Secret::Encoded(secret_b32).to_bytes().unwrap();
+    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes,
+        Some("Susi License Server".into()), "admin".into()).unwrap();
+    http.post(format!("{}/auth/verify-2fa", api_url))
+        .bearer_auth(&token)
+        .json(&json!({"totp_code": totp.generate_current().unwrap()}))
+        .send().unwrap();
+
     let resp = http.post(format!("{}/licenses", api_url))
         .bearer_auth(&token)
         .json(&json!({"customer": "Corp", "days": 30, "require_signed_binary": false}))
@@ -344,7 +390,7 @@ fn test_fallback_to_cached_file() {
     // Prime the on-disk cache.
     let license_path = dir.path().join("license.json");
     let client = LicenseClient::with_server(&public_pem, api_url.clone()).unwrap();
-    let status = client.verify_and_refresh(&license_path, &license_key, None);
+    let status = client.activate(&license_path, &license_key, None);
     assert!(status.is_valid(), "initial: {:?}", status);
 
     // Kill server — dir (and cached file) remain alive.
