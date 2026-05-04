@@ -370,7 +370,7 @@ struct CreateLicenseRequest {
     /// Grace period in hours after lease expires. Default: 24.
     #[serde(default = "default_lease_grace")]
     lease_grace_hours: u32,
-    /// Require valid binary code signature. Default: true.
+    /// Require valid binary code signature. Default: false.
     #[serde(default = "default_require_signed_binary")]
     require_signed_binary: bool,
 }
@@ -388,7 +388,7 @@ fn default_lease_grace() -> u32 {
     DEFAULT_LEASE_GRACE_HOURS
 }
 fn default_require_signed_binary() -> bool {
-    true
+    false
 }
 
 #[derive(Deserialize)]

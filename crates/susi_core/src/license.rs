@@ -92,7 +92,7 @@ impl License {
             lease_grace_hours: DEFAULT_LEASE_GRACE_HOURS,
             machines: Vec::new(),
             revoked: false,
-            require_signed_binary: true,
+            require_signed_binary: false,
         }
     }
 
