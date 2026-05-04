@@ -92,7 +92,7 @@ impl LicenseDb {
                 revoked INTEGER NOT NULL DEFAULT 0,
                 lease_duration_hours INTEGER NOT NULL DEFAULT 168,
                 lease_grace_hours INTEGER NOT NULL DEFAULT 24,
-                require_signed_binary INTEGER NOT NULL DEFAULT 1
+                require_signed_binary INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS machine_activations (
@@ -425,7 +425,7 @@ impl LicenseDb {
 
         // Add require binary signing to licenses table
         let _ = self.conn.execute_batch(
-            "ALTER TABLE licenses ADD COLUMN require_signed_binary INTEGER NOT NULL DEFAULT 1;"
+            "ALTER TABLE licenses ADD COLUMN require_signed_binary INTEGER NOT NULL DEFAULT 0;"
         );
 
         // >> Add new migrations as own execute_batch statements here <<
