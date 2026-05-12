@@ -3175,7 +3175,7 @@ async function populateReleaseWorkspaceDropdown(presetWorkspaceId) {
 function showUploadReleaseModal(presetWorkspaceId) {
     const tagInput = document.getElementById('releaseTag');
     tagInput.value = '';
-    tagInput.disabled = false; // may have been locked by replaceWsReleaseFile
+    tagInput.disabled = false; // may have been locked by addWsReleaseSoftware
     document.getElementById('releaseName').value = '';
     document.getElementById('releaseBody').value = '';
     document.getElementById('releasePrerelease').checked = false;
@@ -3432,21 +3432,11 @@ document.addEventListener('click', () => {
     document.querySelectorAll('.dropdown-menu').forEach(el => { el.style.display = 'none'; });
 });
 
+// Open the upload modal pre-filled with the release's metadata so the user can
+// add one or more new binaries. The tag input is locked (backend keys assets
+// off the tag); same-named uploads overwrite via add_release_asset upsert.
 async function addWsReleaseSoftware(tag) {
-    // Identical wiring to "Replace file": pre-fill the upload modal with the
-    // current metadata and lock the tag. The semantic difference is intent —
-    // the user picks a NEW file to add. The backend will preserve any
-    // existing assets with different filenames; uploading a same-named file
-    // overwrites it (existing add_release_asset upsert behaviour). The
-    // modal supports multi-select, so several binaries can ship at once.
-    return replaceWsReleaseFile(tag);
-}
-
-async function replaceWsReleaseFile(tag) {
     if (!selectedWsId) return;
-    // Pre-fill the existing upload modal with the current metadata so the user
-    // only has to pick a new file. The tag input is locked because the
-    // backend keys re-uploads off the tag.
     try {
         const resp = await fetch(API + '/workspaces/' + selectedWsId + '/releases', { headers: authHeaders() });
         if (!resp.ok) { toast('Failed to load release', 'error'); return; }
@@ -3461,6 +3451,59 @@ async function replaceWsReleaseFile(tag) {
         document.getElementById('releaseBody').value = r.body || '';
         document.getElementById('releasePrerelease').checked = !!r.prerelease;
         document.getElementById('releaseFile').focus();
+    } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+    }
+}
+
+// Replace one specific asset on a release. Opens a hidden file picker; the
+// chosen file is POSTed to the per-asset replace endpoint which atomically
+// removes the old row+file and writes the new one (the new file may have a
+// different name than the old).
+function replaceWsReleaseAsset(tag, fileName) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.style.display = 'none';
+    input.addEventListener('change', async () => {
+        const file = input.files && input.files[0];
+        input.remove();
+        if (!file) return;
+        const fd = new FormData();
+        fd.append('file', file);
+        try {
+            const resp = await fetch(
+                API + '/releases/' + encodeURIComponent(tag) + '/assets/' + encodeURIComponent(fileName) + '/replace',
+                { method: 'POST', headers: authHeaders(), body: fd }
+            );
+            if (!resp.ok) {
+                const d = await resp.json().catch(() => ({}));
+                toast('Error: ' + (d.error || 'Could not replace file'), 'error');
+                return;
+            }
+            toast('File replaced', 'success');
+            if (selectedWsId) loadWsReleases(selectedWsId);
+        } catch (e) {
+            toast('Failed: ' + e.message, 'error');
+        }
+    });
+    document.body.appendChild(input);
+    input.click();
+}
+
+async function deleteWsReleaseAsset(tag, fileName) {
+    if (!confirm('Remove file "' + fileName + '" from release ' + tag + '?')) return;
+    try {
+        const resp = await fetch(
+            API + '/releases/' + encodeURIComponent(tag) + '/assets/' + encodeURIComponent(fileName),
+            { method: 'DELETE', headers: authHeaders() }
+        );
+        if (!resp.ok) {
+            const d = await resp.json().catch(() => ({}));
+            toast('Error: ' + (d.error || 'Could not remove file'), 'error');
+            return;
+        }
+        toast('File removed', 'success');
+        if (selectedWsId) loadWsReleases(selectedWsId);
     } catch (e) {
         toast('Failed: ' + e.message, 'error');
     }
@@ -3728,7 +3771,6 @@ function renderWsReleases() {
                 '<div id="' + menuId + '" class="dropdown-menu" style="display:none;">' +
                     '<button onclick="editWsRelease(\'' + esc(r.tag) + '\')">Edit metadata</button>' +
                     '<button onclick="addWsReleaseSoftware(\'' + esc(r.tag) + '\')">Add software</button>' +
-                    '<button onclick="replaceWsReleaseFile(\'' + esc(r.tag) + '\')">Replace file</button>' +
                     '<div class="divider"></div>' +
                     '<button onclick="editWsReleaseDocs(\'' + esc(r.tag) + '\')">Edit documentation</button>' +
                     '<button onclick="moveWsRelease(\'' + esc(r.tag) + '\')">Move to workspace…</button>' +
@@ -3781,14 +3823,22 @@ function renderWsReleaseExpansion(r, hasDocReleaseRow) {
     }
 
     let filesHtml;
+    const isAdmin = userRole === 'admin';
     if ((r.assets || []).length === 0) {
         filesHtml = '<div style="color:var(--text2);font-size:12px;">No software files attached.</div>';
     } else {
         filesHtml = '<ul style="list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:2px;">' +
-            r.assets.map(a => '<li style="display:flex;justify-content:space-between;gap:8px;font-size:13px;">' +
-                '<a href="#" onclick="event.preventDefault();downloadAsset(event,\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" style="color:var(--accent);text-decoration:none;font-family:monospace;">' + esc(a.name) + '</a>' +
-                '<span style="color:var(--text2);font-size:11px;">' + formatSize(a.size) + '</span>' +
-            '</li>').join('') +
+            r.assets.map(a => {
+                const actions = isAdmin
+                    ? '<button class="small secondary" style="padding:1px 6px;font-size:11px;" onclick="replaceWsReleaseAsset(\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" title="Replace this file">Replace</button>' +
+                      '<button class="small danger" style="padding:1px 6px;font-size:11px;" onclick="deleteWsReleaseAsset(\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" title="Remove this file">&times;</button>'
+                    : '';
+                return '<li style="display:flex;justify-content:space-between;gap:8px;font-size:13px;align-items:center;">' +
+                    '<a href="#" onclick="event.preventDefault();downloadAsset(event,\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" style="color:var(--accent);text-decoration:none;font-family:monospace;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(a.name) + '</a>' +
+                    '<span style="color:var(--text2);font-size:11px;white-space:nowrap;">' + formatSize(a.size) + '</span>' +
+                    (actions ? '<span style="display:flex;gap:4px;">' + actions + '</span>' : '') +
+                '</li>';
+            }).join('') +
         '</ul>';
     }
 

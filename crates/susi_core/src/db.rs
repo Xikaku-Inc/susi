@@ -1970,6 +1970,16 @@ impl LicenseDb {
         Ok(())
     }
 
+    pub fn delete_release_asset(&self, release_id: i64, file_name: &str) -> Result<bool, LicenseError> {
+        let n = self.conn
+            .execute(
+                "DELETE FROM release_assets WHERE release_id = ?1 AND file_name = ?2",
+                params![release_id, file_name],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB delete asset: {}", e)))?;
+        Ok(n > 0)
+    }
+
     /// Update metadata of an existing release without touching its id (so
     /// FKs from doc_pages / release_assets remain intact).
     pub fn update_release_metadata(
@@ -4325,6 +4335,33 @@ mod tests {
         let latest = db.get_latest_config_revision("ws-1").unwrap().unwrap();
         assert_eq!(latest.1, r#"{"v":2}"#); // config_json
         assert_eq!(latest.2, "v2"); // name
+    }
+
+    #[test]
+    fn test_release_asset_add_and_delete() {
+        let db = test_db();
+        let rid = db.insert_release("v9.9", "Test", "", false, None).unwrap();
+
+        db.add_release_asset(rid, "a.bin", 11).unwrap();
+        db.add_release_asset(rid, "b.bin", 22).unwrap();
+        let assets = db.get_release_assets(rid).unwrap();
+        assert_eq!(assets.len(), 2);
+
+        // Upsert keeps the same row count and updates size in place.
+        db.add_release_asset(rid, "a.bin", 33).unwrap();
+        let assets = db.get_release_assets(rid).unwrap();
+        assert_eq!(assets.len(), 2);
+        let a = assets.iter().find(|(n, _)| n == "a.bin").unwrap();
+        assert_eq!(a.1, 33);
+
+        // Delete one — the other remains.
+        assert!(db.delete_release_asset(rid, "a.bin").unwrap());
+        let remaining = db.get_release_assets(rid).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "b.bin");
+
+        // Deleting again is a no-op (returns false).
+        assert!(!db.delete_release_asset(rid, "a.bin").unwrap());
     }
 
     #[test]

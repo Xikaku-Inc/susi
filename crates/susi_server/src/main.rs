@@ -2885,6 +2885,105 @@ async fn handle_delete_release(
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
 
+/// Delete a single binary asset from a release. Admin only (JWT).
+async fn handle_delete_release_asset(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((tag, file_name)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_admin_full(&state, &principal)?;
+    docs::safe_tag(&tag)?;
+    docs::safe_filename(&file_name)?;
+
+    let release_id = {
+        let db = state.db.lock().unwrap();
+        db.get_release_by_tag(&tag)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Release not found"))?
+    };
+    let removed = {
+        let db = state.db.lock().unwrap();
+        db.delete_release_asset(release_id, &file_name)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    };
+    let _ = std::fs::remove_file(releases_dir(&state).join(&tag).join(&file_name));
+    if !removed {
+        return Err(error_response(StatusCode::NOT_FOUND, "Asset not found"));
+    }
+    log::info!("Release {} asset {} deleted", tag, file_name);
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+/// Replace a single binary asset on a release with a newly uploaded file.
+/// The old asset row + file are removed; the new file is written under its
+/// own name (which may differ from the old one). Admin only (JWT).
+async fn handle_replace_release_asset(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((tag, old_file_name)): Path<(String, String)>,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_admin_full(&state, &principal)?;
+    docs::safe_tag(&tag)?;
+    docs::safe_filename(&old_file_name)?;
+
+    let mut new_file_name = String::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(field) = multipart.next_field().await
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, &format!("Multipart: {}", e)))?
+    {
+        if field.name() == Some("file") {
+            new_file_name = field.file_name().unwrap_or("").to_string();
+            let data = field.bytes().await
+                .map_err(|e| error_response(StatusCode::BAD_REQUEST, &e.to_string()))?;
+            bytes = data.to_vec();
+            break;
+        }
+    }
+    if new_file_name.is_empty() || bytes.is_empty() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Missing 'file' field"));
+    }
+    docs::safe_filename(&new_file_name)?;
+
+    let release_id = {
+        let db = state.db.lock().unwrap();
+        db.get_release_by_tag(&tag)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Release not found"))?
+    };
+
+    let tag_dir = releases_dir(&state).join(&tag);
+    std::fs::create_dir_all(&tag_dir)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("mkdir: {}", e)))?;
+    let new_path = tag_dir.join(&new_file_name);
+    std::fs::write(&new_path, &bytes)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("write: {}", e)))?;
+
+    {
+        let db = state.db.lock().unwrap();
+        db.add_release_asset(release_id, &new_file_name, bytes.len() as u64)
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        // Drop the old row only if the new file landed under a different name —
+        // otherwise add_release_asset's upsert already updated the row in place.
+        if new_file_name != old_file_name {
+            db.delete_release_asset(release_id, &old_file_name)
+                .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        }
+    }
+    if new_file_name != old_file_name {
+        let _ = std::fs::remove_file(tag_dir.join(&old_file_name));
+    }
+
+    log::info!("Release {} asset {} replaced by {} ({} bytes)", tag, old_file_name, new_file_name, bytes.len());
+    Ok(Json(serde_json::json!({
+        "status": "OK",
+        "name": new_file_name,
+        "size": bytes.len(),
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Workspace endpoints (JWT-protected)
 // ---------------------------------------------------------------------------
@@ -3753,10 +3852,12 @@ async fn main() -> Result<()> {
         .merge(
             Router::new()
                 .route("/api/v1/releases", post(handle_upload_release))
+                .route("/api/v1/releases/{tag}/assets/{file}/replace", post(handle_replace_release_asset))
                 .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         )
         .route("/api/v1/releases/{tag}", axum::routing::put(handle_update_release).delete(handle_delete_release))
         .route("/api/v1/releases/{tag}/move", post(handle_move_release))
+        .route("/api/v1/releases/{tag}/assets/{file}", axum::routing::delete(handle_delete_release_asset))
         // Workspace endpoints (JWT protected)
         .route("/api/v1/workspaces", get(handle_list_workspaces).post(handle_create_workspace))
         .route("/api/v1/workspaces/{id}", get(handle_get_workspace).put(handle_update_workspace).delete(handle_delete_workspace))
