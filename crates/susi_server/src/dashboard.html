@@ -3817,7 +3817,7 @@ function renderWsReleaseExpansion(r, hasDocReleaseRow) {
             sorted.map(p => {
                 const indent = p.parent_slug ? '12px' : '0';
                 const pageUrl = docsUrl + '#/' + encodeURIComponent(tag) + '/' + encodeURIComponent(p.slug);
-                return '<li style="padding-left:' + indent + ';"><a href="' + pageUrl + '" style="color:var(--accent);text-decoration:none;font-size:13px;">' + esc(p.title) + '</a> <span style="color:var(--text2);font-size:11px;font-family:monospace;">' + esc(p.slug) + '</span></li>';
+                return '<li style="padding-left:' + indent + ';"><a href="' + pageUrl + '" style="color:var(--accent);text-decoration:none;font-size:13px;">' + esc(p.title) + '</a></li>';
             }).join('') +
         '</ul>';
     }
