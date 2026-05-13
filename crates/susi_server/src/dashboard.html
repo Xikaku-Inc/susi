@@ -3830,8 +3830,8 @@ function renderWsReleaseExpansion(r, hasDocReleaseRow) {
         filesHtml = '<ul style="list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:2px;">' +
             r.assets.map(a => {
                 const actions = isAdmin
-                    ? '<button class="small secondary" style="padding:1px 6px;font-size:11px;" onclick="replaceWsReleaseAsset(\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" title="Replace this file">Replace</button>' +
-                      '<button class="small danger" style="padding:1px 6px;font-size:11px;" onclick="deleteWsReleaseAsset(\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" title="Remove this file">&times;</button>'
+                    ? '<button class="small secondary" style="min-width:0;padding:2px 8px;font-size:11px;line-height:1.4;" onclick="replaceWsReleaseAsset(\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" title="Replace this file">Replace</button>' +
+                      '<button class="small danger" style="min-width:0;padding:2px 7px;font-size:12px;line-height:1.4;" onclick="deleteWsReleaseAsset(\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" title="Remove this file">&times;</button>'
                     : '';
                 return '<li style="display:flex;justify-content:space-between;gap:8px;font-size:13px;align-items:center;">' +
                     '<a href="#" onclick="event.preventDefault();downloadAsset(event,\'' + esc(tag) + '\',\'' + esc(a.name) + '\')" style="color:var(--accent);text-decoration:none;font-family:monospace;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(a.name) + '</a>' +
