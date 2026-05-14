@@ -183,6 +183,35 @@ impl LicenseDb {
             );
             CREATE INDEX IF NOT EXISTS idx_config_revisions_workspace ON config_revisions(workspace_id);
 
+            -- Workspace-scoped federation channel secret. Members of the same
+            -- workspace share this opaque base64 string; FusionHub instances
+            -- derive their ChaCha20Poly1305 data-plane key from it. Lazily
+            -- created on first read so existing workspaces just work.
+            CREATE TABLE IF NOT EXISTS workspace_federation (
+                workspace_id TEXT PRIMARY KEY,
+                channel_secret TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                rotated_at TEXT NOT NULL,
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+            );
+
+            -- Workspace peer registry. Each FusionHub instance that logs into
+            -- a workspace registers its externally-reachable URL here. Other
+            -- members poll this list to populate their peer set without mDNS.
+            CREATE TABLE IF NOT EXISTS workspace_peers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                registered_by TEXT NOT NULL,
+                registered_at TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+                UNIQUE(workspace_id, host_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_peers_ws ON workspace_peers(workspace_id);
+
             CREATE TABLE IF NOT EXISTS doc_pages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 release_id INTEGER NOT NULL,
@@ -1787,6 +1816,150 @@ impl LicenseDb {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(LicenseError::Other(format!("DB query: {}", e))),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Workspace federation: shared channel secret + peer registry
+    // -----------------------------------------------------------------------
+
+    /// Read the workspace's federation channel secret, creating one on first
+    /// call. Members of the same workspace get the same secret on every call,
+    /// so they all derive the same ChaCha20Poly1305 data-plane key.
+    pub fn get_or_create_workspace_federation_secret(
+        &self,
+        workspace_id: &str,
+    ) -> Result<String, LicenseError> {
+        let existing: Option<String> = self.conn
+            .query_row(
+                "SELECT channel_secret FROM workspace_federation WHERE workspace_id = ?1",
+                params![workspace_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?;
+        if let Some(s) = existing {
+            return Ok(s);
+        }
+        // Fresh 32 bytes of OS entropy, base64-encoded for transport.
+        use base64::Engine as _;
+        use rand::RngCore;
+        let mut buf = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        let secret = base64::engine::general_purpose::STANDARD.encode(&buf);
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO workspace_federation (workspace_id, channel_secret, created_at, rotated_at)
+                 VALUES (?1, ?2, ?3, ?3)",
+                params![workspace_id, secret, now],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB insert federation: {}", e)))?;
+        Ok(secret)
+    }
+
+    /// Rotate the workspace's federation secret. Existing peers must re-fetch
+    /// to keep encrypting on the wire; until they do their frames will fail to
+    /// authenticate at the receiver and get dropped.
+    pub fn rotate_workspace_federation_secret(
+        &self,
+        workspace_id: &str,
+    ) -> Result<String, LicenseError> {
+        use base64::Engine as _;
+        use rand::RngCore;
+        let mut buf = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        let secret = base64::engine::general_purpose::STANDARD.encode(&buf);
+        let now = Utc::now().to_rfc3339();
+        let updated = self.conn
+            .execute(
+                "UPDATE workspace_federation SET channel_secret = ?2, rotated_at = ?3
+                 WHERE workspace_id = ?1",
+                params![workspace_id, secret, now],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB update federation: {}", e)))?;
+        if updated == 0 {
+            // No row yet — treat rotate as create.
+            self.conn
+                .execute(
+                    "INSERT INTO workspace_federation (workspace_id, channel_secret, created_at, rotated_at)
+                     VALUES (?1, ?2, ?3, ?3)",
+                    params![workspace_id, secret, now],
+                )
+                .map_err(|e| LicenseError::Other(format!("DB insert federation: {}", e)))?;
+        }
+        Ok(secret)
+    }
+
+    /// Insert or update a peer registration. Updates `url`, `label`, and
+    /// `last_seen` on conflict so a peer that moved (new public URL) refreshes
+    /// in place rather than accumulating stale rows.
+    pub fn upsert_workspace_peer(
+        &self,
+        workspace_id: &str,
+        host_id: &str,
+        url: &str,
+        label: &str,
+        registered_by: &str,
+    ) -> Result<(), LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO workspace_peers
+                    (workspace_id, host_id, url, label, registered_by, registered_at, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(workspace_id, host_id) DO UPDATE SET
+                    url = excluded.url,
+                    label = excluded.label,
+                    last_seen = excluded.last_seen",
+                params![workspace_id, host_id, url, label, registered_by, now],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB upsert peer: {}", e)))?;
+        Ok(())
+    }
+
+    /// List peers registered against a workspace. Returns
+    /// `(host_id, url, label, registered_by, last_seen)`.
+    pub fn list_workspace_peers(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<(String, String, String, String, String)>, LicenseError> {
+        let mut stmt = self.conn
+            .prepare(
+                "SELECT host_id, url, label, registered_by, last_seen
+                 FROM workspace_peers
+                 WHERE workspace_id = ?1
+                 ORDER BY host_id",
+            )
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let rows: Vec<_> = stmt
+            .query_map(params![workspace_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| LicenseError::Other(format!("DB query: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Remove a peer registration. Returns true if a row was deleted.
+    pub fn delete_workspace_peer(
+        &self,
+        workspace_id: &str,
+        host_id: &str,
+    ) -> Result<bool, LicenseError> {
+        let n = self.conn
+            .execute(
+                "DELETE FROM workspace_peers WHERE workspace_id = ?1 AND host_id = ?2",
+                params![workspace_id, host_id],
+            )
+            .map_err(|e| LicenseError::Other(format!("DB delete peer: {}", e)))?;
+        Ok(n > 0)
     }
 
     // -----------------------------------------------------------------------
@@ -4593,5 +4766,111 @@ mod tests {
         assert_eq!(db.get_release_workspace_id("v1.0").unwrap(), Some(None));
         assert_eq!(db.get_release_workspace_id("v1.1").unwrap(), Some(Some("ws-1".to_string())));
         assert_eq!(db.get_release_workspace_id("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_federation_secret_idempotent_per_workspace() {
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        db.create_workspace("ws-2", "WS2", "", "", "admin").unwrap();
+
+        let s1a = db.get_or_create_workspace_federation_secret("ws-1").unwrap();
+        let s1b = db.get_or_create_workspace_federation_secret("ws-1").unwrap();
+        assert_eq!(s1a, s1b, "same workspace must return same secret");
+        assert!(!s1a.is_empty());
+        // base64 of 32 bytes → 44 chars (with padding).
+        assert_eq!(s1a.len(), 44);
+
+        let s2 = db.get_or_create_workspace_federation_secret("ws-2").unwrap();
+        assert_ne!(s1a, s2, "different workspaces must get different secrets");
+    }
+
+    #[test]
+    fn test_federation_secret_rotation() {
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+
+        let before = db.get_or_create_workspace_federation_secret("ws-1").unwrap();
+        let rotated = db.rotate_workspace_federation_secret("ws-1").unwrap();
+        assert_ne!(before, rotated, "rotation must produce a new secret");
+
+        // Subsequent reads return the rotated value.
+        let after = db.get_or_create_workspace_federation_secret("ws-1").unwrap();
+        assert_eq!(after, rotated);
+
+        // Rotating on a workspace that never had a secret should still work
+        // (treat as create).
+        db.create_workspace("ws-fresh", "F", "", "", "admin").unwrap();
+        let fresh = db.rotate_workspace_federation_secret("ws-fresh").unwrap();
+        assert_eq!(fresh.len(), 44);
+        assert_eq!(
+            db.get_or_create_workspace_federation_secret("ws-fresh").unwrap(),
+            fresh
+        );
+    }
+
+    #[test]
+    fn test_workspace_peer_upsert_and_list() {
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        db.create_workspace("ws-2", "WS2", "", "", "admin").unwrap();
+
+        // Register two peers in ws-1 and one in ws-2.
+        db.upsert_workspace_peer("ws-1", "hostA", "https://a.local:443", "Laptop A", "alice").unwrap();
+        db.upsert_workspace_peer("ws-1", "hostB", "https://b.local:443", "Laptop B", "alice").unwrap();
+        db.upsert_workspace_peer("ws-2", "hostA", "https://other.local", "", "bob").unwrap();
+
+        let peers_ws1 = db.list_workspace_peers("ws-1").unwrap();
+        assert_eq!(peers_ws1.len(), 2);
+        let host_ids: Vec<&str> = peers_ws1.iter().map(|p| p.0.as_str()).collect();
+        assert!(host_ids.contains(&"hostA"));
+        assert!(host_ids.contains(&"hostB"));
+
+        let peers_ws2 = db.list_workspace_peers("ws-2").unwrap();
+        assert_eq!(peers_ws2.len(), 1);
+        assert_eq!(peers_ws2[0].1, "https://other.local");
+
+        // Re-register hostA with a new URL — must update in place.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        db.upsert_workspace_peer("ws-1", "hostA", "https://a.new:443", "Laptop A v2", "alice").unwrap();
+        let after = db.list_workspace_peers("ws-1").unwrap();
+        assert_eq!(after.len(), 2, "upsert must not create duplicate row");
+        let row_a = after.iter().find(|p| p.0 == "hostA").unwrap();
+        assert_eq!(row_a.1, "https://a.new:443");
+        assert_eq!(row_a.2, "Laptop A v2");
+    }
+
+    #[test]
+    fn test_workspace_peer_delete() {
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        db.upsert_workspace_peer("ws-1", "hostA", "https://a", "", "alice").unwrap();
+
+        assert!(db.delete_workspace_peer("ws-1", "hostA").unwrap());
+        assert_eq!(db.list_workspace_peers("ws-1").unwrap().len(), 0);
+        // Second delete returns false.
+        assert!(!db.delete_workspace_peer("ws-1", "hostA").unwrap());
+        // Wrong workspace also false.
+        db.upsert_workspace_peer("ws-1", "hostA", "https://a", "", "alice").unwrap();
+        assert!(!db.delete_workspace_peer("ws-other", "hostA").unwrap());
+        assert_eq!(db.list_workspace_peers("ws-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_workspace_delete_cascades_federation_and_peers() {
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        db.get_or_create_workspace_federation_secret("ws-1").unwrap();
+        db.upsert_workspace_peer("ws-1", "hostA", "https://a", "", "alice").unwrap();
+        assert_eq!(db.list_workspace_peers("ws-1").unwrap().len(), 1);
+
+        db.delete_workspace("ws-1").unwrap();
+
+        // FK cascade should have wiped both rows.
+        assert_eq!(db.list_workspace_peers("ws-1").unwrap().len(), 0);
+        // Re-creating the workspace must yield a fresh secret, not the old one.
+        db.create_workspace("ws-1", "WS again", "", "", "admin").unwrap();
+        let fresh = db.get_or_create_workspace_federation_secret("ws-1").unwrap();
+        assert_eq!(fresh.len(), 44);
     }
 }

@@ -89,6 +89,17 @@ struct Cli {
     #[arg(long, env = "SUSI_MAGIC_LINK_BASE_URL", default_value = "")]
     magic_link_base_url: String,
 
+    /// WebSocket URL of the FusionHub relay this susi instance points
+    /// workspace members at. Returned verbatim in
+    /// `GET /workspaces/{id}/federation` so each member's
+    /// workspace_federation poller can spawn its relay client without
+    /// hard-coding the URL. Empty ⇒ no relay; members are expected to
+    /// reach each other directly (or fall back to `FUSIONHUB_RELAY_URL`
+    /// set locally on each member). Typically
+    /// `wss://fusionhub.lp-research.com/api/relay`.
+    #[arg(long, env = "SUSI_RELAY_URL", default_value = "")]
+    relay_url: String,
+
     // -------- Shop / Stripe --------
     //
     // Both empty ⇒ shop checkout + webhook endpoints respond with 503.
@@ -143,6 +154,9 @@ struct AppState {
     contact_attempts: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     email: Option<EmailService>,
     magic_link_base_url: String,
+    /// FusionHub relay URL handed to workspace members via
+    /// `GET /workspaces/{id}/federation`. Empty when not configured.
+    relay_url: String,
     stripe_secret_key: String,
     stripe_webhook_secret: String,
     shop_base_url: String,
@@ -3398,6 +3412,143 @@ async fn handle_delete_config(
     Ok(Json(serde_json::json!({ "status": "OK" })))
 }
 
+// ---------------------------------------------------------------------------
+// Workspace federation: channel secret + peer registry
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegisterPeerRequest {
+    host_id: String,
+    url: String,
+    #[serde(default)]
+    label: String,
+}
+
+/// Returns the workspace's federation channel secret and the live peer list.
+/// Any workspace member (incl. viewers) can read — the secret is the symmetric
+/// key for the ZMQ data plane that all member fusionhubs need to participate.
+async fn handle_get_workspace_federation(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+
+    let db = state.db.lock().unwrap();
+    db.get_workspace_member_role(&workspace_id, &principal.username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+
+    let secret = db.get_or_create_workspace_federation_secret(&workspace_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let peers = db.list_workspace_peers(&workspace_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    let peer_json: Vec<_> = peers.iter().map(|(host_id, url, label, registered_by, last_seen)| {
+        serde_json::json!({
+            "host_id": host_id,
+            "url": url,
+            "label": label,
+            "registered_by": registered_by,
+            "last_seen": last_seen,
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({
+        "channel_secret": secret,
+        "peers": peer_json,
+        // Empty string when this susi instance isn't configured with a
+        // relay URL. Workspace members treat the empty string the same
+        // as "field missing" and fall back to FUSIONHUB_RELAY_URL set
+        // locally on each member, or "no relay" if that's also unset.
+        "relay_url": state.relay_url,
+    })))
+}
+
+/// Register (or refresh) a FusionHub peer for this workspace. Idempotent on
+/// `(workspace_id, host_id)` — re-registration updates `url`/`label`/`last_seen`.
+/// Viewers cannot register peers (read-only role).
+async fn handle_register_workspace_peer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<RegisterPeerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+
+    if req.host_id.trim().is_empty() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "host_id is required"));
+    }
+    if req.url.trim().is_empty() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "url is required"));
+    }
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&workspace_id, &principal.username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    if role == "viewer" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Viewers cannot register peers"));
+    }
+
+    db.upsert_workspace_peer(&workspace_id, &req.host_id, &req.url, &req.label, &principal.username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+/// Remove a FusionHub peer from this workspace. Viewers cannot revoke.
+async fn handle_delete_workspace_peer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((workspace_id, host_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&workspace_id, &principal.username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    if role == "viewer" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Viewers cannot remove peers"));
+    }
+
+    let removed = db.delete_workspace_peer(&workspace_id, &host_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !removed {
+        return Err(error_response(StatusCode::NOT_FOUND, "Peer not registered"));
+    }
+
+    Ok(Json(serde_json::json!({ "status": "OK" })))
+}
+
+/// Rotate the workspace's federation channel secret. Forces every connected
+/// FusionHub to re-fetch on next poll and rekey. Owner/editor only.
+async fn handle_rotate_workspace_federation(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&workspace_id, &principal.username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    if role == "viewer" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Viewers cannot rotate secrets"));
+    }
+
+    let new_secret = db.rotate_workspace_federation_secret(&workspace_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "status": "OK", "channel_secret": new_secret })))
+}
+
 /// List releases visible to a workspace (workspace-specific + global).
 async fn handle_workspace_releases(
     State(state): State<Arc<AppState>>,
@@ -3735,6 +3886,7 @@ async fn main() -> Result<()> {
         contact_attempts: Mutex::new(HashMap::new()),
         email: email_service,
         magic_link_base_url: cli.magic_link_base_url.clone(),
+        relay_url: cli.relay_url.clone(),
         stripe_secret_key: cli.stripe_secret_key,
         stripe_webhook_secret: cli.stripe_webhook_secret,
         shop_base_url: if cli.shop_base_url.is_empty() { cli.magic_link_base_url.clone() } else { cli.shop_base_url },
@@ -3867,6 +4019,11 @@ async fn main() -> Result<()> {
         .route("/api/v1/workspaces/{id}/configs", get(handle_list_configs).post(handle_push_config))
         .route("/api/v1/workspaces/{id}/configs/latest", get(handle_get_latest_config))
         .route("/api/v1/workspaces/{id}/configs/{config_id}", get(handle_get_config).put(handle_update_config).delete(handle_delete_config))
+        // FusionHub federation: shared channel secret + peer registry
+        .route("/api/v1/workspaces/{id}/federation", get(handle_get_workspace_federation))
+        .route("/api/v1/workspaces/{id}/federation/rotate", post(handle_rotate_workspace_federation))
+        .route("/api/v1/workspaces/{id}/peers", post(handle_register_workspace_peer))
+        .route("/api/v1/workspaces/{id}/peers/{host_id}", axum::routing::delete(handle_delete_workspace_peer))
         .route("/api/v1/workspaces/{id}/releases", get(handle_workspace_releases))
         .route(
             "/api/v1/workspaces/{id}/docs/releases",
