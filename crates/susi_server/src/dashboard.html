@@ -678,6 +678,7 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
             <div class="ws-tabs" role="tablist">
                 <button class="ws-tab active" data-ws-tab="releases" onclick="setWsTab('releases')">Releases</button>
                 <button class="ws-tab" data-ws-tab="configs" onclick="setWsTab('configs')">Configs</button>
+                <button class="ws-tab" data-ws-tab="instances" onclick="setWsTab('instances')">Instances</button>
                 <button class="ws-tab" data-ws-tab="members" onclick="setWsTab('members')">Members</button>
                 <button class="ws-tab" data-ws-tab="settings" data-ws-admin-only onclick="setWsTab('settings')">Settings</button>
             </div>
@@ -695,6 +696,14 @@ tr:hover td { background: rgba(108, 140, 255, 0.04); }
             <div class="ws-tab-panel" data-ws-panel="configs">
                 <div class="detail-section-title">Config Revisions</div>
                 <div id="wsDetailConfigs" class="machines-list"></div>
+            </div>
+
+            <div class="ws-tab-panel" data-ws-panel="instances">
+                <div class="detail-section-title" style="display:flex;align-items:center;justify-content:space-between;">
+                    <span>Connected Instances</span>
+                    <button class="small" onclick="loadWsInstances(selectedWsId)">Refresh</button>
+                </div>
+                <div id="wsDetailInstances" class="machines-list"></div>
             </div>
 
             <div class="ws-tab-panel" data-ws-panel="members">
@@ -3406,6 +3415,7 @@ async function showWsDetail(id) {
         // Load configs and the unified releases list.
         loadWsConfigs(id);
         loadWsReleases(id);
+        loadWsInstances(id);
     } catch (e) {
         toast('Error: ' + e.message, 'error');
     }
@@ -3902,6 +3912,48 @@ async function loadWsConfigs(wsId) {
         `).join('');
     } catch (e) {
         container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load configs</div>';
+    }
+}
+
+// Render registered FusionHub peers for the workspace. Peers re-register every
+// 30s, so anything seen within 90s (3 ticks) is treated as currently online.
+async function loadWsInstances(wsId) {
+    if (!wsId) return;
+    const container = document.getElementById('wsDetailInstances');
+    try {
+        const resp = await fetch(API + '/workspaces/' + wsId + '/federation', { headers: authHeaders() });
+        if (!resp.ok) { container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load</div>'; return; }
+        const data = await resp.json();
+        const peers = data.peers || [];
+        if (peers.length === 0) {
+            container.innerHTML = '<div style="color:var(--text2);font-size:13px;">No FusionHub instances have registered with this workspace.</div>';
+            return;
+        }
+        const now = Date.now();
+        container.innerHTML = peers.map(p => {
+            const seenMs = p.last_seen ? new Date(p.last_seen).getTime() : 0;
+            const ageS = seenMs ? Math.max(0, Math.floor((now - seenMs) / 1000)) : null;
+            const online = ageS !== null && ageS <= 90;
+            const dotColor = online ? '#3fb950' : 'var(--text2)';
+            const ageLabel = ageS === null ? 'never'
+                : ageS < 60 ? ageS + 's ago'
+                : ageS < 3600 ? Math.floor(ageS / 60) + 'm ago'
+                : ageS < 86400 ? Math.floor(ageS / 3600) + 'h ago'
+                : Math.floor(ageS / 86400) + 'd ago';
+            const label = p.label && p.label.trim() ? p.label : '(unnamed)';
+            const hostShort = (p.host_id || '').slice(0, 12);
+            return '<div class="machine-item">' +
+                '<span style="display:flex;align-items:center;gap:10px;min-width:0;">' +
+                    '<span title="' + (online ? 'Online' : 'Last seen ' + ageLabel) + '" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + dotColor + ';flex-shrink:0;"></span>' +
+                    '<strong style="min-width:160px;">' + esc(label) + '</strong>' +
+                    '<span class="machine-code" title="' + esc(p.host_id) + '">' + esc(hostShort) + '</span>' +
+                    '<span class="machine-code" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(p.url) + '</span>' +
+                '</span>' +
+                '<span class="machine-code">' + esc(p.registered_by) + ' &middot; ' + ageLabel + '</span>' +
+            '</div>';
+        }).join('');
+    } catch (e) {
+        container.innerHTML = '<div style="color:var(--text2);font-size:13px;">Failed to load instances</div>';
     }
 }
 
