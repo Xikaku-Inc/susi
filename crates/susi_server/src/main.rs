@@ -3444,6 +3444,10 @@ async fn handle_get_workspace_federation(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     let peers = db.list_workspace_peers(&workspace_id)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    // Cheap version-only fetch — body is fetched separately via GET /graph
+    // when the polling peer notices its `applied_graph_version` is behind.
+    let graph_version = db.get_workspace_graph_version(&workspace_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
     let peer_json: Vec<_> = peers.iter().map(|(host_id, url, label, registered_by, last_seen)| {
         serde_json::json!({
@@ -3463,7 +3467,93 @@ async fn handle_get_workspace_federation(
         // as "field missing" and fall back to FUSIONHUB_RELAY_URL set
         // locally on each member, or "no relay" if that's also unset.
         "relay_url": state.relay_url,
+        // `null` when no graph has been pushed yet (workspace is "empty").
+        // Polling peers compare to their local `applied_graph_version` and
+        // pull `GET /graph` whenever the susi version is newer.
+        "graph_version": graph_version,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Workspace graph (shared node-graph, version-tracked)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PutGraphRequest {
+    /// Version the editor was loaded with. `None` is only valid for the
+    /// very first push of a workspace (no row yet). Mismatch ⇒ 409.
+    #[serde(default)]
+    expected_version: Option<u32>,
+    /// Raw config JSON — same shape the editor exports / loads.
+    config: serde_json::Value,
+}
+
+/// Returns the workspace's full graph + version, or 404 when no graph has been
+/// pushed yet. Any workspace member can read.
+async fn handle_get_workspace_graph(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+
+    let db = state.db.lock().unwrap();
+    db.get_workspace_member_role(&workspace_id, &principal.username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+
+    let row = db.get_workspace_graph(&workspace_id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Workspace has no graph yet"))?;
+    let (graph_version, config_json, updated_by, updated_at) = row;
+    let config: serde_json::Value = serde_json::from_str(&config_json)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Stored graph JSON corrupt: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "graph_version": graph_version,
+        "config": config,
+        "updated_by": updated_by,
+        "updated_at": updated_at,
+    })))
+}
+
+/// Optimistic-lock upsert of the workspace's graph. The request body carries
+/// the version the editor was loaded with; mismatch ⇒ 409 with the current
+/// version so the editor can refresh + reapply. Viewers cannot write.
+async fn handle_put_workspace_graph(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<PutGraphRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = validate_principal(&headers, &state)?;
+    require_password_changed(&state, &principal)?;
+
+    let db = state.db.lock().unwrap();
+    let role = db.get_workspace_member_role(&workspace_id, &principal.username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "Not a member of this workspace"))?;
+    if role == "viewer" {
+        return Err(error_response(StatusCode::FORBIDDEN, "Viewers cannot edit the workspace graph"));
+    }
+
+    let config_str = serde_json::to_string(&req.config)
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, &format!("config not serialisable: {}", e)))?;
+
+    match db.upsert_workspace_graph(&workspace_id, req.expected_version, &config_str, &principal.username) {
+        Ok(new_version) => Ok(Json(serde_json::json!({ "graph_version": new_version }))),
+        Err(susi_core::error::LicenseError::GraphConflict { current }) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!(
+                    "Graph version conflict — current is {}; reload and reapply",
+                    current
+                ),
+            }),
+        )),
+        Err(e) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
 }
 
 /// Register (or refresh) a FusionHub peer for this workspace. Idempotent on
@@ -4024,6 +4114,9 @@ async fn main() -> Result<()> {
         .route("/api/v1/workspaces/{id}/federation/rotate", post(handle_rotate_workspace_federation))
         .route("/api/v1/workspaces/{id}/peers", post(handle_register_workspace_peer))
         .route("/api/v1/workspaces/{id}/peers/{host_id}", axum::routing::delete(handle_delete_workspace_peer))
+        // Shared workspace graph (one node-graph per workspace, version-tracked
+        // for optimistic-lock concurrent edits between member fusionhubs).
+        .route("/api/v1/workspaces/{id}/graph", get(handle_get_workspace_graph).put(handle_put_workspace_graph))
         .route("/api/v1/workspaces/{id}/releases", get(handle_workspace_releases))
         .route(
             "/api/v1/workspaces/{id}/docs/releases",

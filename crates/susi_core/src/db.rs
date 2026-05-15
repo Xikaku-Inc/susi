@@ -195,6 +195,21 @@ impl LicenseDb {
                 FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
             );
 
+            -- One node-graph per workspace. Source of truth for the
+            -- distributed pipeline shared by every member fusionhub:
+            -- `graph_version` is the optimistic-lock counter (PUT must echo
+            -- the value it loaded; mismatch ⇒ 409), `config` is the raw JSON
+            -- the editor exports. NULL row ⇒ workspace has no graph yet
+            -- (first peer to save seeds it).
+            CREATE TABLE IF NOT EXISTS workspace_graphs (
+                workspace_id  TEXT PRIMARY KEY,
+                graph_version INTEGER NOT NULL,
+                config        TEXT NOT NULL,
+                updated_by    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+            );
+
             -- Workspace peer registry. Each FusionHub instance that logs into
             -- a workspace registers its externally-reachable URL here. Other
             -- members poll this list to populate their peer set without mDNS.
@@ -1960,6 +1975,106 @@ impl LicenseDb {
             )
             .map_err(|e| LicenseError::Other(format!("DB delete peer: {}", e)))?;
         Ok(n > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Workspace graph (one shared node-graph per workspace, version-tracked)
+    // -----------------------------------------------------------------------
+
+    /// Fetch the workspace's current graph. Returns `(graph_version, config_json,
+    /// updated_by, updated_at)` or `None` when no graph has been pushed yet.
+    pub fn get_workspace_graph(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<(u32, String, String, String)>, LicenseError> {
+        let mut stmt = self.conn
+            .prepare(
+                "SELECT graph_version, config, updated_by, updated_at
+                 FROM workspace_graphs WHERE workspace_id = ?1",
+            )
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let row = stmt
+            .query_row(params![workspace_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u32,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .ok();
+        Ok(row)
+    }
+
+    /// Cheap version-only fetch for the federation poll response — avoids
+    /// shipping the (potentially large) config blob on every poll cycle.
+    /// `None` when no graph row exists yet.
+    pub fn get_workspace_graph_version(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<u32>, LicenseError> {
+        let mut stmt = self.conn
+            .prepare("SELECT graph_version FROM workspace_graphs WHERE workspace_id = ?1")
+            .map_err(|e| LicenseError::Other(format!("DB prepare: {}", e)))?;
+        let row = stmt
+            .query_row(params![workspace_id], |r| r.get::<_, i64>(0))
+            .ok()
+            .map(|v| v as u32);
+        Ok(row)
+    }
+
+    /// Upsert the workspace's graph with optimistic-lock semantics. The caller
+    /// passes the version it loaded; we bump to `loaded + 1` only when the row
+    /// is still at that version (or absent ⇒ seed at version 1). Returns the
+    /// new version. `Err(GraphConflict { current })` when another writer raced
+    /// us — caller surfaces this as HTTP 409 with the current version so the
+    /// editor can refresh.
+    ///
+    /// `expected_version` is `None` only for the very first save of a
+    /// workspace (or when the caller is deliberately overwriting; today we
+    /// route deliberate overwrites through the same `Some(current)` path).
+    pub fn upsert_workspace_graph(
+        &self,
+        workspace_id: &str,
+        expected_version: Option<u32>,
+        config_json: &str,
+        updated_by: &str,
+    ) -> Result<u32, LicenseError> {
+        let now = Utc::now().to_rfc3339();
+        let current = self.get_workspace_graph_version(workspace_id)?;
+
+        match (current, expected_version) {
+            // First save: no existing row, no expected version → seed at v1.
+            (None, None) => {
+                self.conn
+                    .execute(
+                        "INSERT INTO workspace_graphs
+                            (workspace_id, graph_version, config, updated_by, updated_at)
+                         VALUES (?1, 1, ?2, ?3, ?4)",
+                        params![workspace_id, config_json, updated_by, now],
+                    )
+                    .map_err(|e| LicenseError::Other(format!("DB insert graph: {}", e)))?;
+                Ok(1)
+            }
+            // Update: expected matches current → bump to current+1.
+            (Some(cur), Some(exp)) if cur == exp => {
+                let next = cur + 1;
+                self.conn
+                    .execute(
+                        "UPDATE workspace_graphs
+                            SET graph_version = ?2, config = ?3, updated_by = ?4, updated_at = ?5
+                          WHERE workspace_id = ?1 AND graph_version = ?6",
+                        params![workspace_id, next as i64, config_json, updated_by, now, cur as i64],
+                    )
+                    .map_err(|e| LicenseError::Other(format!("DB update graph: {}", e)))?;
+                Ok(next)
+            }
+            // Anything else is a conflict — surface the current version so the
+            // editor can re-fetch and re-apply local changes on top.
+            _ => Err(LicenseError::GraphConflict {
+                current: current.unwrap_or(0),
+            }),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4838,6 +4953,73 @@ mod tests {
         let row_a = after.iter().find(|p| p.0 == "hostA").unwrap();
         assert_eq!(row_a.1, "https://a.new:443");
         assert_eq!(row_a.2, "Laptop A v2");
+    }
+
+    #[test]
+    fn test_workspace_graph_first_save_seeds_v1() {
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        assert!(db.get_workspace_graph("ws-1").unwrap().is_none());
+        assert!(db.get_workspace_graph_version("ws-1").unwrap().is_none());
+
+        let v = db.upsert_workspace_graph("ws-1", None, r#"{"sources":{}}"#, "alice").unwrap();
+        assert_eq!(v, 1);
+        let row = db.get_workspace_graph("ws-1").unwrap().expect("row exists");
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1, r#"{"sources":{}}"#);
+        assert_eq!(row.2, "alice");
+        assert_eq!(db.get_workspace_graph_version("ws-1").unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_workspace_graph_optimistic_lock_bumps_on_match() {
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        db.upsert_workspace_graph("ws-1", None, r#"{"a":1}"#, "alice").unwrap();
+
+        let v2 = db.upsert_workspace_graph("ws-1", Some(1), r#"{"a":2}"#, "bob").unwrap();
+        assert_eq!(v2, 2);
+        let row = db.get_workspace_graph("ws-1").unwrap().unwrap();
+        assert_eq!(row.0, 2);
+        assert_eq!(row.1, r#"{"a":2}"#);
+        assert_eq!(row.2, "bob");
+    }
+
+    #[test]
+    fn test_workspace_graph_stale_version_rejected() {
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        db.upsert_workspace_graph("ws-1", None, r#"{"v":1}"#, "alice").unwrap();
+        db.upsert_workspace_graph("ws-1", Some(1), r#"{"v":2}"#, "alice").unwrap();
+        // Caller still thinks it's at v1 — must fail with current=2.
+        let err = db.upsert_workspace_graph("ws-1", Some(1), r#"{"v":3}"#, "bob").unwrap_err();
+        match err {
+            crate::error::LicenseError::GraphConflict { current } => assert_eq!(current, 2),
+            other => panic!("expected GraphConflict, got {:?}", other),
+        }
+        // Stored row unchanged after the rejected write.
+        assert_eq!(db.get_workspace_graph("ws-1").unwrap().unwrap().1, r#"{"v":2}"#);
+    }
+
+    #[test]
+    fn test_workspace_graph_no_expected_version_after_first_save_conflicts() {
+        // Once a row exists, `expected_version = None` must NOT silently
+        // overwrite — that would be the same "forgot to load" footgun.
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        db.upsert_workspace_graph("ws-1", None, r#"{"v":1}"#, "alice").unwrap();
+        let err = db.upsert_workspace_graph("ws-1", None, r#"{"v":2}"#, "bob").unwrap_err();
+        assert!(matches!(err, crate::error::LicenseError::GraphConflict { current: 1 }));
+    }
+
+    #[test]
+    fn test_workspace_graph_cascade_deletes_with_workspace() {
+        // Dropping the parent workspace must take the graph with it (FK ON DELETE CASCADE).
+        let db = test_db();
+        db.create_workspace("ws-1", "WS", "", "", "admin").unwrap();
+        db.upsert_workspace_graph("ws-1", None, "{}", "alice").unwrap();
+        db.delete_workspace("ws-1").unwrap();
+        assert!(db.get_workspace_graph("ws-1").unwrap().is_none());
     }
 
     #[test]
